@@ -12,6 +12,8 @@ if str(ROOT) not in sys.path:
 from utils.checkpoint import (
     TASK_SPECS,
     build_meta,
+    extract_state_dict,
+    infer_init_args_from_state_dict,
     load_meta,
     save_json,
     torch_load,
@@ -68,20 +70,31 @@ def synthesize_meta_from_checkpoint(
     model_class: str,
     model_module: str,
 ) -> dict[str, Any]:
+    config: dict[str, Any] = {}
     if isinstance(checkpoint, dict):
         task = checkpoint.get("task", task)
-        config = checkpoint.get("config") or {}
+        config = dict(checkpoint.get("config") or {})
         best_epoch = checkpoint.get("epoch")
         metric_name = checkpoint.get("best_metric_name")
         metric_value = checkpoint.get("best_metric_value")
         if "label_map" in checkpoint:
-            config = dict(config)
             config.setdefault("checkpoint_label_map", checkpoint["label_map"])
+
+        # ★ 从实际权重形状推断 model_init_args，覆盖 TASK_SPECS 默认值
+        state_dict = extract_state_dict(checkpoint)
+        if isinstance(state_dict, dict):
+            inferred = infer_init_args_from_state_dict(state_dict)
+            merged_init = dict(
+                TASK_SPECS[task].get("model_init_args", {})
+            )
+            merged_init.update(inferred)  # 实际权重优先
+            merged_init.update(config.get("model_init_args") or {})  # 训练时显式配置最高优先
+            config["model_init_args"] = merged_init
     else:
-        config = {}
         best_epoch = None
         metric_name = None
         metric_value = None
+
     return build_meta(
         task=task,
         repeat=repeat,
@@ -108,27 +121,37 @@ def load_or_create_meta(
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Missing checkpoint for {task}: {ckpt_path}")
 
-    if meta_path.exists():
-        meta = load_meta(meta_path)
-        validate_meta(meta, task=task, repeat=args.repeat, fold=args.fold)
-        try:
-            checkpoint = torch_load(ckpt_path)
-            validate_checkpoint_meta(
-                checkpoint,
-                task=task,
-                repeat=args.repeat,
-                fold=args.fold,
-                path=ckpt_path,
-            )
-        except ImportError as exc:
-            print(f"[combine] warning: {exc}")
-        return ckpt_path, meta_path, meta
-
     model_class, model_module = cli_model_info(args, task)
     checkpoint = torch_load(ckpt_path)
     validate_checkpoint_meta(
         checkpoint, task=task, repeat=args.repeat, fold=args.fold, path=ckpt_path
     )
+
+    # 从实际权重推断正确的 model_init_args
+    state_dict = extract_state_dict(checkpoint)
+    inferred = infer_init_args_from_state_dict(state_dict) if isinstance(state_dict, dict) else {}
+
+    if meta_path.exists():
+        meta = load_meta(meta_path)
+        validate_meta(meta, task=task, repeat=args.repeat, fold=args.fold)
+        # 检查已有 meta 的 model_init_args 与实际权重是否一致
+        existing_init = (meta.get("config") or {}).get("model_init_args") or {}
+        mismatches = {}
+        for key, expected in inferred.items():
+            actual = existing_init.get(key)
+            if actual is not None and isinstance(expected, int) and int(actual) != expected:
+                mismatches[key] = f"meta={actual} checkpoint={expected}"
+        if mismatches:
+            print(f"[combine] meta 与实际权重不一致，重新生成: {mismatches}")
+            meta = synthesize_meta_from_checkpoint(
+                checkpoint=checkpoint, task=task, repeat=args.repeat,
+                fold=args.fold, model_file=spec["file"],
+                model_class=model_class, model_module=model_module,
+            )
+            validate_meta(meta, task=task, repeat=args.repeat, fold=args.fold)
+            save_json(meta, meta_path)
+        return ckpt_path, meta_path, meta
+
     meta = synthesize_meta_from_checkpoint(
         checkpoint=checkpoint,
         task=task,

@@ -91,6 +91,46 @@ def extract_state_dict(checkpoint: Any) -> Any:
     return checkpoint
 
 
+def infer_init_args_from_state_dict(state_dict: dict) -> dict[str, Any]:
+    """
+    从 state_dict 中推断模型初始化参数，避免 TASK_SPECS 与训练时不一致。
+
+    例如从 subject_head 的权重形状推断 num_subjects。
+    """
+    inferred: dict[str, Any] = {}
+
+    # 推断 num_subjects：subject_head.net.3.weight 形状为 [num_subjects, 64]
+    for key in ("subject_head.net.3.weight", "subject_head.fc.3.weight"):
+        if key in state_dict:
+            inferred["num_subjects"] = state_dict[key].shape[0]
+            break
+
+    # 推断 emotion_nclass：emo_head.weight 或 emotion_head 的 out_features
+    for key in ("emo_head.weight", "emotion_head.weight"):
+        if key in state_dict:
+            inferred["emotion_nclass"] = state_dict[key].shape[0]
+            break
+
+    # 推断 nclass / diagnosis_nclass
+    for key in ("diag_head.weight", "diagnosis_head.weight"):
+        if key in state_dict:
+            inferred["diagnosis_nclass"] = state_dict[key].shape[0]
+            break
+    for key in ("classifier.weight",):
+        if key in state_dict:
+            inferred["nclass"] = state_dict[key].shape[0]
+            break
+
+    # 推断 nclass（二分类 logits head）
+    if "nclass" not in inferred:
+        for key in ("logits_head.weight", "fc.weight", "head.weight"):
+            if key in state_dict:
+                inferred["nclass"] = state_dict[key].shape[0]
+                break
+
+    return inferred
+
+
 def save_checkpoint(
     path: Path,
     *,
