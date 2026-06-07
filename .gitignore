@@ -1,4 +1,9 @@
 data/
 testdata/
 model_params/
+dep/
+hc/
+diagnosis_cls/
+*.zip
+__pycache__/
 

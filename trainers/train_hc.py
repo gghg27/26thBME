@@ -1407,7 +1407,7 @@ if __name__ == "__main__":
     #   all : 正常+抑郁一起训练情绪，同时可打开 diagnosis GRL
     train_group = "hc"
 
-    version = f"two_branch_emotion_grl_contrast_{train_group}"
+    version = f"{train_group}"
     model_params_root = "model_params"
     os.makedirs(version, exist_ok=True)
     os.makedirs(model_params_root, exist_ok=True)
