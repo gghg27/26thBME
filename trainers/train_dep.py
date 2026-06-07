@@ -47,6 +47,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import config
 import numpy as np
 import pandas as pd
 import torch
@@ -103,10 +104,6 @@ def seed_worker(worker_id: int):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
-
-
-def make_run_seed(base_seed: int, fold: int, extra: int = 0) -> int:
-    return int(base_seed) * 1000 + int(fold) + int(extra)
 
 
 # =========================================================
@@ -1045,7 +1042,7 @@ def train_competition_cross_subject(
         )
 
     if run_seed is None:
-        run_seed = make_run_seed(rand, fold)
+        run_seed = config.make_run_seed(rand, fold)
 
     set_global_seed(run_seed, deterministic=deterministic)
     device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -1420,7 +1417,7 @@ if __name__ == "__main__":
     combined_emotion_confusions = []
     combined_trial_confusions = []
 
-    for repeat, rand in enumerate([20, 32, 42]):
+    for repeat, rand in enumerate(config.DEP_REPEAT_SEEDS):
         print(f"\n{'#' * 70}")
         print(f"开始 random seed = {rand} 的 5 折交叉验证 | train_group={train_group}")
         print(f"{'#' * 70}")
@@ -1433,7 +1430,7 @@ if __name__ == "__main__":
             print(f"开始训练第 {fold + 1}/{n_splits} 折 | seed={rand} | group={train_group}")
             print(f"{'=' * 50}")
 
-            run_seed = make_run_seed(rand, fold)
+            run_seed = config.make_run_seed(rand, fold)
             set_global_seed(run_seed, deterministic=True)
             print(f"[Main Seed] rand={rand}, fold={fold}, run_seed={run_seed}")
 

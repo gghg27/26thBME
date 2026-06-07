@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import config
 import numpy as np
 import pandas as pd
 import torch
@@ -94,13 +95,6 @@ def seed_worker(worker_id: int):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
-
-
-def make_run_seed(base_seed: int, fold: int, extra: int = 0) -> int:
-    """
-    为每个 seed × fold 构造一个独立但可复现的 run_seed。
-    """
-    return int(base_seed) * 1000 + int(fold) + int(extra)
 
 
 # =========================================================
@@ -1136,7 +1130,7 @@ def train_competition_cross_subject(
     os.makedirs(save_dir, exist_ok=True)
 
     if run_seed is None:
-        run_seed = make_run_seed(rand, fold)
+        run_seed = config.make_run_seed(rand, fold)
 
     # 这里主要控制 DataLoader、sampler、训练过程随机性；
     # 模型初始化前的种子需要在 __main__ 里创建 model 之前设置。
@@ -1563,7 +1557,7 @@ if __name__ == "__main__":
     combined_subject_diag_confusions = []
 
     # 多随机种子 × 五折交叉验证
-    for repeat, rand in enumerate([20,42]):
+    for repeat, rand in enumerate(config.DIAG_REPEAT_SEEDS):
         print(f"\n{'#' * 70}")
         print(f"开始 random seed = {rand} 的 {5} 折交叉验证")
         print(f"{'#' * 70}")
@@ -1577,7 +1571,7 @@ if __name__ == "__main__":
             print(f"{'=' * 50}")
 
             # 关键：模型初始化前设置 seed
-            run_seed = make_run_seed(rand, fold)
+            run_seed = config.make_run_seed(rand, fold)
             set_global_seed(run_seed, deterministic=True)
             print(f"[Main Seed] rand={rand}, fold={fold}, run_seed={run_seed}")
 
