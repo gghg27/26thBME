@@ -12,10 +12,10 @@
 DIAG_REPEAT_SEEDS = [20, 42]
 
 # HC 情绪模型（train_hc.py）
-HC_REPEAT_SEEDS = [20, 32, 42]
+HC_REPEAT_SEEDS = [20,  42]
 
 # DEP 情绪模型（train_dep.py）
-DEP_REPEAT_SEEDS = [20, 32, 42]
+DEP_REPEAT_SEEDS = [20,  42]
 
 # ── 交叉验证 ─────────────────────────────────────────────────────
 N_SPLITS = 5          # K 折数
