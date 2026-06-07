@@ -17,9 +17,9 @@ TASK_SPECS = {
         "label_map": {"HC": 0, "DEP": 1},
         "model_init_args": {
             "sfreq": 250.0,
-            "topk": 8,
+            "topk": 6,
             "dropout": 0.2,
-            "num_subjects": 60,
+            "num_subjects": 48,
             "nclass": 2,
         },
     },
