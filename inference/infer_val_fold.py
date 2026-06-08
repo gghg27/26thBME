@@ -46,6 +46,24 @@ def _load_training_split(meta_path: str | Path) -> tuple[set[str], set[str]]:
     return train, val
 
 
+def _load_subjects_from_checkpoint(checkpoint_path: str | Path) -> tuple[set[str], set[str]]:
+    """直接从 .pt checkpoint 中读取 train_subjects / val_subjects。"""
+    import torch
+
+    ckpt_path = Path(checkpoint_path)
+    if not ckpt_path.exists():
+        return set(), set()
+    try:
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    except Exception:
+        return set(), set()
+    if not isinstance(ckpt, dict):
+        return set(), set()
+    train = {str(s) for s in (ckpt.get("train_subjects") or [])}
+    val = {str(s) for s in (ckpt.get("val_subjects") or [])}
+    return train, val
+
+
 def _check_overlap(model_name: str, eval_val: set[str], train_train: set[str]) -> None:
     """检查评估用的验证被试是否与模型训练集有重叠（即数据泄露）。"""
     overlap = eval_val & train_train
@@ -170,20 +188,7 @@ def main() -> None:
         seed = config.get_seed_for_repeat("diagnosis", args.repeat)
     print(f"[infer-val] repeat={args.repeat} → seed={seed}")
 
-    # ── sklearn 即时划分（替代原来的 load_fold + filter_subjects）───
-    val_subjects = get_val_subjects(
-        index_csv=args.diag_csv,
-        fold=args.fold,
-        n_splits=args.n_splits,
-        seed=seed,
-    )
-    print(
-        f"[infer-val] val_subjects (sklearn StratifiedGroupKFold, "
-        f"seed={seed}, fold={args.fold}): "
-        f"n={len(val_subjects)}"
-    )
-
-    # ── 加载模型 ──────────────────────────────────────────────────
+    # ── 加载模型（需要先加载 combined_meta 才能读各个模型的 meta）───
     combined = load_combined(args)
     metas = {
         task: load_meta(resolve_path(entry["meta"]))
@@ -196,15 +201,48 @@ def main() -> None:
         for task in ("diagnosis", "hc_emotion", "dep_emotion")
     }
 
-    # ── 检查数据泄露：评估用验证被试是否出现在各模型训练集中 ────
+    # ── 确定验证被试：优先从训练时保存的 val_subjects 读取 ────────
+    #   Step 1: 尝试从诊断模型的 meta JSON 读取
+    diag_meta_path = resolve_path(combined["models"]["diagnosis"]["meta"])
+    _, diag_val_from_meta = _load_training_split(diag_meta_path)
+
+    #   Step 2: 如果 meta 中没有，尝试从 .pt checkpoint 直接读
+    if not diag_val_from_meta:
+        diag_ckpt_path = resolve_path(combined["models"]["diagnosis"]["path"])
+        _, diag_val_from_meta = _load_subjects_from_checkpoint(diag_ckpt_path)
+
+    #   Step 3: 都读不到才用 sklearn 即时重建（并打印警告）
+    if diag_val_from_meta:
+        val_subjects = sorted(diag_val_from_meta)
+        print(
+            f"[infer-val] val_subjects 来自训练时 checkpoint: "
+            f"n={len(val_subjects)}"
+        )
+    else:
+        val_subjects = get_val_subjects(
+            index_csv=args.diag_csv,
+            fold=args.fold,
+            n_splits=args.n_splits,
+            seed=seed,
+        )
+        print(
+            f"[WARNING] checkpoint 中无 val_subjects，使用 sklearn 即时重建: "
+            f"n={len(val_subjects)} — 可能与训练时划分不一致！"
+        )
+
+    # ── 检查数据泄露：评估用的 val_subjects 是否出现在训练集中 ────
     eval_val_set = set(val_subjects)
     for task in ("diagnosis", "hc_emotion", "dep_emotion"):
         meta_path = resolve_path(combined["models"][task]["meta"])
-        train_train_set, train_val_set = _load_training_split(meta_path)
+        train_train_set, _ = _load_training_split(meta_path)
+        if not train_train_set:
+            # meta 没有则从 checkpoint 直接读
+            ckpt_path = resolve_path(combined["models"][task]["path"])
+            train_train_set, _ = _load_subjects_from_checkpoint(ckpt_path)
         if train_train_set:
             _check_overlap(task, eval_val_set, train_train_set)
         else:
-            print(f"[INFO] {task}: meta 中无 train_subjects，无法检查重叠。")
+            print(f"[INFO] {task}: checkpoint 中无 train_subjects，无法检查重叠。")
 
     # ── 加载并过滤验证数据 ────────────────────────────────────────
     diag_df = pd.read_csv(args.diag_csv)
