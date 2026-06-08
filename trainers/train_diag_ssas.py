@@ -2042,7 +2042,7 @@ if __name__ == "__main__":
                 repeat_index=repeat,
                 n_splits=n_splits,
                 epochs=100,
-                batch_size=32,
+                batch_size=16,
                 nclass=nclass,
                 lr=1e-4,
                 rand=rand,
