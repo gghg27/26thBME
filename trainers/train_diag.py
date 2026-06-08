@@ -1119,7 +1119,7 @@ def train_competition_cross_subject(
     lambda_con: float = 0.05,
     device: str = "cuda",
     run_seed: int = None,
-    deterministic: bool = True,
+    deterministic: bool = False,
     early_stop_patience: int = 20,
     early_stop_warmup: int = 15,
     early_stop_min_delta: float = 1e-6,
@@ -1205,7 +1205,7 @@ def train_competition_cross_subject(
         train_dataset,
         batch_sampler=train_batch_sampler,
         collate_fn=collate_fn,
-        num_workers=0,  # Windows 建议先用 0
+        num_workers=4,
         pin_memory=True,
         worker_init_fn=seed_worker,
         generator=loader_generator,
@@ -1576,7 +1576,7 @@ if __name__ == "__main__":
 
             # 关键：模型初始化前设置 seed
             run_seed = config.make_run_seed(rand, fold)
-            set_global_seed(run_seed, deterministic=True)
+            set_global_seed(run_seed, deterministic=False)
             print(f"[Main Seed] rand={rand}, fold={fold}, run_seed={run_seed}")
 
             model = EmotionPretrainModel(
@@ -1608,7 +1608,7 @@ if __name__ == "__main__":
                 lambda_con=0.0,
                 device=device,
                 run_seed=run_seed,
-                deterministic=True,
+                deterministic=False,
                 early_stop_track="combined",
                 early_stop_patience=25,
                 early_stop_warmup=15,

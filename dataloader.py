@@ -98,7 +98,7 @@ class EEGWindowDataset(Competition4ClassDataset):
         super().__init__(index_csv=index_csv, subject_ids=subject_ids, normalize=normalize)
 
 
-class MultiSubjectBatchSampler(Sampler[list[int]]):
+class MultiSubjectBatchSampler(Sampler):
     """Simple sampler kept for compatibility with the imported trainer API."""
 
     def __init__(
