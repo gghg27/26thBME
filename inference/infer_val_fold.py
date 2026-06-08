@@ -94,7 +94,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predictions_dir", type=Path, default=ROOT / "predictions")
     parser.add_argument("--results_dir", type=Path, default=ROOT / "results")
     parser.add_argument("--model_params_dir", type=Path, default=ROOT / "model_params")
-    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--device", default="cuda")
     return parser.parse_args()
 
