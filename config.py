@@ -10,13 +10,13 @@
 
 # 诊断模型（train_diag.py）
 # 可以按需扩展：例如加 123 支持第 3 次五折
-DIAG_REPEAT_SEEDS = [20, 42, 123]
+DIAG_REPEAT_SEEDS = [20, 42, 32]
 
 # HC 情绪模型（train_hc.py）
-HC_REPEAT_SEEDS = [20, 42, 123]
+HC_REPEAT_SEEDS = [20, 42, 32]
 
 # DEP 情绪模型（train_dep.py）
-DEP_REPEAT_SEEDS = [20, 42, 123]
+DEP_REPEAT_SEEDS = [20, 42, 32]
 
 # ── 交叉验证 ─────────────────────────────────────────────────────
 N_SPLITS = 5          # K 折数
