@@ -27,7 +27,7 @@ N_REPEATS = 2         # 默认 repeat 数（向后兼容）
 #   - 每个窗口硬预测(>=0.5)，按被试/trial 多数表决
 #   - 诊断结果硬路由到对应情绪模型（pred_diag=0→HC模型, 1→DEP模型）
 # False: 软投票（概率均值 + 概率加权融合）
-VAL_HARD_VOTING = False
+VAL_HARD_VOTING = True
 
 # ── run_seed 构造规则 ────────────────────────────────────────────
 # make_run_seed(base_seed, fold) = base_seed * 1000 + fold
