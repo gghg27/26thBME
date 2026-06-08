@@ -10,12 +10,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import pandas as pd
-from sklearn.model_selection import StratifiedGroupKFold
 
 import config
 from utils.checkpoint import load_meta
 from utils.folds import (
     combined_model_param_dir,
+    get_unified_subject_split,
     reapt_name,
     require_columns,
     save_json,
@@ -135,36 +135,17 @@ def get_val_subjects(
     seed: int,
 ) -> list[str]:
     """
-    使用 sklearn StratifiedGroupKFold 即时划分验证集被试。
+    使用项目统一划分函数即时重建验证集被试。
 
-    与 train_diag.py 的 get_competition_subject_split() 完全一致：
-    - 按 diagnosis_label 分层
-    - 按 subject_id 分组（同一被试不会跨训练/验证集）
+    与训练脚本一致：优先按 label4 推断 0=DEP, 1=HC，再按 subject_id 分组。
     """
-    df = pd.read_csv(index_csv)
-    subject_df = (
-        df[["subject_id", "diagnosis_label"]]
-        .drop_duplicates("subject_id")
-        .reset_index(drop=True)
-    )
-
-    sgkf = StratifiedGroupKFold(
+    split = get_unified_subject_split(
+        index_csv=index_csv,
+        fold=fold,
         n_splits=n_splits,
-        shuffle=True,
-        random_state=seed,
+        seed=seed,
     )
-
-    splits = list(
-        sgkf.split(
-            X=subject_df["subject_id"],
-            y=subject_df["diagnosis_label"],
-            groups=subject_df["subject_id"],
-        )
-    )
-
-    _, val_idx = splits[fold]
-    val_subjects = subject_df.iloc[val_idx]["subject_id"].tolist()
-    return [str(s) for s in val_subjects]
+    return [str(s) for s in split["val_all"]]
 
 
 def filter_val_subjects(df: pd.DataFrame, val_subjects: list[str]) -> pd.DataFrame:
@@ -172,6 +153,38 @@ def filter_val_subjects(df: pd.DataFrame, val_subjects: list[str]) -> pd.DataFra
     val_set = set(val_subjects)
     result = df[df["subject_id"].astype(str).isin(val_set)].copy()
     return result.reset_index(drop=True)
+
+
+def add_diagnosis_truth_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    统一生成诊断真值列，避免 diagnosis_label 编码方向不一致。
+
+    当前训练 CSV 里 diagnosis_label 是 DEP=1, HC=0；但部分训练代码
+    会用 label4 >= 2 推出 0=DEP, 1=HC。这里显式生成:
+      - true_dep: 1=DEP, 0=HC，用于和 p_dep / pred_diag 比较
+      - true_group: "DEP" / "HC"，用于 HC/DEP 子集指标
+    """
+    result = df.copy()
+
+    if "diagnosis" in result.columns:
+        diag_text = result["diagnosis"].astype(str).str.upper()
+        result["true_group"] = diag_text.where(diag_text.isin(["DEP", "HC"]), None)
+        result["true_dep"] = (diag_text == "DEP").astype(int)
+        return result
+
+    if "label4" in result.columns:
+        label4 = result["label4"].astype(int)
+        is_hc = label4 >= 2
+        result["true_group"] = is_hc.map({True: "HC", False: "DEP"})
+        result["true_dep"] = (~is_hc).astype(int)
+        return result
+
+    if "diagnosis_label" in result.columns:
+        result["true_dep"] = result["diagnosis_label"].astype(int)
+        result["true_group"] = result["true_dep"].map({1: "DEP", 0: "HC"})
+        return result
+
+    raise KeyError("需要 diagnosis / label4 / diagnosis_label 中至少一列来确定诊断真值。")
 
 
 def main() -> None:
@@ -232,17 +245,51 @@ def main() -> None:
 
     # ── 检查数据泄露：评估用的 val_subjects 是否出现在训练集中 ────
     eval_val_set = set(val_subjects)
+    checkpoint_splits: dict[str, tuple[set[str], set[str]]] = {}
     for task in ("diagnosis", "hc_emotion", "dep_emotion"):
         meta_path = resolve_path(combined["models"][task]["meta"])
-        train_train_set, _ = _load_training_split(meta_path)
-        if not train_train_set:
+        train_train_set, task_val_set = _load_training_split(meta_path)
+        if not train_train_set and not task_val_set:
             # meta 没有则从 checkpoint 直接读
             ckpt_path = resolve_path(combined["models"][task]["path"])
-            train_train_set, _ = _load_subjects_from_checkpoint(ckpt_path)
+            train_train_set, task_val_set = _load_subjects_from_checkpoint(ckpt_path)
+        checkpoint_splits[task] = (train_train_set, task_val_set)
         if train_train_set:
             _check_overlap(task, eval_val_set, train_train_set)
         else:
             print(f"[INFO] {task}: checkpoint 中无 train_subjects，无法检查重叠。")
+
+    diag_val_set = checkpoint_splits.get("diagnosis", (set(), set()))[1]
+    hc_val_set = checkpoint_splits.get("hc_emotion", (set(), set()))[1]
+    dep_val_set = checkpoint_splits.get("dep_emotion", (set(), set()))[1]
+    if diag_val_set:
+        if diag_val_set == eval_val_set:
+            print(f"[OK] diagnosis val_subjects 与本次评估 val_subjects 完全一致。")
+        else:
+            print(
+                "[WARNING] diagnosis checkpoint val_subjects 与本次评估 val_subjects 不一致: "
+                f"only_eval={sorted(eval_val_set - diag_val_set)} "
+                f"only_ckpt={sorted(diag_val_set - eval_val_set)}"
+            )
+    if hc_val_set or dep_val_set:
+        emotion_val_union = hc_val_set | dep_val_set
+        if emotion_val_union == eval_val_set:
+            print(
+                "[OK] hc_emotion.val_subjects ∪ dep_emotion.val_subjects "
+                "与本次评估 val_subjects 完全一致。"
+            )
+        else:
+            print(
+                "[WARNING] HC/DEP 情绪 checkpoint 的 val_subjects 合集与本次评估不一致: "
+                f"only_eval={sorted(eval_val_set - emotion_val_union)} "
+                f"only_emotion_ckpt={sorted(emotion_val_union - eval_val_set)}"
+            )
+        print(
+            f"[infer-val] checkpoint val counts: "
+            f"diagnosis={len(diag_val_set) if diag_val_set else 'NA'}, "
+            f"hc={len(hc_val_set) if hc_val_set else 'NA'}, "
+            f"dep={len(dep_val_set) if dep_val_set else 'NA'}"
+        )
 
     # ── 加载并过滤验证数据 ────────────────────────────────────────
     diag_df = pd.read_csv(args.diag_csv)
@@ -264,6 +311,9 @@ def main() -> None:
     if diag_df.empty or emotion_df.empty:
         raise ValueError("Validation diagnosis or emotion data is empty.")
 
+    diag_df = add_diagnosis_truth_columns(diag_df)
+    emotion_df = add_diagnosis_truth_columns(emotion_df)
+
     print(f"[infer-val] diagnosis windows={len(diag_df)} emotion windows={len(emotion_df)}")
 
     # ── 阶段一：诊断推理 ──────────────────────────────────────────
@@ -277,7 +327,8 @@ def main() -> None:
     )
     subject_probs = aggregate_subject_prob(diag_df, "p_dep", "subject_id")
     subject_truth = diag_df.groupby("subject_id", as_index=False).agg(
-        true_diag=("diagnosis_label", "first")
+        true_diag=("true_dep", "first"),
+        true_group=("true_group", "first"),
     )
     subject_probs = subject_probs.merge(subject_truth, on="subject_id", how="left")
     subject_probs["pred_diag"] = (subject_probs["p_dep_subject"] >= 0.5).astype(int)
@@ -304,7 +355,8 @@ def main() -> None:
     p_hc = aggregate_trial_prob(emotion_df, "p_pos_hc_window", "subject_id", "p_pos_hc")
     p_dep = aggregate_trial_prob(emotion_df, "p_pos_dep_window", "subject_id", "p_pos_dep")
     truth = emotion_df.groupby(["subject_id", "trial_id"], as_index=False).agg(
-        true_diag=("diagnosis_label", "first"),
+        true_diag=("true_dep", "first"),
+        true_group=("true_group", "first"),
         true_emotion=("emotion_label", "first"),
     )
     preds = (
@@ -316,6 +368,8 @@ def main() -> None:
         (1.0 - preds["p_dep_subject"]) * preds["p_pos_hc"]
         + preds["p_dep_subject"] * preds["p_pos_dep"]
     )
+    preds["pred_emotion_hc_model"] = (preds["p_pos_hc"] >= 0.5).astype(int)
+    preds["pred_emotion_dep_model"] = (preds["p_pos_dep"] >= 0.5).astype(int)
     preds["pred_emotion"] = (preds["p_final"] >= 0.5).astype(int)
     preds.insert(0, "fold", args.fold)
     preds.insert(0, "repeat", args.repeat)
@@ -326,38 +380,50 @@ def main() -> None:
             "subject_id",
             "trial_id",
             "true_diag",
+            "true_group",
             "p_dep_subject",
             "pred_diag",
             "true_emotion",
             "p_pos_hc",
             "p_pos_dep",
+            "pred_emotion_hc_model",
+            "pred_emotion_dep_model",
             "p_final",
             "pred_emotion",
         ]
     ]
 
     # ── 计算指标 ──────────────────────────────────────────────────
-    # 注意：hc_emotion_acc / dep_emotion_acc 分别评估的是
-    # true_diag==0 (DEP) 和 true_diag==1 (HC) 子集上的情绪识别准确率
-    # 按诊断分组计算 HC/DEP 子集上的情绪指标
-    hc_mask = preds["true_diag"].astype(int) == 1
-    dep_mask = preds["true_diag"].astype(int) == 0
+    # hc_emotion_acc / dep_emotion_acc: 最终软路由预测在对应真实组上的指标。
+    # hc_model_emotion_acc / dep_model_emotion_acc: 单个情绪模型在对应真实组上的指标，
+    # 更适合与 train_hc.py / train_dep.py 训练时的 val trial_acc 对齐。
+    hc_mask = preds["true_group"].astype(str).str.upper() == "HC"
+    dep_mask = preds["true_group"].astype(str).str.upper() == "DEP"
     hc_true = preds.loc[hc_mask, "true_emotion"]
-    hc_pred = preds.loc[hc_mask, "pred_emotion"]
+    hc_final_pred = preds.loc[hc_mask, "pred_emotion"]
+    hc_model_pred = preds.loc[hc_mask, "pred_emotion_hc_model"]
     dep_true = preds.loc[dep_mask, "true_emotion"]
-    dep_pred = preds.loc[dep_mask, "pred_emotion"]
+    dep_final_pred = preds.loc[dep_mask, "pred_emotion"]
+    dep_model_pred = preds.loc[dep_mask, "pred_emotion_dep_model"]
 
     metrics = {
         "repeat": args.repeat,
         "fold": args.fold,
         "seed": seed,
+        "n_val_subjects": int(len(val_subjects)),
+        "n_hc_trials": int(hc_mask.sum()),
+        "n_dep_trials": int(dep_mask.sum()),
         "diag_subject_acc": accuracy(subject_probs["true_diag"], subject_probs["pred_diag"]),
         "emotion_trial_acc_soft": accuracy(preds["true_emotion"], preds["pred_emotion"]),
         "emotion_macro_f1_soft": macro_f1(preds["true_emotion"], preds["pred_emotion"]),
-        "hc_emotion_acc": accuracy(hc_true, hc_pred),
-        "hc_emotion_f1": macro_f1(hc_true, hc_pred),
-        "dep_emotion_acc": accuracy(dep_true, dep_pred),
-        "dep_emotion_f1": macro_f1(dep_true, dep_pred),
+        "hc_emotion_acc": accuracy(hc_true, hc_final_pred),
+        "hc_emotion_f1": macro_f1(hc_true, hc_final_pred),
+        "dep_emotion_acc": accuracy(dep_true, dep_final_pred),
+        "dep_emotion_f1": macro_f1(dep_true, dep_final_pred),
+        "hc_model_emotion_acc": accuracy(hc_true, hc_model_pred),
+        "hc_model_emotion_f1": macro_f1(hc_true, hc_model_pred),
+        "dep_model_emotion_acc": accuracy(dep_true, dep_model_pred),
+        "dep_model_emotion_f1": macro_f1(dep_true, dep_model_pred),
     }
 
     # ── 保存结果 ──────────────────────────────────────────────────
