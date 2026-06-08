@@ -1596,7 +1596,7 @@ if __name__ == "__main__":
                 dataset="com",
                 n_splits=n_splits,
                 epochs=100,
-                batch_size=128,
+                batch_size=32,
                 nclass=nclass,
                 lr=1e-4,
                 rand=rand,
