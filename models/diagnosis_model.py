@@ -2621,7 +2621,7 @@ class BrainGraphBackbone(nn.Module):
         hjorth = h["hjorth"]
 
         # 保留原来的对比学习特征。
-        node_contrast_feat = self.node_contrast_projector(node_features)  # [B, 64]
+
 
         # =====================================================
         # 2. 分支 1：多尺度卷积分支直接读出
@@ -2680,7 +2680,7 @@ class BrainGraphBackbone(nn.Module):
             "z_or": z_plv,
 
             "node_features": node_features,
-            "node_contrast_feat": node_contrast_feat,
+
             "node_embeddings": plv_node_embeddings,
 
             # 为了兼容旧训练代码，adj_norm / adj_dense 默认返回 PLV 分支图。

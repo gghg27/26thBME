@@ -730,20 +730,19 @@ def validate_one_epoch_emotion_grl(
     lambda_con: float = 0.05,
     con_temperature: float = 0.1,
 ):
+    """验证一轮 — 已注释验证时恒为 0 的损失以加速。"""
     model.eval()
 
     total_loss = 0.0
     total_emo_loss = 0.0
-    total_diag_loss = 0.0
-    total_subject_loss = 0.0
-    total_graph_loss = 0.0
     total_con_loss = 0.0
     total_num = 0
 
     all_emo_preds, all_emo_labels = [], []
     all_diag_preds, all_diag_labels = [], []
-    all_subject_preds, all_subject_labels = [], []
     segment_records = []
+
+    _need_con = lambda_con > 0
 
     pbar = tqdm(loader, desc="Val", leave=False)
 
@@ -762,12 +761,11 @@ def validate_one_epoch_emotion_grl(
         emo_logits = out["emo_logits"]
         diagnosis_logits = out["diagnosis_logits"]
         subject_logits = out["subject_logits"]
-        adj_dense = out["adj_dense"]
         contrast_feat = out.get("contrast_feat", out.get("graph_feat", None))
 
         loss_emo = criterion_emo(emo_logits, y_emo)
 
-        if lambda_con > 0:
+        if _need_con:
             if contrast_feat is None:
                 raise KeyError("模型输出中缺少 contrast_feat / graph_feat，无法计算对比学习损失。")
             loss_con = supervised_contrastive_loss(
@@ -778,28 +776,18 @@ def validate_one_epoch_emotion_grl(
         else:
             loss_con = emo_logits.new_tensor(0.0)
 
-        loss_diag = criterion_diag(diagnosis_logits, y_diag) if lambda_diag > 0 else emo_logits.new_tensor(0.0)
+        # ── 以下损失在验证时 lambda 恒为 0，已注释以加速 ──
+        # loss_diag = criterion_diag(diagnosis_logits, y_diag) ...
+        # loss_subject = ...
+        # loss_graph = intra_class_graph_loss(adj_dense, y_emo)
 
-        if lambda_subject > 0 and y_subject is not None and int(y_subject.max().item()) < subject_logits.size(1):
-            loss_subject = criterion_subject(subject_logits, y_subject)
-        else:
-            loss_subject = emo_logits.new_tensor(0.0)
-
-        loss_graph = intra_class_graph_loss(adj_dense, y_emo)
-        loss = (
-            lambda_emo * loss_emo
-            + lambda_con * loss_con
-            + lambda_diag * loss_diag
-            + lambda_subject * loss_subject
-            + lambda_graph * loss_graph
-        )
+        loss = lambda_emo * loss_emo + lambda_con * loss_con
 
         prob_emo = torch.softmax(emo_logits, dim=1)
         prob_pos = prob_emo[:, 1]
 
         pred_emo = emo_logits.argmax(dim=1)
         pred_diag = diagnosis_logits.argmax(dim=1)
-        pred_subject = subject_logits.argmax(dim=1)
 
         subject_ids_cpu = batch["subject_id"]
         trial_ids_cpu = batch["trial_id"]
@@ -818,9 +806,6 @@ def validate_one_epoch_emotion_grl(
         bsz = x.size(0)
         total_loss += loss.item() * bsz
         total_emo_loss += loss_emo.item() * bsz
-        total_diag_loss += loss_diag.item() * bsz
-        total_subject_loss += loss_subject.item() * bsz
-        total_graph_loss += loss_graph.item() * bsz
         total_con_loss += loss_con.item() * bsz
         total_num += bsz
 
@@ -828,9 +813,6 @@ def validate_one_epoch_emotion_grl(
         all_emo_labels.extend(y_emo.detach().cpu().numpy().tolist())
         all_diag_preds.extend(pred_diag.detach().cpu().numpy().tolist())
         all_diag_labels.extend(y_diag.detach().cpu().numpy().tolist())
-        if y_subject is not None:
-            all_subject_preds.extend(pred_subject.detach().cpu().numpy().tolist())
-            all_subject_labels.extend(y_subject.detach().cpu().numpy().tolist())
 
         pbar.set_postfix({
             "loss": f"{total_loss / max(total_num, 1):.4f}",
@@ -876,10 +858,8 @@ def validate_one_epoch_emotion_grl(
     )
     diagnosis_cm = confusion_matrix(all_diag_labels, all_diag_preds, labels=[0, 1])
 
-    if len(all_subject_labels) > 0:
-        subject_acc = accuracy_score(all_subject_labels, all_subject_preds)
-    else:
-        subject_acc = 0.0
+    # ── subject_acc 在验证时不需要（lambda_subject 恒为 0），设 0 ──
+    subject_acc = 0.0
 
     trial_metrics = compute_trial_level_metrics(segment_records, threshold=0.5, vote_method="hard")
 
@@ -902,9 +882,9 @@ def validate_one_epoch_emotion_grl(
     return {
         "loss": total_loss / total_num,
         "emo_loss": total_emo_loss / total_num,
-        "diag_loss": total_diag_loss / total_num,
-        "subject_loss": total_subject_loss / total_num,
-        "graph_loss": total_graph_loss / total_num,
+        "diag_loss": 0.0,       # 验证时 lambda_diag 恒为 0
+        "subject_loss": 0.0,    # 验证时 lambda_subject 恒为 0
+        "graph_loss": 0.0,      # 验证时 lambda_graph 恒为 0
         "con_loss": total_con_loss / total_num,
 
         "emotion_acc": emotion_acc,

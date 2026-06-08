@@ -114,13 +114,17 @@ def validate_one_epoch_comp4(
 ):
     """
     验证 / 测试一轮，并返回尽可能完整的指标。
+
+    注意：为加速验证，以下损失仅在对应 lambda > 0 时才计算：
+      - contrast_loss：当前训练配置中未用于验证，已注释
+      - graph_loss：仅当 lambda_graph > 0 时计算
     """
     model.eval()
 
     total_loss = 0.0
     total_ce = 0.0
-    total_graph = 0.0
-    total_con = 0.0
+    # total_graph = 0.0   # 当前配置 lambda_graph=0，已注释
+    # total_con = 0.0     # 当前配置验证时不使用 contrast loss
 
     total_correct = 0
     total_num = 0
@@ -131,6 +135,8 @@ def validate_one_epoch_comp4(
     all_emo_preds = []
     all_emo_labels = []
     segment_records = []
+
+    _need_graph = lambda_graph > 0  # 编译期常量折叠
 
     pbar = tqdm(loader, desc="Val", leave=False)
 
@@ -144,29 +150,35 @@ def validate_one_epoch_comp4(
             y = batch["diagnosis_label"].to(device).long()
             y_emo = y
 
-        subject_id = batch["subject_id"].to(device).long()
+        # subject_id = batch["subject_id"].to(device).long()  # 当前仅 contrast loss 需要，已注释
         de_feat = batch["de_feat"].to(device)
 
         out = model(x, de_feat, 0, dataset_name="comp4")
         logits = out["logits"]
-        adj_dense = out.get("adj_dense", None)
-        contrast_feat = out.get("node_contrast_feat", None)
+        # adj_dense = out.get("adj_dense", None)      # 当前配置 lambda_graph=0，已注释
+        # contrast_feat = out.get("node_contrast_feat", None)  # 验证时不使用
 
-        if contrast_feat is not None:
-            loss_con = contrast_criterion(
-                features=contrast_feat,
-                labels=y,
-                subjects=subject_id,
-            )
-        else:
-            loss_con = logits.new_tensor(0.0)
+        # ── contrast loss：当前验证 loss 中不使用，注释以加速 ──
+        # if contrast_feat is not None:
+        #     loss_con = contrast_criterion(
+        #         features=contrast_feat,
+        #         labels=y,
+        #         subjects=subject_id,
+        #     )
+        # else:
+        #     loss_con = logits.new_tensor(0.0)
 
         loss_ce = criterion_ce(logits, y)
-        if lambda_graph > 0 and adj_dense is not None:
-            loss_graph = intra_class_graph_loss(adj_dense, y)
+        if _need_graph:
+            adj_dense = out.get("adj_dense", None)
+            if adj_dense is not None:
+                loss_graph = intra_class_graph_loss(adj_dense, y)
+            else:
+                loss_graph = logits.new_tensor(0.0)
+            loss = loss_ce + lambda_graph * loss_graph
         else:
-            loss_graph = logits.new_tensor(0.0)
-        loss = loss_ce + lambda_graph * loss_graph
+            # loss_graph = logits.new_tensor(0.0)   # 不再需要
+            loss = loss_ce
 
         pred = logits.argmax(dim=1)
         pred_emo = (pred % 2).long() if nclass == 4 else pred
@@ -202,8 +214,8 @@ def validate_one_epoch_comp4(
 
         total_loss += loss.item() * bsz
         total_ce += loss_ce.item() * bsz
-        total_graph += loss_graph.item() * bsz
-        total_con += loss_con.item() * bsz
+        # total_graph += loss_graph.item() * bsz   # 已注释
+        # total_con += loss_con.item() * bsz       # 已注释
         total_correct += correct
         total_emo_correct += emo_correct
         total_num += bsz
@@ -216,8 +228,8 @@ def validate_one_epoch_comp4(
         pbar.set_postfix({
             "loss": f"{total_loss / max(total_num, 1):.4f}",
             "ce": f"{total_ce / max(total_num, 1):.4f}",
-            "graph": f"{total_graph / max(total_num, 1):.4f}",
-            "contrast_loss": f"{total_con / max(total_num, 1):.4f}",
+            # "graph": f"{total_graph / max(total_num, 1):.4f}",       # 已注释
+            # "contrast_loss": f"{total_con / max(total_num, 1):.4f}",  # 已注释
             "acc": f"{total_correct / max(total_num, 1):.4f}",
             "emo_acc": f"{total_emo_correct / max(total_num, 1):.4f}",
         })
@@ -302,8 +314,8 @@ def validate_one_epoch_comp4(
     metrics = {
         "loss": total_loss / total_num,
         "ce_loss": total_ce / total_num,
-        "graph_loss": total_graph / total_num,
-        "contrast_loss": total_con / total_num,
+        "graph_loss": 0.0,       # 当前配置 lambda_graph=0，验证时不计算
+        "contrast_loss": 0.0,    # 当前验证 loss 中不使用 contrast loss
 
         "acc": acc,
         "macro_f1": macro_f1,
@@ -358,7 +370,6 @@ def validate_one_epoch_comp4(
 def train_one_epoch_comp4(
     model,
     loader,
-    contrast_criterion,
     optimizer,
     criterion_ce,
     dom_criterion,
@@ -368,6 +379,12 @@ def train_one_epoch_comp4(
     grl_domain: float = 0.1,
     lambda_graph: float = 0.6,
     lambda_con: float = 0.05,
+
+    # 新增
+    center_criterion=None,
+    lambda_center: float = 0.0,
+    center_warmup_epochs: int = 10,
+    current_epoch: int = 1,
 ):
     """
     单次训练。
@@ -381,6 +398,7 @@ def train_one_epoch_comp4(
     total_num = 0
     total_dom_loss = 0.0
     total_con_loss = 0.0
+    total_loss_center = 0.0
 
     pbar = tqdm(loader, desc="Train", leave=False)
 
@@ -396,37 +414,47 @@ def train_one_epoch_comp4(
 
         optimizer.zero_grad(set_to_none=True)
 
-        out = model(x, de_feat, grl_domain, dataset_name="comp4")
+        out = model(
+                    x,
+                    de_feat=de_feat,
+                    lambda_emo=0.0,
+                    lambda_subject=0.0,
+                    dataset_name="comp4",
+                )
+        #诊断logits
         logits = out["logits"]
-        adj_dense = out.get("adj_dense", None)
         domain_logits = out.get("domain_logits", None)
-        contrast_feat = out.get("node_contrast_feat", None)
+        #图读出feat
+        graph_feat = out.get("graph_feat", None)
 
-        if contrast_feat is not None:
-            loss_con = contrast_criterion(
-                features=contrast_feat,
-                labels=y,
-                subjects=subject_id,
-            )
+        #类中心损失
+        if center_criterion is not None and lambda_center > 0 and graph_feat is not None:
+            loss_center, center_info = center_criterion(graph_feat, y)
+
+            if current_epoch <= center_warmup_epochs:
+                center_weight = 0.0
+            else:
+                center_weight = float(lambda_center)
         else:
-            loss_con = logits.new_tensor(0.0)
+            loss_center = logits.new_tensor(0.0)
+            center_weight = 0.0
+            center_info = {"center_acc": 0.0}
 
-        if domain_logits is not None:
+        #域损失
+        if domain_logits is not None and lambdad_domain > 0:
             loss_dom = dom_criterion(domain_logits, subject_id)
         else:
             loss_dom = logits.new_tensor(0.0)
 
+        #分类损失
         loss_ce = criterion_ce(logits, y)
-        if lambda_graph > 0 and adj_dense is not None:
-            loss_graph = intra_class_graph_loss(adj_dense, y)
-        else:
-            loss_graph = logits.new_tensor(0.0)
+
 
         loss = (
             loss_ce
-            + lambda_graph * loss_graph
+            + center_weight * loss_center
             + lambdad_domain * loss_dom
-            + lambda_con * loss_con
+
         )
 
         loss.backward()
@@ -437,9 +465,9 @@ def train_one_epoch_comp4(
         bsz = x.size(0)
 
         total_loss += loss.item() * bsz
-        total_con_loss += loss_con.item() * bsz
+        total_loss_center += loss_center.item() * bsz
         total_ce += loss_ce.item() * bsz
-        total_graph += loss_graph.item() * bsz
+  
         total_dom_loss += loss_dom.item() * bsz
         total_correct += correct
         total_num += bsz
@@ -447,9 +475,9 @@ def train_one_epoch_comp4(
         pbar.set_postfix({
             "loss": f"{total_loss / max(total_num, 1):.4f}",
             "ce": f"{total_ce / max(total_num, 1):.4f}",
-            "graph": f"{total_graph / max(total_num, 1):.4f}",
+            # "graph": f"{total_graph / max(total_num, 1):.4f}",
             "loss_dom": f"{total_dom_loss / max(total_num, 1):.4f}",
-            "contrast_loss": f"{total_con_loss / max(total_num, 1):.4f}",
+            "total_loss_center": f"{total_loss_center / max(total_num, 1):.4f}",
             "acc": f"{total_correct / max(total_num, 1):.4f}",
         })
 
@@ -459,9 +487,9 @@ def train_one_epoch_comp4(
     metrics = {
         "loss": total_loss / total_num,
         "ce_loss": total_ce / total_num,
-        "graph_loss": total_graph / total_num,
+        # "graph_loss": total_graph / total_num,
         "loss_dom": total_dom_loss / total_num,
-        "loss_con": total_con_loss / total_num,
+        "loss_center": total_loss_center / total_num,
         "acc": total_correct / total_num,
     }
     return metrics
@@ -687,6 +715,77 @@ class RelationCosineContrastLoss(torch.nn.Module):
             return features.new_tensor(0.0)
 
         return torch.stack(losses).mean()
+
+
+class ClassCenterContrastLoss(torch.nn.Module):
+    """
+    类中心对比 CE / Prototype CE。
+
+    作用：
+        1. 将融合特征 z 投影到对比空间；
+        2. 维护 num_classes 个可学习类中心；
+        3. 用 cosine(z, center) / tau 得到 center_logits；
+        4. 对 center_logits 和 diagnosis_label 做 CE。
+
+    对二分类诊断：
+        center_0: 诊断类别0中心
+        center_1: 诊断类别1中心
+    """
+
+    def __init__(
+        self,
+        in_dim: int = 192,
+        proj_dim: int = 64,
+        num_classes: int = 2,
+        tau: float = 0.1,
+        dropout: float = 0.2,
+        label_smoothing: float = 0.0,
+    ):
+        super().__init__()
+        self.tau = float(tau)
+        self.num_classes = int(num_classes)
+        self.label_smoothing = float(label_smoothing)
+
+        self.projector = torch.nn.Sequential(
+            torch.nn.Linear(in_dim, proj_dim),
+            torch.nn.GELU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(proj_dim, proj_dim),
+        )
+
+        self.centers = torch.nn.Parameter(
+            torch.randn(num_classes, proj_dim)
+        )
+
+        torch.nn.init.xavier_uniform_(self.centers)
+
+    def forward(self, features, labels):
+        """
+        features: [B, in_dim]，建议传 out["graph_feat"]
+        labels:   [B]，diagnosis_label
+        """
+        z = self.projector(features)
+        z = F.normalize(z, dim=1)
+
+        centers = F.normalize(self.centers, dim=1)
+
+        center_logits = torch.matmul(z, centers.t()) / self.tau
+
+        loss = F.cross_entropy(
+            center_logits,
+            labels.long(),
+            label_smoothing=self.label_smoothing,
+        )
+
+        pred = center_logits.argmax(dim=1)
+        acc = (pred == labels).float().mean()
+
+        return loss, {
+            "center_acc": float(acc.detach().cpu()),
+            "center_logits": center_logits.detach(),
+        }
+
+
 
 
 # =========================================================
@@ -1124,6 +1223,12 @@ def train_competition_cross_subject(
     early_stop_warmup: int = 15,
     early_stop_min_delta: float = 1e-6,
     early_stop_track: str = "combined",
+
+        # 新增
+    lambda_center: float = 0.0,
+    center_tau: float = 0.1,
+    center_dim: int = 64,
+    center_warmup_epochs: int = 10,
 ):
     """
     跨被试训练。
@@ -1236,18 +1341,23 @@ def train_competition_cross_subject(
     )
 
     dom_criterion = torch.nn.CrossEntropyLoss()
-    contrast_criterion = RelationCosineContrastLoss(
-        positive_classes=(1, 3),
-        negative_class=(2,),
-        pos_target=0.8,
-        neg_margin=0.2,
-        use_cross_subject=True,
-        use_cross_class_only=True,
-    )
+    center_criterion = ClassCenterContrastLoss(
+        in_dim=model.in_dim if hasattr(model, "in_dim") else 192,
+        proj_dim=64,
+        num_classes=nclass,
+        tau=center_tau,
+        dropout=0.2,
+        label_smoothing=0.0,
+    ).to(device)
 
     # -------- optimizer --------
+    optim_params = list(model.parameters())
+
+    if center_criterion is not None and lambda_center > 0:
+        optim_params += list(center_criterion.parameters())
+
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        optim_params,
         lr=lr,
         weight_decay=weight_decay,
     )
@@ -1278,6 +1388,10 @@ def train_competition_cross_subject(
         "early_stop_warmup": early_stop_warmup,
         "early_stop_min_delta": early_stop_min_delta,
         "early_stop_track": early_stop_track,
+        "lambda_center": lambda_center,
+        "center_tau": center_tau,
+        "center_dim": center_dim,
+        "center_warmup_epochs": center_warmup_epochs,
     }
 
     # -------- 并列保存多个最优模型 --------
@@ -1366,7 +1480,9 @@ def train_competition_cross_subject(
         f"criteria={format_criteria(early_stopper.criteria)}, "
         f"patience={early_stop_patience}, "
         f"warmup={early_stop_warmup}, "
-        f"min_delta={early_stop_min_delta}"
+        f"min_delta={early_stop_min_delta}, "
+        f"lambda_center={lambda_center}, "
+        f"center_warmup_epochs={center_warmup_epochs}"
     )
 
     history = []
@@ -1380,13 +1496,16 @@ def train_competition_cross_subject(
             optimizer=optimizer,
             nclass=nclass,
             criterion_ce=criterion_ce,
-            contrast_criterion=contrast_criterion,
             dom_criterion=dom_criterion,
             device=device,
             grl_domain=grl_domain,
             lambda_graph=lambda_graph,
             lambdad_domain=lambda_dom,
             lambda_con=lambda_con,
+            center_criterion=center_criterion,
+            lambda_center=lambda_center,
+            center_warmup_epochs=center_warmup_epochs,
+            current_epoch=epoch,
         )
 
         val_metrics = validate_one_epoch_comp4(
@@ -1394,7 +1513,7 @@ def train_competition_cross_subject(
             loader=val_loader,
             nclass=nclass,
             criterion_ce=criterion_ce,
-            contrast_criterion=contrast_criterion,
+            contrast_criterion=None,   # 当前验证 loss 中不使用
             device=device,
             lambda_graph=lambda_graph,
         )
@@ -1405,9 +1524,8 @@ def train_competition_cross_subject(
         print(
             f"[Train] loss={train_metrics['loss']:.4f} "
             f"ce={train_metrics['ce_loss']:.4f} "
-            f"graph={train_metrics['graph_loss']:.4f} "
             f"loss_dom={train_metrics['loss_dom']:.4f} "
-            f"loss_con={train_metrics['loss_con']:.4f} "
+            f"loss_center={train_metrics['loss_center']:.4f} "
             f"acc={train_metrics['acc']:.4f}"
         )
         print(
