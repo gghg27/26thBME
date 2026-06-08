@@ -71,6 +71,7 @@ from dataloader import (
 )
 
 from models.dep_contrast_bio import EmotionPretrainModel
+from utils.folds import get_unified_subject_split
 
 
 # =========================================================
@@ -1054,13 +1055,23 @@ def train_competition_cross_subject(
     print(f"[Seed] rand={rand}, fold={fold}, run_seed={run_seed}, deterministic={deterministic}")
     print(f"[TrainGroup] {train_group}")
 
-    train_subjects, val_subjects, subject_df = get_competition_subject_split(
+    # ── 统一交叉验证划分：三个模型共用同一套 StratifiedGroupKFold ──
+    split = get_unified_subject_split(
         index_csv=index_csv,
         fold=fold,
         n_splits=n_splits,
         seed=rand,
-        train_group=train_group,
     )
+    if train_group == "hc":
+        train_subjects = split["train_hc"]
+        val_subjects = split["val_hc"]
+    elif train_group == "dep":
+        train_subjects = split["train_dep"]
+        val_subjects = split["val_dep"]
+    else:
+        train_subjects = split["train_all"]
+        val_subjects = split["val_all"]
+    subject_df = split["subject_df"]
 
     print(f"Fold {fold}")
     print("train subjects:", len(train_subjects), train_subjects)

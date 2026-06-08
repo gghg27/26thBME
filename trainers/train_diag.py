@@ -52,6 +52,7 @@ from dataloader import (
     comp4_collate_fn,
 )
 from models.diagnosis_model import EmotionPretrainModel
+from utils.folds import get_unified_subject_split
 
 
 # =========================================================
@@ -1145,12 +1146,15 @@ def train_competition_cross_subject(
     print(f"[Seed] rand={rand}, fold={fold}, run_seed={run_seed}, deterministic={deterministic}")
 
     # -------- subject-level split --------
-    train_subjects, val_subjects = get_competition_subject_split(
+    # ── 统一交叉验证划分：三个模型共用同一套 StratifiedGroupKFold ──
+    split = get_unified_subject_split(
         index_csv=index_csv,
         fold=fold,
         n_splits=n_splits,
         seed=rand,
     )
+    train_subjects = split["train_all"]
+    val_subjects = split["val_all"]
 
     print(f"Fold {fold}")
     print("train subjects:", len(train_subjects), train_subjects)

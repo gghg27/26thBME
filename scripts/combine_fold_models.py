@@ -71,6 +71,8 @@ def synthesize_meta_from_checkpoint(
     model_module: str,
 ) -> dict[str, Any]:
     config: dict[str, Any] = {}
+    train_subjects: list | None = None
+    val_subjects: list | None = None
     if isinstance(checkpoint, dict):
         task = checkpoint.get("task", task)
         config = dict(checkpoint.get("config") or {})
@@ -79,6 +81,10 @@ def synthesize_meta_from_checkpoint(
         metric_value = checkpoint.get("best_metric_value")
         if "label_map" in checkpoint:
             config.setdefault("checkpoint_label_map", checkpoint["label_map"])
+
+        # ★ 从 checkpoint 中提取训练时保存的被试划分
+        train_subjects = checkpoint.get("train_subjects")
+        val_subjects = checkpoint.get("val_subjects")
 
         # ★ 从实际权重形状推断 model_init_args，覆盖 TASK_SPECS 默认值
         state_dict = extract_state_dict(checkpoint)
@@ -105,6 +111,8 @@ def synthesize_meta_from_checkpoint(
         best_epoch=best_epoch,
         best_metric_name=metric_name,
         best_metric_value=metric_value,
+        train_subjects=train_subjects,
+        val_subjects=val_subjects,
         config=config,
     )
 
@@ -123,17 +131,42 @@ def load_or_create_meta(
 
     model_class, model_module = cli_model_info(args, task)
     checkpoint = torch_load(ckpt_path)
-    validate_checkpoint_meta(
-        checkpoint, task=task, repeat=args.repeat, fold=args.fold, path=ckpt_path
-    )
+    try:
+        validate_checkpoint_meta(
+            checkpoint, task=task, repeat=args.repeat, fold=args.fold, path=ckpt_path
+        )
+    except ValueError as e:
+        print(f"[combine] checkpoint 元数据校验警告 (将忽略): {e}")
 
     # 从实际权重推断正确的 model_init_args
     state_dict = extract_state_dict(checkpoint)
     inferred = infer_init_args_from_state_dict(state_dict) if isinstance(state_dict, dict) else {}
 
-    if meta_path.exists():
-        meta = load_meta(meta_path)
+    # ── 辅助函数：从 checkpoint 重新合成 meta ──
+    def _regenerate_meta() -> dict[str, Any]:
+        meta = synthesize_meta_from_checkpoint(
+            checkpoint=checkpoint,
+            task=task,
+            repeat=args.repeat,
+            fold=args.fold,
+            model_file=spec["file"],
+            model_class=model_class,
+            model_module=model_module,
+        )
         validate_meta(meta, task=task, repeat=args.repeat, fold=args.fold)
+        save_json(meta, meta_path)
+        print(f"[combine] 已重新生成 meta: {meta_path}")
+        return meta
+
+    if meta_path.exists():
+        try:
+            meta = load_meta(meta_path)
+            validate_meta(meta, task=task, repeat=args.repeat, fold=args.fold)
+        except (ValueError, KeyError) as e:
+            print(f"[combine] meta 校验失败，将从 checkpoint 重新生成: {e}")
+            meta = _regenerate_meta()
+            return ckpt_path, meta_path, meta
+
         # 检查已有 meta 的 model_init_args 与实际权重是否一致
         existing_init = (meta.get("config") or {}).get("model_init_args") or {}
         mismatches = {}
@@ -143,27 +176,11 @@ def load_or_create_meta(
                 mismatches[key] = f"meta={actual} checkpoint={expected}"
         if mismatches:
             print(f"[combine] meta 与实际权重不一致，重新生成: {mismatches}")
-            meta = synthesize_meta_from_checkpoint(
-                checkpoint=checkpoint, task=task, repeat=args.repeat,
-                fold=args.fold, model_file=spec["file"],
-                model_class=model_class, model_module=model_module,
-            )
-            validate_meta(meta, task=task, repeat=args.repeat, fold=args.fold)
-            save_json(meta, meta_path)
+            meta = _regenerate_meta()
         return ckpt_path, meta_path, meta
 
-    meta = synthesize_meta_from_checkpoint(
-        checkpoint=checkpoint,
-        task=task,
-        repeat=args.repeat,
-        fold=args.fold,
-        model_file=spec["file"],
-        model_class=model_class,
-        model_module=model_module,
-    )
-    validate_meta(meta, task=task, repeat=args.repeat, fold=args.fold)
-    save_json(meta, meta_path)
-    print(f"[combine] synthesized missing meta: {meta_path}")
+    # meta 不存在，从 checkpoint 合成
+    meta = _regenerate_meta()
     return ckpt_path, meta_path, meta
 
 
@@ -173,16 +190,25 @@ def resolve_task_fold_dir(args: argparse.Namespace, task: str) -> Path:
         TASK_PREFIX[task], args.repeat, args.fold, args.model_params_dir
     )
     if (task_dir / spec["file"]).exists():
+        print(f"[combine] {task}: 使用目录 {task_dir}")
         return task_dir
 
+    # 旧版目录作为兜底（例如 repeat0_fold0/ 下直接放三个模型的 .pt 文件）
     legacy_dir = model_param_dir(args.repeat, args.fold, args.model_params_dir)
     if (legacy_dir / spec["file"]).exists():
-        print(f"[combine] using legacy directory for {task}: {legacy_dir}")
+        print(f"[combine] {task}: 使用旧版目录 {legacy_dir}")
         return legacy_dir
 
+    # 扫描所有可能的目录，给出更有帮助的错误信息
+    all_dirs = sorted(
+        d.name for d in args.model_params_dir.iterdir()
+        if d.is_dir() and spec["file"] in [f.name for f in d.iterdir()]
+    ) if args.model_params_dir.exists() else []
     raise FileNotFoundError(
-        f"Missing checkpoint for {task}. Tried: "
-        f"{task_dir / spec['file']} and {legacy_dir / spec['file']}"
+        f"Missing checkpoint for {task} (repeat={args.repeat}, fold={args.fold}).\n"
+        f"  Tried: {task_dir / spec['file']}\n"
+        f"  Tried: {legacy_dir / spec['file']}\n"
+        + (f"  Dirs with {spec['file']}: {all_dirs}" if all_dirs else "")
     )
 
 

@@ -28,6 +28,35 @@ from utils.predict import (
     predict_windows,
 )
 
+# ── 从 checkpoint meta 中读取训练时的 train/val 被试划分 ──────────
+def _load_training_split(meta_path: str | Path) -> tuple[set[str], set[str]]:
+    """
+    尝试从 meta JSON 中读取训练时保存的 train_subjects / val_subjects。
+    返回 (train_set, val_set)，若缺失则返回空集。
+    """
+    meta_path = Path(meta_path)
+    if not meta_path.exists():
+        return set(), set()
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return set(), set()
+    train = {str(s) for s in (meta.get("train_subjects") or [])}
+    val = {str(s) for s in (meta.get("val_subjects") or [])}
+    return train, val
+
+
+def _check_overlap(model_name: str, eval_val: set[str], train_train: set[str]) -> None:
+    """检查评估用的验证被试是否与模型训练集有重叠（即数据泄露）。"""
+    overlap = eval_val & train_train
+    if overlap:
+        print(
+            f"[WARNING] {model_name}: {len(overlap)} 个评估验证被试出现在该模型训练集中！"
+            f" 重叠被试: {sorted(overlap)[:10]}{'...' if len(overlap) > 10 else ''}"
+        )
+    else:
+        print(f"[OK] {model_name}: 评估验证被试与该模型训练集无重叠。")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run two-stage validation inference.")
@@ -47,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predictions_dir", type=Path, default=ROOT / "predictions")
     parser.add_argument("--results_dir", type=Path, default=ROOT / "results")
     parser.add_argument("--model_params_dir", type=Path, default=ROOT / "model_params")
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--device", default="cuda")
     return parser.parse_args()
 
@@ -134,16 +163,11 @@ def main() -> None:
 
     device = args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu"
 
-    # ── 确定 seed：与 train_diag.py 的 enumerate([20, 42]) 对齐 ────
+    # ── 确定 seed：与训练脚本共用 config.get_seed_for_repeat ────
     if args.seed is not None:
         seed = args.seed
-    elif args.repeat < len(config.DIAG_REPEAT_SEEDS):
-        seed = config.DIAG_REPEAT_SEEDS[args.repeat]
     else:
-        raise ValueError(
-            f"--repeat={args.repeat} 超出 diag 种子列表 {config.DIAG_REPEAT_SEEDS}，"
-            f"请显式指定 --seed。"
-        )
+        seed = config.get_seed_for_repeat("diagnosis", args.repeat)
     print(f"[infer-val] repeat={args.repeat} → seed={seed}")
 
     # ── sklearn 即时划分（替代原来的 load_fold + filter_subjects）───
@@ -171,6 +195,16 @@ def main() -> None:
         )
         for task in ("diagnosis", "hc_emotion", "dep_emotion")
     }
+
+    # ── 检查数据泄露：评估用验证被试是否出现在各模型训练集中 ────
+    eval_val_set = set(val_subjects)
+    for task in ("diagnosis", "hc_emotion", "dep_emotion"):
+        meta_path = resolve_path(combined["models"][task]["meta"])
+        train_train_set, train_val_set = _load_training_split(meta_path)
+        if train_train_set:
+            _check_overlap(task, eval_val_set, train_train_set)
+        else:
+            print(f"[INFO] {task}: meta 中无 train_subjects，无法检查重叠。")
 
     # ── 加载并过滤验证数据 ────────────────────────────────────────
     diag_df = pd.read_csv(args.diag_csv)
@@ -267,6 +301,14 @@ def main() -> None:
     # ── 计算指标 ──────────────────────────────────────────────────
     # 注意：hc_emotion_acc / dep_emotion_acc 分别评估的是
     # true_diag==0 (DEP) 和 true_diag==1 (HC) 子集上的情绪识别准确率
+    # 按诊断分组计算 HC/DEP 子集上的情绪指标
+    hc_mask = preds["true_diag"].astype(int) == 1
+    dep_mask = preds["true_diag"].astype(int) == 0
+    hc_true = preds.loc[hc_mask, "true_emotion"]
+    hc_pred = preds.loc[hc_mask, "pred_emotion"]
+    dep_true = preds.loc[dep_mask, "true_emotion"]
+    dep_pred = preds.loc[dep_mask, "pred_emotion"]
+
     metrics = {
         "repeat": args.repeat,
         "fold": args.fold,
@@ -274,14 +316,10 @@ def main() -> None:
         "diag_subject_acc": accuracy(subject_probs["true_diag"], subject_probs["pred_diag"]),
         "emotion_trial_acc_soft": accuracy(preds["true_emotion"], preds["pred_emotion"]),
         "emotion_macro_f1_soft": macro_f1(preds["true_emotion"], preds["pred_emotion"]),
-        "hc_emotion_acc": accuracy(
-            preds.loc[preds["true_diag"].astype(int) == 1, "true_emotion"],
-            preds.loc[preds["true_diag"].astype(int) == 1, "pred_emotion"],
-        ),
-        "dep_emotion_acc": accuracy(
-            preds.loc[preds["true_diag"].astype(int) == 0, "true_emotion"],
-            preds.loc[preds["true_diag"].astype(int) == 0, "pred_emotion"],
-        ),
+        "hc_emotion_acc": accuracy(hc_true, hc_pred),
+        "hc_emotion_f1": macro_f1(hc_true, hc_pred),
+        "dep_emotion_acc": accuracy(dep_true, dep_pred),
+        "dep_emotion_f1": macro_f1(dep_true, dep_pred),
     }
 
     # ── 保存结果 ──────────────────────────────────────────────────

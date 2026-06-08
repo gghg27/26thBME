@@ -35,24 +35,49 @@ from utils.folds import reapt_name
 def discover_folds(model_params_dir: Path) -> list[tuple[int, int]]:
     """
     扫描 model_params/，找到三个模型 checkpoint 都存在的 (repeat, fold)。
-    模式: diag_reapt{r}_fold{f}/diag_best.pt 等。
+
+    支持两种目录命名模式：
+      - 新版: diag_reapt{r}_fold{f}/   (训练脚本当前使用)
+      - 旧版: repeat{r}_fold{f}/       (历史遗留，需检查内部文件)
     """
     if not model_params_dir.exists():
         return []
 
     def _scan(prefix: str) -> set[tuple[int, int]]:
-        pat = re.compile(rf"{prefix}_reapt(\d+)_fold(\d+)")
+        # 新版命名: diag_reapt0_fold1
+        pat_new = re.compile(rf"{prefix}_reapt(\d+)_fold(\d+)")
+        # 旧版命名: diag_repeat0_fold1 (极少见但兼容)
+        pat_old = re.compile(rf"{prefix}_repeat(\d+)_fold(\d+)")
         pairs: set[tuple[int, int]] = set()
         for item in model_params_dir.iterdir():
             if not item.is_dir():
                 continue
-            m = pat.match(item.name)
+            m = pat_new.match(item.name) or pat_old.match(item.name)
             if m:
                 pairs.add((int(m.group(1)), int(m.group(2))))
         return pairs
 
-    ready = sorted(_scan("diag") & _scan("hc") & _scan("dep"))
-    return ready
+    # 新版命名：每个模型有独立目录
+    ready_new = sorted(_scan("diag") & _scan("hc") & _scan("dep"))
+
+    # 旧版命名：三个模型文件在同一个 repeat{r}_fold{f} 目录下
+    # 检查目录内是否有 diag_best.pt / hc_best.pt / dep_best.pt
+    legacy_pairs: set[tuple[int, int]] = set()
+    legacy_pat = re.compile(r"repeat(\d+)_fold(\d+)")
+    for item in model_params_dir.iterdir():
+        if not item.is_dir():
+            continue
+        m = legacy_pat.match(item.name)
+        if not m:
+            continue
+        r, f = int(m.group(1)), int(m.group(2))
+        has_all = all((item / f"{p}_best.pt").exists() for p in ("diag", "hc", "dep"))
+        if has_all:
+            legacy_pairs.add((r, f))
+
+    # 合并新旧，去重排序
+    all_pairs = sorted(set(ready_new) | legacy_pairs)
+    return all_pairs
 
 
 def filter_folds(
@@ -134,7 +159,9 @@ def step_val(folds: list[tuple[int, int]]) -> None:
         "emotion_trial_acc_soft",
         "emotion_macro_f1_soft",
         "hc_emotion_acc",
+        "hc_emotion_f1",
         "dep_emotion_acc",
+        "dep_emotion_f1",
     ]
     print(f"\n{'=' * 50}")
     print(f"验证集 {len(all_metrics)} 折 平均指标")

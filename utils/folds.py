@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 from typing import Iterable
 
+import pandas as pd
+from sklearn.model_selection import StratifiedGroupKFold
+
 
 def project_root() -> Path:
     return Path(__file__).resolve().parents[1]
@@ -92,3 +95,102 @@ def filter_subjects(
     if diagnosis_label is not None:
         result = result[result["diagnosis_label"].astype(int) == diagnosis_label].copy()
     return result.reset_index(drop=True)
+
+
+# ── 统一交叉验证划分 ──────────────────────────────────────────────
+
+def _subject_group_table(index_csv: str | Path) -> pd.DataFrame:
+    """
+    返回每个 subject 的 group_binary：0=DEP，1=HC。
+    优先用 label4 推断，避免 diagnosis_label 原始编码不统一。
+    """
+    df = pd.read_csv(index_csv)
+
+    if "label4" in df.columns:
+        tmp = df[["subject_id", "label4"]].copy()
+        tmp["group_binary"] = (tmp["label4"].astype(int) >= 2).astype(int)  # 0=DEP, 1=HC
+        subject_df = (
+            tmp.groupby("subject_id")["group_binary"]
+            .agg(lambda s: int(s.mode().iloc[0]))
+            .reset_index()
+        )
+    elif "diagnosis_label" in df.columns:
+        subject_df = (
+            df[["subject_id", "diagnosis_label"]]
+            .drop_duplicates("subject_id")
+            .reset_index(drop=True)
+        )
+        subject_df["group_binary"] = subject_df["diagnosis_label"].astype(int)
+    else:
+        raise KeyError("index_csv 中至少需要 label4 或 diagnosis_label。")
+
+    subject_df["group_name"] = subject_df["group_binary"].map({0: "dep", 1: "hc"})
+    return subject_df
+
+
+def get_unified_subject_split(
+    index_csv: str | Path,
+    fold: int = 0,
+    n_splits: int = 5,
+    seed: int = 42,
+) -> dict:
+    """
+    使用 StratifiedGroupKFold 在 **全部被试** 上做统一划分，
+    三个模型（诊断 / HC情绪 / DEP情绪）共用同一套 train/val 被试分区。
+
+    返回:
+        {
+            "train_all":      [...],   # 训练折全部被试
+            "val_all":        [...],   # 验证折全部被试
+            "train_hc":       [...],   # 训练折中的 HC 被试
+            "val_hc":         [...],   # 验证折中的 HC 被试
+            "train_dep":      [...],   # 训练折中的 DEP 被试
+            "val_dep":        [...],   # 验证折中的 DEP 被试
+            "subject_df":     DataFrame,
+            "fold":           int,
+            "seed":           int,
+        }
+    """
+    subject_df = _subject_group_table(index_csv)
+
+    if len(subject_df) < n_splits:
+        raise ValueError(f"只有 {len(subject_df)} 个被试，无法做 {n_splits} 折。")
+
+    sgkf = StratifiedGroupKFold(
+        n_splits=n_splits,
+        shuffle=True,
+        random_state=seed,
+    )
+
+    splits = list(
+        sgkf.split(
+            X=subject_df["subject_id"],
+            y=subject_df["group_binary"],
+            groups=subject_df["subject_id"],
+        )
+    )
+
+    train_idx, val_idx = splits[fold]
+
+    train_all = [str(s) for s in subject_df.iloc[train_idx]["subject_id"].tolist()]
+    val_all = [str(s) for s in subject_df.iloc[val_idx]["subject_id"].tolist()]
+
+    train_df = subject_df.iloc[train_idx]
+    val_df = subject_df.iloc[val_idx]
+
+    train_hc = [str(s) for s in train_df[train_df["group_binary"] == 1]["subject_id"].tolist()]
+    val_hc = [str(s) for s in val_df[val_df["group_binary"] == 1]["subject_id"].tolist()]
+    train_dep = [str(s) for s in train_df[train_df["group_binary"] == 0]["subject_id"].tolist()]
+    val_dep = [str(s) for s in val_df[val_df["group_binary"] == 0]["subject_id"].tolist()]
+
+    return {
+        "train_all": train_all,
+        "val_all": val_all,
+        "train_hc": train_hc,
+        "val_hc": val_hc,
+        "train_dep": train_dep,
+        "val_dep": val_dep,
+        "subject_df": subject_df,
+        "fold": fold,
+        "seed": seed,
+    }

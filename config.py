@@ -9,13 +9,14 @@
 # 推理时通过 --repeat 参数反查对应 seed。
 
 # 诊断模型（train_diag.py）
-DIAG_REPEAT_SEEDS = [20, 42]
+# 可以按需扩展：例如加 123 支持第 3 次五折
+DIAG_REPEAT_SEEDS = [20, 42, 123]
 
 # HC 情绪模型（train_hc.py）
-HC_REPEAT_SEEDS = [20,  42]
+HC_REPEAT_SEEDS = [20, 42, 123]
 
 # DEP 情绪模型（train_dep.py）
-DEP_REPEAT_SEEDS = [20,  42]
+DEP_REPEAT_SEEDS = [20, 42, 123]
 
 # ── 交叉验证 ─────────────────────────────────────────────────────
 N_SPLITS = 5          # K 折数
@@ -32,7 +33,11 @@ def make_run_seed(base_seed: int, fold: int, extra: int = 0) -> int:
 
 
 def get_seed_for_repeat(task: str, repeat: int) -> int:
-    """根据任务名和 repeat 索引获取对应的 seed。"""
+    """根据任务名和 repeat 索引获取对应的 seed。
+
+    如果 repeat 超出预定义列表，则用 base_seed + repeat * 31 派生一个新 seed，
+    保证不同 repeat 有不同但可复现的种子。
+    """
     seeds = {
         "diagnosis": DIAG_REPEAT_SEEDS,
         "diag": DIAG_REPEAT_SEEDS,
@@ -44,9 +49,11 @@ def get_seed_for_repeat(task: str, repeat: int) -> int:
     seed_list = seeds.get(task)
     if seed_list is None:
         raise KeyError(f"Unknown task: {task}. Expected one of {list(seeds.keys())}.")
-    if repeat < 0 or repeat >= len(seed_list):
-        raise IndexError(
-            f"repeat={repeat} out of range for task '{task}' "
-            f"(seeds={seed_list}, valid range: 0-{len(seed_list)-1})"
-        )
-    return seed_list[repeat]
+    if repeat < 0:
+        raise IndexError(f"repeat={repeat} 不能为负数。")
+    if repeat < len(seed_list):
+        return seed_list[repeat]
+    # 派生种子：用列表中第一个种子 + 偏移，保持不同 repeat 可复现
+    derived = seed_list[0] + repeat * 31
+    print(f"[config] repeat={repeat} 超出预定义种子列表 {seed_list}，使用派生种子 {derived}")
+    return derived
