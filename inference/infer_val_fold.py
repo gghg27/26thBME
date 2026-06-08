@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import numpy as np
 import pandas as pd
 
 import config
@@ -22,7 +23,9 @@ from utils.folds import (
 )
 from utils.metrics import accuracy, macro_f1
 from utils.predict import (
+    aggregate_subject_hard_vote,
     aggregate_subject_prob,
+    aggregate_trial_hard_vote,
     aggregate_trial_prob,
     load_model_for_inference,
     predict_windows,
@@ -96,6 +99,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model_params_dir", type=Path, default=ROOT / "model_params")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--hard_voting",
+        action="store_true",
+        default=config.VAL_HARD_VOTING,
+        help="Enable hard voting mode: majority vote across windows + hard diagnosis routing. "
+        "Default from config.VAL_HARD_VOTING.",
+    )
     return parser.parse_args()
 
 
@@ -193,6 +203,9 @@ def main() -> None:
     import torch
 
     device = args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu"
+
+    voting_mode = "hard" if args.hard_voting else "soft"
+    print(f"[infer-val] voting_mode={voting_mode} (hard=majority vote + hard routing, soft=mean prob + soft fusion)")
 
     # ── 确定 seed：与训练脚本共用 config.get_seed_for_repeat ────
     if args.seed is not None:
@@ -325,13 +338,20 @@ def main() -> None:
         batch_size=args.batch_size,
         logit_key="diagnosis_logits",
     )
-    subject_probs = aggregate_subject_prob(diag_df, "p_dep", "subject_id")
+    if args.hard_voting:
+        # 硬投票：每个窗口投 0/1，被试级别多数表决
+        subject_probs = aggregate_subject_hard_vote(diag_df, "p_dep", "subject_id")
+        # pred_diag 已由多数表决确定
+    else:
+        # 软投票：窗口概率均值 → 阈值 0.5
+        subject_probs = aggregate_subject_prob(diag_df, "p_dep", "subject_id")
+        subject_probs["pred_diag"] = (subject_probs["p_dep_subject"] >= 0.5).astype(int)
+
     subject_truth = diag_df.groupby("subject_id", as_index=False).agg(
         true_diag=("true_dep", "first"),
         true_group=("true_group", "first"),
     )
     subject_probs = subject_probs.merge(subject_truth, on="subject_id", how="left")
-    subject_probs["pred_diag"] = (subject_probs["p_dep_subject"] >= 0.5).astype(int)
 
     # ── 阶段二：情绪推理 ──────────────────────────────────────────
     emotion_df["p_pos_hc_window"] = predict_windows(
@@ -352,8 +372,16 @@ def main() -> None:
     )
 
     # ── 聚合与融合 ────────────────────────────────────────────────
-    p_hc = aggregate_trial_prob(emotion_df, "p_pos_hc_window", "subject_id", "p_pos_hc")
-    p_dep = aggregate_trial_prob(emotion_df, "p_pos_dep_window", "subject_id", "p_pos_dep")
+    if args.hard_voting:
+        # 硬投票：每个窗口投 0/1，trial 级别多数表决
+        p_hc = aggregate_trial_hard_vote(emotion_df, "p_pos_hc_window", "subject_id", "p_pos_hc")
+        p_dep = aggregate_trial_hard_vote(emotion_df, "p_pos_dep_window", "subject_id", "p_pos_dep")
+        p_hc.rename(columns={"pred_hard": "pred_emotion_hc_model"}, inplace=True)
+        p_dep.rename(columns={"pred_hard": "pred_emotion_dep_model"}, inplace=True)
+    else:
+        # 软投票：窗口概率均值
+        p_hc = aggregate_trial_prob(emotion_df, "p_pos_hc_window", "subject_id", "p_pos_hc")
+        p_dep = aggregate_trial_prob(emotion_df, "p_pos_dep_window", "subject_id", "p_pos_dep")
     truth = emotion_df.groupby(["subject_id", "trial_id"], as_index=False).agg(
         true_diag=("true_dep", "first"),
         true_group=("true_group", "first"),
@@ -364,13 +392,31 @@ def main() -> None:
         .merge(p_dep, on=["subject_id", "trial_id"], how="left")
         .merge(subject_probs[["subject_id", "p_dep_subject", "pred_diag"]], on="subject_id", how="left")
     )
-    preds["p_final"] = (
-        (1.0 - preds["p_dep_subject"]) * preds["p_pos_hc"]
-        + preds["p_dep_subject"] * preds["p_pos_dep"]
-    )
-    preds["pred_emotion_hc_model"] = (preds["p_pos_hc"] >= 0.5).astype(int)
-    preds["pred_emotion_dep_model"] = (preds["p_pos_dep"] >= 0.5).astype(int)
-    preds["pred_emotion"] = (preds["p_final"] >= 0.5).astype(int)
+
+    if args.hard_voting:
+        # 硬投票融合：诊断结果硬路由到对应情绪模型
+        # pred_diag=0 (HC) → 使用 HC 模型多数表决结果
+        # pred_diag=1 (DEP) → 使用 DEP 模型多数表决结果
+        preds["pred_emotion"] = np.where(
+            preds["pred_diag"] == 0,
+            preds["pred_emotion_hc_model"],
+            preds["pred_emotion_dep_model"],
+        )
+        # p_final: 保留对应被选中模型的窗口概率均值，用于参考
+        preds["p_final"] = np.where(
+            preds["pred_diag"] == 0,
+            preds["p_pos_hc"],
+            preds["p_pos_dep"],
+        )
+    else:
+        # 软投票融合：诊断概率加权插值 HC/DEP 情绪模型输出
+        preds["p_final"] = (
+            (1.0 - preds["p_dep_subject"]) * preds["p_pos_hc"]
+            + preds["p_dep_subject"] * preds["p_pos_dep"]
+        )
+        preds["pred_emotion_hc_model"] = (preds["p_pos_hc"] >= 0.5).astype(int)
+        preds["pred_emotion_dep_model"] = (preds["p_pos_dep"] >= 0.5).astype(int)
+        preds["pred_emotion"] = (preds["p_final"] >= 0.5).astype(int)
     preds.insert(0, "fold", args.fold)
     preds.insert(0, "repeat", args.repeat)
     preds = preds[
@@ -406,24 +452,34 @@ def main() -> None:
     dep_final_pred = preds.loc[dep_mask, "pred_emotion"]
     dep_model_pred = preds.loc[dep_mask, "pred_emotion_dep_model"]
 
+    emotion_suffix = "hard" if args.hard_voting else "soft"
+    diag_suffix = "hard" if args.hard_voting else "soft"
+
     metrics = {
         "repeat": args.repeat,
         "fold": args.fold,
         "seed": seed,
+        "voting_mode": voting_mode,
         "n_val_subjects": int(len(val_subjects)),
         "n_hc_trials": int(hc_mask.sum()),
         "n_dep_trials": int(dep_mask.sum()),
-        "diag_subject_acc": accuracy(subject_probs["true_diag"], subject_probs["pred_diag"]),
-        "emotion_trial_acc_soft": accuracy(preds["true_emotion"], preds["pred_emotion"]),
-        "emotion_macro_f1_soft": macro_f1(preds["true_emotion"], preds["pred_emotion"]),
-        "hc_emotion_acc": accuracy(hc_true, hc_final_pred),
-        "hc_emotion_f1": macro_f1(hc_true, hc_final_pred),
-        "dep_emotion_acc": accuracy(dep_true, dep_final_pred),
-        "dep_emotion_f1": macro_f1(dep_true, dep_final_pred),
-        "hc_model_emotion_acc": accuracy(hc_true, hc_model_pred),
-        "hc_model_emotion_f1": macro_f1(hc_true, hc_model_pred),
-        "dep_model_emotion_acc": accuracy(dep_true, dep_model_pred),
-        "dep_model_emotion_f1": macro_f1(dep_true, dep_model_pred),
+        f"diag_subject_acc_{diag_suffix}": accuracy(
+            subject_probs["true_diag"], subject_probs["pred_diag"]
+        ),
+        f"emotion_trial_acc_{emotion_suffix}": accuracy(
+            preds["true_emotion"], preds["pred_emotion"]
+        ),
+        f"emotion_macro_f1_{emotion_suffix}": macro_f1(
+            preds["true_emotion"], preds["pred_emotion"]
+        ),
+        f"hc_emotion_acc_{emotion_suffix}": accuracy(hc_true, hc_final_pred),
+        f"hc_emotion_f1_{emotion_suffix}": macro_f1(hc_true, hc_final_pred),
+        f"dep_emotion_acc_{emotion_suffix}": accuracy(dep_true, dep_final_pred),
+        f"dep_emotion_f1_{emotion_suffix}": macro_f1(dep_true, dep_final_pred),
+        f"hc_model_emotion_acc_{emotion_suffix}": accuracy(hc_true, hc_model_pred),
+        f"hc_model_emotion_f1_{emotion_suffix}": macro_f1(hc_true, hc_model_pred),
+        f"dep_model_emotion_acc_{emotion_suffix}": accuracy(dep_true, dep_model_pred),
+        f"dep_model_emotion_f1_{emotion_suffix}": macro_f1(dep_true, dep_model_pred),
     }
 
     # ── 保存结果 ──────────────────────────────────────────────────
