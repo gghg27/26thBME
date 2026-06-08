@@ -154,15 +154,32 @@ def step_val(folds: list[tuple[int, int]]) -> None:
         print("\n无成功的验证结果。")
         return
 
-    keys = [
-        "diag_subject_acc",
-        "emotion_trial_acc_soft",
-        "emotion_macro_f1_soft",
-        "hc_emotion_acc",
-        "hc_emotion_f1",
-        "dep_emotion_acc",
-        "dep_emotion_f1",
-    ]
+    # 从第一个 metrics 文件推断实际 key 名（带 _soft/_hard 后缀）
+    first = all_metrics[0]
+    candidate_suffixes: dict[str, list[str]] = {
+        "diag_subject_acc":       ["diag_subject_acc_soft", "diag_subject_acc_hard"],
+        "emotion_trial_acc":      ["emotion_trial_acc_soft", "emotion_trial_acc_hard"],
+        "emotion_macro_f1":       ["emotion_macro_f1_soft", "emotion_macro_f1_hard"],
+        "hc_emotion_acc":         ["hc_emotion_acc_soft", "hc_emotion_acc_hard"],
+        "hc_emotion_f1":          ["hc_emotion_f1_soft", "hc_emotion_f1_hard"],
+        "dep_emotion_acc":        ["dep_emotion_acc_soft", "dep_emotion_acc_hard"],
+        "dep_emotion_f1":         ["dep_emotion_f1_soft", "dep_emotion_f1_hard"],
+        "hc_model_emotion_acc":   ["hc_model_emotion_acc_soft", "hc_model_emotion_acc_hard"],
+        "hc_model_emotion_f1":    ["hc_model_emotion_f1_soft", "hc_model_emotion_f1_hard"],
+        "dep_model_emotion_acc":  ["dep_model_emotion_acc_soft", "dep_model_emotion_acc_hard"],
+        "dep_model_emotion_f1":   ["dep_model_emotion_f1_soft", "dep_model_emotion_f1_hard"],
+    }
+    keys: list[str] = []
+    for candidates in candidate_suffixes.values():
+        for c in candidates:
+            if c in first:
+                keys.append(c)
+                break
+
+    if not keys:
+        print("\n无法识别指标 key，请检查 metrics JSON 格式。")
+        return
+
     print(f"\n{'=' * 50}")
     print(f"验证集 {len(all_metrics)} 折 平均指标")
     print(f"{'=' * 50}")

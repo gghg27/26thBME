@@ -1470,7 +1470,7 @@ if __name__ == "__main__":
                 lambda_emo=1.0,
 
                 # 监督对比学习：同一情绪类拉近，不同情绪类拉远
-                lambda_con=0.05,
+                lambda_con=0.1,
                 con_temperature=0.1,
 
                 # train_group='hc'/'dep' 时诊断标签恒定，建议关闭
@@ -1479,8 +1479,8 @@ if __name__ == "__main__":
                 grl_diag=0.0,
 
                 # 被试域对抗，建议小权重起步
-                lambda_subject=0.01,
-                grl_subject=0.01,
+                lambda_subject=0.0,
+                grl_subject=0.0,
 
                 # 图正则先关闭，主任务稳定后再开
                 lambda_graph=0.0,
