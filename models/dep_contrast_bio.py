@@ -77,6 +77,25 @@ def make_identity_batch(batch_size: int, n: int, device: torch.device, dtype: to
     return eye.unsqueeze(0).expand(batch_size, -1, -1)
 
 
+class SubjectRelativeDEAdapter(nn.Module):
+    """
+    将 concat(de_feat, de_rel, de_z) 映射回原始 DE 频带数。
+
+    输入:  [B, C, 3*K]
+    输出:  [B, C, K]
+    """
+
+    def __init__(self, in_bands: int, out_bands: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(in_bands),
+            nn.Linear(in_bands, out_bands),
+        )
+
+    def forward(self, de_input: torch.Tensor) -> torch.Tensor:
+        return self.net(de_input)
+
+
 # =========================================================
 # Spectral feature extractor
 # =========================================================
@@ -722,11 +741,17 @@ class BiologicalMarkerExtractor(nn.Module):
             num_channels: int = 30,
             bands: Optional[List[Tuple[float, float]]] = None,
             eps: float = 1e-6,
+            use_subject_relative_bio: bool = False,
+            bio_abs_scale: float = 0.3,
+            relative_eps: float = 1e-6,
     ):
         super().__init__()
         self.sfreq = float(sfreq)
         self.num_channels = int(num_channels)
         self.eps = float(eps)
+        self.use_subject_relative_bio = bool(use_subject_relative_bio)
+        self.bio_abs_scale = float(bio_abs_scale)
+        self.relative_eps = float(relative_eps)
 
         if bands is None:
             bands = [
@@ -745,6 +770,11 @@ class BiologicalMarkerExtractor(nn.Module):
         self.nonlinear_dim = R + 1                        # 6
         self.raw_dim = self.freq_dim + self.asym_dim + self.hjorth_dim + self.plv_dim + self.nonlinear_dim  # 57
         self.out_dim = self.raw_dim  # 直接输出，无投影
+        if self.use_subject_relative_bio:
+            self.relative_projector = nn.Sequential(
+                nn.LayerNorm(2 * self.raw_dim),
+                nn.Linear(2 * self.raw_dim, self.raw_dim),
+            )
 
         for name, idx in self._REGIONS.items():
             self.register_buffer(f"_idx_{name}", torch.tensor(idx, dtype=torch.long), persistent=False)
@@ -933,6 +963,8 @@ class BiologicalMarkerExtractor(nn.Module):
             de_feat: Optional[torch.Tensor] = None,
             hjorth: Optional[torch.Tensor] = None,
             plv_matrix: Optional[torch.Tensor] = None,
+            subject_bio_mu: Optional[torch.Tensor] = None,
+            subject_bio_std: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         if x.ndim != 3:
             raise ValueError(f"x should be [B,C,T], got {tuple(x.shape)}")
@@ -964,10 +996,33 @@ class BiologicalMarkerExtractor(nn.Module):
                 f"bio_raw dim mismatch: got {bio_raw.size(1)}, expected {self.raw_dim}."
             )
 
-        # 不再过 projector，直接输出 57 维作为 bio_feat
+        bio_raw_rel = None
+        bio_raw_z = None
+        bio_input = bio_raw
+        use_relative = (
+            self.use_subject_relative_bio
+            and hasattr(self, "relative_projector")
+            and subject_bio_mu is not None
+            and subject_bio_std is not None
+        )
+        if use_relative:
+            subject_bio_mu = subject_bio_mu.to(device=x.device, dtype=x.dtype)
+            subject_bio_std = subject_bio_std.to(device=x.device, dtype=x.dtype)
+            bio_raw_rel = bio_raw - subject_bio_mu
+            bio_raw_z = bio_raw_rel / (subject_bio_std + self.relative_eps)
+            bio_input = torch.cat([self.bio_abs_scale * bio_raw, bio_raw_z], dim=-1)
+            bio_input = torch.nan_to_num(bio_input, nan=0.0, posinf=0.0, neginf=0.0)
+            bio_feat = self.relative_projector(bio_input)
+        else:
+            # 原始行为：不经过 projector，直接输出 57 维 bio_raw。
+            bio_feat = bio_raw
+
         return {
-            "bio_feat": bio_raw,
+            "bio_feat": bio_feat,
             "bio_raw": bio_raw,
+            "bio_raw_rel": bio_raw_rel,
+            "bio_raw_z": bio_raw_z,
+            "bio_input": bio_input,
             "bio_freq_feat": freq_feat,
             "bio_asym_feat": asym_feat,
             "bio_hjorth_feat": hjorth_feat,
@@ -2306,8 +2361,18 @@ class BrainGraphBackbone(nn.Module):
             dropout: float = 0.2,
             use_biomarkers: bool = True,
             biomarker_dim: int = 57,
+            use_subject_relative_de: bool = False,
+            use_subject_relative_bio: bool = False,
+            bio_abs_scale: float = 0.3,
+            relative_eps: float = 1e-6,
+            de_num_bands: int = 5,
     ) -> None:
         super().__init__()
+        self.use_subject_relative_de = bool(use_subject_relative_de)
+        self.use_subject_relative_bio = bool(use_subject_relative_bio)
+        self.bio_abs_scale = float(bio_abs_scale)
+        self.relative_eps = float(relative_eps)
+        self.de_num_bands = int(de_num_bands)
 
         self.node_encoder = NodeFeatureEncoder(sfreq=sfreq, temporal_dim=64, spectral_dim=16)
         if self.node_encoder.node_dim != node_dim:
@@ -2320,7 +2385,12 @@ class BrainGraphBackbone(nn.Module):
             sfreq=sfreq,
             diag_mode="centered",
         )
-        self.leranable_diag = LearnableDEDiagonalFusion()
+        self.leranable_diag = LearnableDEDiagonalFusion(num_bands=self.de_num_bands)
+        if self.use_subject_relative_de:
+            self.de_relative_adapter = SubjectRelativeDEAdapter(
+                in_bands=self.de_num_bands * 3,
+                out_bands=self.de_num_bands,
+            )
 
         # 保留原来的节点特征对比分支。
         self.node_contrast_projector = NodeFeatureContrastProjector(
@@ -2374,6 +2444,9 @@ class BrainGraphBackbone(nn.Module):
             self.biomarker_extractor = BiologicalMarkerExtractor(
                 sfreq=sfreq,
                 num_channels=30,
+                use_subject_relative_bio=self.use_subject_relative_bio,
+                bio_abs_scale=self.bio_abs_scale,
+                relative_eps=self.relative_eps,
             )
         else:
             self.biomarker_extractor = None
@@ -2390,7 +2463,15 @@ class BrainGraphBackbone(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, x: torch.Tensor, de_feat) -> Dict[str, torch.Tensor]:
+    def forward(
+            self,
+            x: torch.Tensor,
+            de_feat,
+            subject_de_mu: Optional[torch.Tensor] = None,
+            subject_de_std: Optional[torch.Tensor] = None,
+            subject_bio_mu: Optional[torch.Tensor] = None,
+            subject_bio_std: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         """
         Args:
             x: [B, C, T]
@@ -2404,6 +2485,29 @@ class BrainGraphBackbone(nn.Module):
                 node_features: [B, C, 64]
                 plv_adj_norm: [B, C, C]
         """
+        # =====================================================
+        # 0. Subject-relative DE。若 baseline 缺失则自动退化为原始 de_feat。
+        # =====================================================
+        de_rel = None
+        de_z = None
+        de_input = de_feat
+        de_for_model = de_feat
+        use_de_relative = (
+            self.use_subject_relative_de
+            and hasattr(self, "de_relative_adapter")
+            and subject_de_mu is not None
+            and subject_de_std is not None
+            and de_feat.size(-1) == self.de_num_bands
+        )
+        if use_de_relative:
+            subject_de_mu = subject_de_mu.to(device=de_feat.device, dtype=de_feat.dtype)
+            subject_de_std = subject_de_std.to(device=de_feat.device, dtype=de_feat.dtype)
+            de_rel = de_feat - subject_de_mu
+            de_z = de_rel / (subject_de_std + self.relative_eps)
+            de_input = torch.cat([de_feat, de_rel, de_z], dim=-1)
+            de_input = torch.nan_to_num(de_input, nan=0.0, posinf=0.0, neginf=0.0)
+            de_for_model = self.de_relative_adapter(de_input)
+
         # =====================================================
         # 1. 原来的多尺度卷积节点特征
         # =====================================================
@@ -2422,7 +2526,7 @@ class BrainGraphBackbone(nn.Module):
         # =====================================================
         # 3. DE 对角线：两个图相关模块共用同一套 DE self-loop 逻辑
         # =====================================================
-        power_diag_values, band_weight = self.leranable_diag(de_feat)  # [B, C]
+        power_diag_values, band_weight = self.leranable_diag(de_for_model)  # [B, C]
 
         # =====================================================
         # 4. 分支 2：原始信号 PLV 构图 + DE 对角线 + GCN + 图读出
@@ -2449,9 +2553,11 @@ class BrainGraphBackbone(nn.Module):
         if self.use_biomarkers and self.biomarker_extractor is not None:
             bio_dict = self.biomarker_extractor(
                 x,
-                de_feat=de_feat,
+                de_feat=de_for_model,
                 hjorth=hjorth,
                 plv_matrix=plv_graph_dict["plv_matrix"],
+                subject_bio_mu=subject_bio_mu,
+                subject_bio_std=subject_bio_std,
             )
             z_bio = bio_dict["bio_feat"]  # [B, biomarker_dim]
             z = torch.cat([z_core, z_bio], dim=-1)
@@ -2467,6 +2573,9 @@ class BrainGraphBackbone(nn.Module):
             "z_plv": z_plv,
             "bio_feat": z_bio,
             "bio_raw": bio_dict.get("bio_raw", None),
+            "bio_raw_rel": bio_dict.get("bio_raw_rel", None),
+            "bio_raw_z": bio_dict.get("bio_raw_z", None),
+            "bio_input": bio_dict.get("bio_input", None),
             "bio_freq_feat": bio_dict.get("bio_freq_feat", None),
             "bio_asym_feat": bio_dict.get("bio_asym_feat", None),
             "bio_hjorth_feat": bio_dict.get("bio_hjorth_feat", None),
@@ -2496,6 +2605,10 @@ class BrainGraphBackbone(nn.Module):
 
             "power_diag_values": power_diag_values,
             "de_band_weight": band_weight,
+            "de_rel": de_rel,
+            "de_z": de_z,
+            "de_input": de_input,
+            "de_for_model": de_for_model,
             "hjorth": hjorth,
         }
 
@@ -2657,6 +2770,10 @@ class EmotionPretrainModel(nn.Module):
             contrast_hidden_dim: int = 128,
             use_biomarkers: bool = True,
             biomarker_dim: int = 57,
+            use_subject_relative_de: bool = False,
+            use_subject_relative_bio: bool = False,
+            bio_abs_scale: float = 0.3,
+            relative_eps: float = 1e-6,
             # 下面参数用于兼容旧 main 中可能传入的 nclass / aux_nclass / de_num_bands
             nclass: Optional[int] = None,
             aux_nclass: Optional[int] = None,
@@ -2678,7 +2795,16 @@ class EmotionPretrainModel(nn.Module):
             dropout=dropout,
             use_biomarkers=use_biomarkers,
             biomarker_dim=biomarker_dim,
+            use_subject_relative_de=use_subject_relative_de,
+            use_subject_relative_bio=use_subject_relative_bio,
+            bio_abs_scale=bio_abs_scale,
+            relative_eps=relative_eps,
+            de_num_bands=5 if de_num_bands is None else int(de_num_bands),
         )
+        self.use_subject_relative_de = bool(use_subject_relative_de)
+        self.use_subject_relative_bio = bool(use_subject_relative_bio)
+        self.bio_abs_scale = float(bio_abs_scale)
+        self.relative_eps = float(relative_eps)
 
         self.in_dim = self.backbone.out_dim  # 128
         self.emotion_nclass = emotion_nclass
@@ -2728,6 +2854,11 @@ class EmotionPretrainModel(nn.Module):
             lambda_subject: float = 0.0,
             lambda_dom: Optional[float] = None,
             dataset_name: str = "competition",
+            subject_id: Optional[torch.Tensor] = None,
+            subject_de_mu: Optional[torch.Tensor] = None,
+            subject_de_std: Optional[torch.Tensor] = None,
+            subject_bio_mu: Optional[torch.Tensor] = None,
+            subject_bio_std: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -2741,7 +2872,14 @@ class EmotionPretrainModel(nn.Module):
         if lambda_dom is not None:
             lambda_subject = float(lambda_dom)
 
-        out = self.backbone(x, de_feat=de_feat)
+        out = self.backbone(
+            x,
+            de_feat=de_feat,
+            subject_de_mu=subject_de_mu,
+            subject_de_std=subject_de_std,
+            subject_bio_mu=subject_bio_mu,
+            subject_bio_std=subject_bio_std,
+        )
         z = out["z"]
 
         emo_logits = self.emotion_head(z)

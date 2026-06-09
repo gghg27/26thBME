@@ -77,6 +77,25 @@ def make_identity_batch(batch_size: int, n: int, device: torch.device, dtype: to
     return eye.unsqueeze(0).expand(batch_size, -1, -1)
 
 
+class SubjectRelativeDEAdapter(nn.Module):
+    """
+    将 concat(de_feat, de_rel, de_z) 映射回原始 DE 频带数。
+
+    输入:  [B, C, 3*K]
+    输出:  [B, C, K]
+    """
+
+    def __init__(self, in_bands: int, out_bands: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(in_bands),
+            nn.Linear(in_bands, out_bands),
+        )
+
+    def forward(self, de_input: torch.Tensor) -> torch.Tensor:
+        return self.net(de_input)
+
+
 # =========================================================
 # Spectral feature extractor
 # =========================================================
@@ -688,99 +707,92 @@ class NodeFeatureEncoder(nn.Module):
 
 class BiologicalMarkerExtractor(nn.Module):
     """
-    从原始 EEG / DE / PLV 中提取轻量生物标志物，并映射为固定维度特征。
+    精简版生物标志物提取器（57 维输出，无 projector，直接拼接）。
 
     包含特征：
-        1) 频带统计特征：各频带在通道维的 mean/std/max/min，以及相对功率统计；
-        2) 左右不对称特征：左右同源通道在各频带上的差值和归一化差值；
-        3) Hjorth 特征：Activity/Mobility/Complexity 的通道级与全局统计；
-        4) PLV 图指标：节点强度、全局连接强度、连接离散度、近似聚类系数等；
-        5) 非线性/复杂度特征：过零率、线长、偏度、峰度、谱熵。
+        A) 频带能量（33维）：5脑区 × 3频带(alpha/beta/gamma) 均值 +
+           5脑区 × 3频带 相对功率 + 3 个全局比值(theta/beta, alpha/beta, gamma/beta)
+        B) 左右不对称（3维）：F4-F3 / FC4-FC3 / T4-T3 的 alpha 不对称
+        C) Hjorth（10维）：5脑区 Mobility + 5脑区 Complexity
+        D) PLV 图指标（5维）：frontal-temporal / frontal-parietal / inter-hemisphere /
+           global strength / global clustering
+        E) 非线性（6维）：5脑区谱熵 + 全局线长
 
     输出：
-        bio_feat: [B, out_dim]
-        bio_raw:  [B, raw_dim]
+        bio_feat: [B, 57]（= bio_raw，无投影层）
+        bio_raw:  [B, 57]
     """
+
+    # 30 通道 0‑based 索引
+    _REGIONS = {
+        "frontal":  [0, 1, 2, 3, 4, 5, 6],
+        "central":  [7, 8, 9, 10, 11, 13, 14, 15],
+        "temporal": [12, 16, 17, 21, 22, 26],
+        "parietal": [18, 19, 20, 23, 24, 25],
+        "occipital":[27, 28, 29],
+    }
+    _ASYM_PAIRS = [(5, 3), (10, 8), (16, 12)]
+    _LEFT_HEM  = [0, 2, 3, 7, 8, 12, 13, 17, 18, 22, 23, 27]
+    _RIGHT_HEM = [1, 6, 5, 11, 10, 16, 15, 21, 20, 26, 25, 29]
 
     def __init__(
             self,
             sfreq: float = 250.0,
             num_channels: int = 30,
-            out_dim: int = 64,
-            hidden_dim: int = 128,
-            dropout: float = 0.2,
             bands: Optional[List[Tuple[float, float]]] = None,
             eps: float = 1e-6,
+            use_subject_relative_bio: bool = False,
+            bio_abs_scale: float = 0.3,
+            relative_eps: float = 1e-6,
     ):
         super().__init__()
         self.sfreq = float(sfreq)
         self.num_channels = int(num_channels)
-        self.out_dim = int(out_dim)
         self.eps = float(eps)
+        self.use_subject_relative_bio = bool(use_subject_relative_bio)
+        self.bio_abs_scale = float(bio_abs_scale)
+        self.relative_eps = float(relative_eps)
 
-        # 默认使用 5 个频带，和你当前 de_feat=[B,30,5] 的版本保持一致。
-        # delta/theta/alpha/beta/gamma
         if bands is None:
             bands = [
-                (1.0, 4.0),
-                (4.0, 8.0),
-                (8.0, 13.0),
-                (13.0, 30.0),
-                (30.0, 45.0),
+                (1.0, 4.0), (4.0, 8.0), (8.0, 13.0), (13.0, 30.0), (30.0, 45.0),
             ]
         self.bands = bands
-        self.num_bands = len(bands)
+        self.num_bands = len(bands)  # 5
+        self._region_names = list(self._REGIONS.keys())
+        self._num_regions = len(self._region_names)
 
-        # 训练集通道顺序：FP1, FP2, F7, F3, FZ, F4, F8, FT7, FC3, FCZ,
-        # FC4, FT8, T3, C3, CZ, C4, T4, TP7, CP3, CPZ, CP4, TP8,
-        # T5, P3, PZ, P4, T6, O1, OZ, O2
-        # 下面是 0-based 左右同源通道对。
-        default_pairs = [
-            (0, 1),    # FP1-FP2
-            (2, 6),    # F7-F8
-            (3, 5),    # F3-F4
-            (7, 11),   # FT7-FT8
-            (8, 10),   # FC3-FC4
-            (12, 16),  # T3-T4
-            (13, 15),  # C3-C4
-            (17, 21),  # TP7-TP8
-            (18, 20),  # CP3-CP4
-            (22, 26),  # T5-T6
-            (23, 25),  # P3-P4
-            (27, 29),  # O1-O2
-        ]
-        self.symmetric_pairs = [
-            (l, r) for l, r in default_pairs
-            if l < self.num_channels and r < self.num_channels
-        ]
-        self.num_pairs = len(self.symmetric_pairs)
+        K_band = 3; R = self._num_regions
+        self.freq_dim     = R * K_band + R * K_band + 3   # 33
+        self.asym_dim     = 3
+        self.hjorth_dim   = R * 2                         # 10
+        self.plv_dim      = 5
+        self.nonlinear_dim = R + 1                        # 6
+        self.raw_dim = self.freq_dim + self.asym_dim + self.hjorth_dim + self.plv_dim + self.nonlinear_dim  # 57
+        self.out_dim = self.raw_dim  # 直接输出，无投影
+        if self.use_subject_relative_bio:
+            self.relative_projector = nn.Sequential(
+                nn.LayerNorm(2 * self.raw_dim),
+                nn.Linear(2 * self.raw_dim, self.raw_dim),
+            )
 
-        # 固定 raw feature 维度：
-        # 频带统计: de mean/std/max/min + relative mean/std + 3 ratios = 6K + 3
-        # 左右不对称: diff + normalized diff 展平 + 两者 mean/std = 2PK + 4K
-        # Hjorth: 30*3 展平 + mean/std/max = 90 + 9
-        # PLV图指标: node_strength 30 + graph_stats 10
-        # 非线性: 5 个通道级指标的 mean/std/max = 15
-        self.freq_dim = 6 * self.num_bands + 3
-        self.asym_dim = 2 * self.num_pairs * self.num_bands + 4 * self.num_bands
-        self.hjorth_dim = self.num_channels * 3 + 9
-        self.plv_dim = self.num_channels + 10
-        self.nonlinear_dim = 15
-        self.raw_dim = self.freq_dim + self.asym_dim + self.hjorth_dim + self.plv_dim + self.nonlinear_dim
+        for name, idx in self._REGIONS.items():
+            self.register_buffer(f"_idx_{name}", torch.tensor(idx, dtype=torch.long), persistent=False)
 
-        self.projector = nn.Sequential(
-            nn.LayerNorm(self.raw_dim),
-            nn.Linear(self.raw_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, out_dim),
-            nn.LayerNorm(out_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
+    # ── helper ──────────────────────────────────────────────
+    def _region_mean(self, feat: torch.Tensor, region_name: str) -> torch.Tensor:
+        """feat: [B, C, ...] → region mean: [B, ...]"""
+        idx = getattr(self, f"_idx_{region_name}")
+        return feat.index_select(dim=1, index=idx).mean(dim=1)
+
+    def _safe_submat_mean(self, A: torch.Tensor, rows: list, cols: list) -> torch.Tensor:
+        """A: [B, C, C], return mean of submatrix [B, 1]"""
+        r = torch.tensor(rows, device=A.device, dtype=torch.long)
+        c = torch.tensor(cols, device=A.device, dtype=torch.long)
+        sub = A.index_select(1, r).index_select(2, c)
+        return sub.mean(dim=(1, 2), keepdim=True)
 
     def _match_num_bands(self, feat: torch.Tensor) -> torch.Tensor:
-        """把最后一维 pad/crop 到 self.num_bands，避免 de_feat 为 4/5 频带时报错。"""
         if feat.size(-1) == self.num_bands:
             return feat
         if feat.size(-1) > self.num_bands:
@@ -789,18 +801,12 @@ class BiologicalMarkerExtractor(nn.Module):
         return F.pad(feat, (0, pad), mode="constant", value=0.0)
 
     def _compute_log_band_power(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [B,C,T]
-        return log_power: [B,C,K]
-        """
         B, C, T = x.shape
         x_float = x.float()
         x_float = x_float - x_float.mean(dim=-1, keepdim=True)
-
         freqs = torch.fft.rfftfreq(T, d=1.0 / self.sfreq).to(device=x.device)
         fft_vals = torch.fft.rfft(x_float, dim=-1)
         power = (fft_vals.real ** 2 + fft_vals.imag ** 2) / max(T, 1)
-
         feats = []
         for low, high in self.bands:
             mask = (freqs >= low) & (freqs < high)
@@ -809,190 +815,139 @@ class BiologicalMarkerExtractor(nn.Module):
             else:
                 band_power = power[..., mask].mean(dim=-1)
             feats.append(torch.log(band_power + self.eps))
-
         return torch.stack(feats, dim=-1).to(dtype=x.dtype)
 
+    # ── A. 频带能量 ──────────────────────────────────────────
     def _frequency_features(self, band_feat: torch.Tensor, raw_log_power: torch.Tensor) -> torch.Tensor:
         """
-        band_feat/raw_log_power: [B,C,K]
+        5 脑区 × 3 频带(alpha/beta/gamma) 均值 +
+        5 脑区 × 3 频带 相对功率 +
+        3 全局比值 → 33 维
         """
         band_feat = self._match_num_bands(band_feat)
-        raw_log_power = self._match_num_bands(raw_log_power)
-
-        # 通道维统计
-        mean_band = band_feat.mean(dim=1)
-        std_band = band_feat.std(dim=1, unbiased=False)
-        max_band = band_feat.max(dim=1).values
-        min_band = band_feat.min(dim=1).values
-
-        # 相对功率统计，用 raw power 更自然
-        raw_power = torch.exp(raw_log_power).clamp_min(self.eps)
+        raw_power = torch.exp(self._match_num_bands(raw_log_power)).clamp_min(self.eps)
         rel_power = raw_power / (raw_power.sum(dim=-1, keepdim=True) + self.eps)
-        rel_mean = rel_power.mean(dim=1)
-        rel_std = rel_power.std(dim=1, unbiased=False)
 
-        # 常用频带比值：theta/beta、alpha/beta、gamma/beta
-        # 频带索引默认：0 delta, 1 theta, 2 alpha, 3 beta, 4 gamma
-        p_mean = raw_power.mean(dim=1)  # [B,K]
-        beta = p_mean[:, 3] if self.num_bands > 3 else p_mean[:, -1]
-        theta = p_mean[:, 1] if self.num_bands > 1 else p_mean[:, 0]
-        alpha = p_mean[:, 2] if self.num_bands > 2 else p_mean[:, 0]
-        gamma = p_mean[:, 4] if self.num_bands > 4 else p_mean[:, -1]
+        band_sel = band_feat[..., [2, 3, 4]]   # alpha, beta, gamma
+        rel_sel  = rel_power[..., [2, 3, 4]]
+
+        parts = []
+        for rname in self._region_names:
+            parts.append(self._region_mean(band_sel, rname))
+        band_region = torch.cat(parts, dim=-1)   # [B, 15]
+
+        parts = []
+        for rname in self._region_names:
+            parts.append(self._region_mean(rel_sel, rname))
+        rel_region = torch.cat(parts, dim=-1)    # [B, 15]
+
+        p_mean = raw_power.mean(dim=1)
+        beta  = p_mean[:, 3]; theta = p_mean[:, 1]
+        alpha = p_mean[:, 2]; gamma = p_mean[:, 4]
         ratios = torch.stack([
             torch.log(theta / (beta + self.eps) + self.eps),
             torch.log(alpha / (beta + self.eps) + self.eps),
             torch.log(gamma / (beta + self.eps) + self.eps),
-        ], dim=-1)
+        ], dim=-1)  # [B, 3]
 
-        return torch.cat([mean_band, std_band, max_band, min_band, rel_mean, rel_std, ratios], dim=-1)
+        return torch.cat([band_region, rel_region, ratios], dim=-1)  # [B, 33]
 
+    # ── B. 左右不对称 ────────────────────────────────────────
     def _asymmetry_features(self, band_feat: torch.Tensor) -> torch.Tensor:
-        """
-        左右同源通道频带不对称。
-        band_feat: [B,C,K]
-        """
+        """F4-F3 / FC4-FC3 / T4-T3 的 alpha 不对称 → 3 维"""
         band_feat = self._match_num_bands(band_feat)
+        alpha_idx = 2
+        diffs = []
+        for ri, li in self._ASYM_PAIRS:
+            d = band_feat[:, ri, alpha_idx] - band_feat[:, li, alpha_idx]
+            diffs.append(d.unsqueeze(-1))
+        return torch.cat(diffs, dim=-1)
 
-        if self.num_pairs == 0:
-            return band_feat.new_zeros(band_feat.size(0), self.asym_dim)
-
-        left_idx = torch.tensor([p[0] for p in self.symmetric_pairs], device=band_feat.device)
-        right_idx = torch.tensor([p[1] for p in self.symmetric_pairs], device=band_feat.device)
-
-        left = band_feat.index_select(dim=1, index=left_idx)    # [B,P,K]
-        right = band_feat.index_select(dim=1, index=right_idx)  # [B,P,K]
-
-        # 常用定义之一：右侧 - 左侧。若你后面专门分析 FAA，可重点看 alpha 频带。
-        diff = right - left
-        norm_diff = diff / (right.abs() + left.abs() + self.eps)
-
-        diff_flat = diff.flatten(start_dim=1)
-        norm_flat = norm_diff.flatten(start_dim=1)
-        diff_mean = diff.mean(dim=1)
-        diff_std = diff.std(dim=1, unbiased=False)
-        norm_mean = norm_diff.mean(dim=1)
-        norm_std = norm_diff.std(dim=1, unbiased=False)
-
-        return torch.cat([diff_flat, norm_flat, diff_mean, diff_std, norm_mean, norm_std], dim=-1)
-
+    # ── C. Hjorth ────────────────────────────────────────────
     def _hjorth_features(self, x: torch.Tensor, hjorth: Optional[torch.Tensor]) -> torch.Tensor:
-        """
-        return [B, C*3 + 9]
-        """
+        """5 脑区 Mobility + 5 脑区 Complexity → 10 维"""
         if hjorth is None:
-            hjorth = hjorth_parameters(x)
-
-        h = hjorth.view(hjorth.size(0), self.num_channels, 3)
+            hjorth_vals = hjorth_parameters(x)
+        else:
+            hjorth_vals = hjorth
+        h = hjorth_vals.view(hjorth_vals.size(0), self.num_channels, 3)
         h = torch.nan_to_num(h, nan=0.0, posinf=0.0, neginf=0.0)
+        mobility   = h[..., 1]
+        complexity = h[..., 2]
 
-        # Activity 数值范围可能较大，做 log 压缩；Mobility/Complexity 保持原值。
-        h_activity = torch.log(h[..., 0:1].abs() + self.eps)
-        h_other = h[..., 1:3]
-        h = torch.cat([h_activity, h_other], dim=-1)
+        parts = []
+        for rname in self._region_names:
+            parts.append(self._region_mean(mobility.unsqueeze(-1), rname))
+        mob_feat = torch.cat(parts, dim=-1)
 
-        h_flat = h.flatten(start_dim=1)
-        h_mean = h.mean(dim=1)
-        h_std = h.std(dim=1, unbiased=False)
-        h_max = h.max(dim=1).values
+        parts = []
+        for rname in self._region_names:
+            parts.append(self._region_mean(complexity.unsqueeze(-1), rname))
+        comp_feat = torch.cat(parts, dim=-1)
 
-        return torch.cat([h_flat, h_mean, h_std, h_max], dim=-1)
+        return torch.cat([mob_feat, comp_feat], dim=-1)
 
+    # ── D. PLV 图指标 ────────────────────────────────────────
     def _plv_graph_features(self, plv_matrix: torch.Tensor) -> torch.Tensor:
-        """
-        plv_matrix: [B,C,C]
-        """
+        """frontal-temporal / frontal-parietal / inter-hemisphere /
+           global strength / global clustering → 5 维"""
         B, C, _ = plv_matrix.shape
         A = torch.nan_to_num(plv_matrix.float(), nan=0.0, posinf=0.0, neginf=0.0)
         eye = torch.eye(C, device=A.device, dtype=A.dtype).unsqueeze(0)
         A = A * (1.0 - eye)
 
-        node_strength = A.sum(dim=-1) / max(C - 1, 1)  # [B,C]
+        ft_conn = self._safe_submat_mean(A, self._REGIONS["frontal"], self._REGIONS["temporal"])
+        fp_conn = self._safe_submat_mean(A, self._REGIONS["frontal"], self._REGIONS["parietal"])
+        ih_conn = self._safe_submat_mean(A, self._LEFT_HEM, self._RIGHT_HEM)
+        global_strength = A.sum(dim=(1, 2)) / (C * (C - 1) + self.eps)
 
-        idx = torch.triu_indices(C, C, offset=1, device=A.device)
-        edges = A[:, idx[0], idx[1]]
-
-        edge_mean = edges.mean(dim=1, keepdim=True)
-        edge_std = edges.std(dim=1, unbiased=False, keepdim=True)
-        edge_max = edges.max(dim=1, keepdim=True).values
-        edge_min = edges.min(dim=1, keepdim=True).values
-        strength_mean = node_strength.mean(dim=1, keepdim=True)
-        strength_std = node_strength.std(dim=1, unbiased=False, keepdim=True)
-
-        # top-k 边强度统计，作为连接集中程度指标。
-        k = min(30, edges.size(1))
-        top_edges = torch.topk(edges, k=k, dim=1).values
-        top_mean = top_edges.mean(dim=1, keepdim=True)
-        top_std = top_edges.std(dim=1, unbiased=False, keepdim=True)
-
-        # 近似 weighted clustering coefficient，主要作为图闭合程度的粗略指标。
-        A2 = torch.bmm(A, A)
-        A3 = torch.bmm(A2, A)
+        A2 = torch.bmm(A, A); A3 = torch.bmm(A2, A)
         tri = torch.diagonal(A3, dim1=1, dim2=2)
         strength = A.sum(dim=-1)
         cluster = tri / (strength * (strength - 1.0).clamp_min(self.eps) + self.eps)
         cluster = torch.nan_to_num(cluster, nan=0.0, posinf=0.0, neginf=0.0)
-        cluster_mean = cluster.mean(dim=1, keepdim=True)
-        cluster_std = cluster.std(dim=1, unbiased=False, keepdim=True)
+        global_cluster = cluster.mean(dim=1, keepdim=True)
 
-        global_stats = torch.cat([
-            edge_mean,
-            edge_std,
-            edge_max,
-            edge_min,
-            strength_mean,
-            strength_std,
-            top_mean,
-            top_std,
-            cluster_mean,
-            cluster_std,
-        ], dim=-1)
+        return torch.cat([
+            ft_conn, fp_conn, ih_conn,
+            global_strength.unsqueeze(-1), global_cluster,
+        ], dim=-1).to(dtype=plv_matrix.dtype)
 
-        return torch.cat([node_strength.to(dtype=plv_matrix.dtype), global_stats.to(dtype=plv_matrix.dtype)], dim=-1)
-
+    # ── E. 非线性 ────────────────────────────────────────────
     def _nonlinear_features(self, x: torch.Tensor, raw_log_power: torch.Tensor) -> torch.Tensor:
-        """
-        轻量非线性/复杂度特征：过零率、线长、偏度、峰度、谱熵。
-        return [B, 15]
-        """
+        """5 脑区谱熵 + 全局线长 → 6 维"""
         x_float = x.float()
-        mean = x_float.mean(dim=-1, keepdim=True)
-        std = x_float.std(dim=-1, unbiased=False, keepdim=True).clamp_min(self.eps)
-        xz = (x_float - mean) / std
-
-        zcr = ((xz[..., 1:] * xz[..., :-1]) < 0).float().mean(dim=-1)  # [B,C]
         line_length = (x_float[..., 1:] - x_float[..., :-1]).abs().mean(dim=-1)
-        skew = (xz ** 3).mean(dim=-1)
-        kurt = (xz ** 4).mean(dim=-1)
+        line_global = line_length.mean(dim=1, keepdim=True)
 
-        raw_power = torch.exp(self._match_num_bands(raw_log_power).float()).clamp_min(self.eps)  # [B,C,K]
+        raw_power = torch.exp(self._match_num_bands(raw_log_power).float()).clamp_min(self.eps)
         p = raw_power / (raw_power.sum(dim=-1, keepdim=True) + self.eps)
         spec_entropy = -(p * torch.log(p + self.eps)).sum(dim=-1) / math.log(max(self.num_bands, 2))
+        spec_entropy = torch.nan_to_num(spec_entropy, nan=0.0, posinf=0.0, neginf=0.0)
 
-        feats_ch = torch.stack([zcr, line_length, skew, kurt, spec_entropy], dim=-1)  # [B,C,5]
-        feats_ch = torch.nan_to_num(feats_ch, nan=0.0, posinf=0.0, neginf=0.0)
+        parts = []
+        for rname in self._region_names:
+            parts.append(self._region_mean(spec_entropy.unsqueeze(-1), rname))
+        se_region = torch.cat(parts, dim=-1)
 
-        f_mean = feats_ch.mean(dim=1)
-        f_std = feats_ch.std(dim=1, unbiased=False)
-        f_max = feats_ch.max(dim=1).values
+        return torch.cat([se_region, line_global], dim=-1).to(dtype=x.dtype)
 
-        return torch.cat([f_mean, f_std, f_max], dim=-1).to(dtype=x.dtype)
-
+    # ── forward ──────────────────────────────────────────────
     def forward(
             self,
             x: torch.Tensor,
             de_feat: Optional[torch.Tensor] = None,
             hjorth: Optional[torch.Tensor] = None,
             plv_matrix: Optional[torch.Tensor] = None,
+            subject_bio_mu: Optional[torch.Tensor] = None,
+            subject_bio_std: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         if x.ndim != 3:
             raise ValueError(f"x should be [B,C,T], got {tuple(x.shape)}")
 
         B, C, T = x.shape
         if C != self.num_channels:
-            raise ValueError(
-                f"BiologicalMarkerExtractor expected C={self.num_channels}, got C={C}. "
-                f"请检查通道数或初始化 num_channels。"
-            )
+            raise ValueError(f"Expected C={self.num_channels}, got C={C}.")
 
         raw_log_power = self._compute_log_band_power(x)
         if de_feat is None:
@@ -1003,37 +958,52 @@ class BiologicalMarkerExtractor(nn.Module):
         if plv_matrix is None:
             plv_matrix = torch.eye(C, device=x.device, dtype=x.dtype).unsqueeze(0).expand(B, C, C)
 
-        freq_feat = self._frequency_features(band_feat, raw_log_power)
-        asym_feat = self._asymmetry_features(band_feat)
-        hjorth_feat = self._hjorth_features(x, hjorth)
-        plv_feat = self._plv_graph_features(plv_matrix)
+        freq_feat     = self._frequency_features(band_feat, raw_log_power)
+        asym_feat     = self._asymmetry_features(band_feat)
+        hjorth_feat   = self._hjorth_features(x, hjorth)
+        plv_feat      = self._plv_graph_features(plv_matrix)
         nonlinear_feat = self._nonlinear_features(x, raw_log_power)
 
-        bio_raw = torch.cat([
-            freq_feat,
-            asym_feat,
-            hjorth_feat,
-            plv_feat,
-            nonlinear_feat,
-        ], dim=-1)
+        bio_raw = torch.cat([freq_feat, asym_feat, hjorth_feat, plv_feat, nonlinear_feat], dim=-1)
         bio_raw = torch.nan_to_num(bio_raw, nan=0.0, posinf=0.0, neginf=0.0)
 
         if bio_raw.size(1) != self.raw_dim:
-            raise RuntimeError(
-                f"bio_raw dim mismatch: got {bio_raw.size(1)}, expected {self.raw_dim}. "
-                f"请检查频带数、通道数或左右通道对设置。"
-            )
+            raise RuntimeError(f"bio_raw dim mismatch: got {bio_raw.size(1)}, expected {self.raw_dim}.")
 
-        bio_feat = self.projector(bio_raw)
+        bio_raw_rel = None
+        bio_raw_z = None
+        bio_input = bio_raw
+        use_relative = (
+            self.use_subject_relative_bio
+            and hasattr(self, "relative_projector")
+            and subject_bio_mu is not None
+            and subject_bio_std is not None
+        )
+        if use_relative:
+            subject_bio_mu = subject_bio_mu.to(device=x.device, dtype=x.dtype)
+            subject_bio_std = subject_bio_std.to(device=x.device, dtype=x.dtype)
+            bio_raw_rel = bio_raw - subject_bio_mu
+            bio_raw_z = bio_raw_rel / (subject_bio_std + self.relative_eps)
+            bio_input = torch.cat([self.bio_abs_scale * bio_raw, bio_raw_z], dim=-1)
+            bio_input = torch.nan_to_num(bio_input, nan=0.0, posinf=0.0, neginf=0.0)
+            bio_feat = self.relative_projector(bio_input)
+        else:
+            # 原始行为：不经过 projector，直接输出 57 维 bio_raw。
+            bio_feat = bio_raw
+
         return {
             "bio_feat": bio_feat,
             "bio_raw": bio_raw,
+            "bio_raw_rel": bio_raw_rel,
+            "bio_raw_z": bio_raw_z,
+            "bio_input": bio_input,
             "bio_freq_feat": freq_feat,
             "bio_asym_feat": asym_feat,
             "bio_hjorth_feat": hjorth_feat,
             "bio_plv_feat": plv_feat,
             "bio_nonlinear_feat": nonlinear_feat,
         }
+
 
 
 # ========================================================
@@ -2365,9 +2335,19 @@ class BrainGraphBackbone(nn.Module):
             prior_matrix: Optional[torch.Tensor] = None,
             dropout: float = 0.2,
             use_biomarkers: bool = True,
-            biomarker_dim: int = 64,
+            biomarker_dim: int = 57,
+            use_subject_relative_de: bool = False,
+            use_subject_relative_bio: bool = False,
+            bio_abs_scale: float = 0.3,
+            relative_eps: float = 1e-6,
+            de_num_bands: int = 5,
     ) -> None:
         super().__init__()
+        self.use_subject_relative_de = bool(use_subject_relative_de)
+        self.use_subject_relative_bio = bool(use_subject_relative_bio)
+        self.bio_abs_scale = float(bio_abs_scale)
+        self.relative_eps = float(relative_eps)
+        self.de_num_bands = int(de_num_bands)
 
         self.node_encoder = NodeFeatureEncoder(sfreq=sfreq, temporal_dim=64, spectral_dim=16)
         if self.node_encoder.node_dim != node_dim:
@@ -2380,7 +2360,12 @@ class BrainGraphBackbone(nn.Module):
             sfreq=sfreq,
             diag_mode="centered",
         )
-        self.leranable_diag = LearnableDEDiagonalFusion()
+        self.leranable_diag = LearnableDEDiagonalFusion(num_bands=self.de_num_bands)
+        if self.use_subject_relative_de:
+            self.de_relative_adapter = SubjectRelativeDEAdapter(
+                in_bands=self.de_num_bands * 3,
+                out_bands=self.de_num_bands,
+            )
 
         # 保留原来的节点特征对比分支。
         self.node_contrast_projector = NodeFeatureContrastProjector(
@@ -2434,9 +2419,9 @@ class BrainGraphBackbone(nn.Module):
             self.biomarker_extractor = BiologicalMarkerExtractor(
                 sfreq=sfreq,
                 num_channels=30,
-                out_dim=self.biomarker_dim,
-                hidden_dim=128,
-                dropout=dropout,
+                use_subject_relative_bio=self.use_subject_relative_bio,
+                bio_abs_scale=self.bio_abs_scale,
+                relative_eps=self.relative_eps,
             )
         else:
             self.biomarker_extractor = None
@@ -2453,7 +2438,15 @@ class BrainGraphBackbone(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, x: torch.Tensor, de_feat) -> Dict[str, torch.Tensor]:
+    def forward(
+            self,
+            x: torch.Tensor,
+            de_feat,
+            subject_de_mu: Optional[torch.Tensor] = None,
+            subject_de_std: Optional[torch.Tensor] = None,
+            subject_bio_mu: Optional[torch.Tensor] = None,
+            subject_bio_std: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         """
         Args:
             x: [B, C, T]
@@ -2467,6 +2460,29 @@ class BrainGraphBackbone(nn.Module):
                 node_features: [B, C, 64]
                 plv_adj_norm: [B, C, C]
         """
+        # =====================================================
+        # 0. Subject-relative DE。若 baseline 缺失则自动退化为原始 de_feat。
+        # =====================================================
+        de_rel = None
+        de_z = None
+        de_input = de_feat
+        de_for_model = de_feat
+        use_de_relative = (
+            self.use_subject_relative_de
+            and hasattr(self, "de_relative_adapter")
+            and subject_de_mu is not None
+            and subject_de_std is not None
+            and de_feat.size(-1) == self.de_num_bands
+        )
+        if use_de_relative:
+            subject_de_mu = subject_de_mu.to(device=de_feat.device, dtype=de_feat.dtype)
+            subject_de_std = subject_de_std.to(device=de_feat.device, dtype=de_feat.dtype)
+            de_rel = de_feat - subject_de_mu
+            de_z = de_rel / (subject_de_std + self.relative_eps)
+            de_input = torch.cat([de_feat, de_rel, de_z], dim=-1)
+            de_input = torch.nan_to_num(de_input, nan=0.0, posinf=0.0, neginf=0.0)
+            de_for_model = self.de_relative_adapter(de_input)
+
         # =====================================================
         # 1. 原来的多尺度卷积节点特征
         # =====================================================
@@ -2485,7 +2501,7 @@ class BrainGraphBackbone(nn.Module):
         # =====================================================
         # 3. DE 对角线：两个图相关模块共用同一套 DE self-loop 逻辑
         # =====================================================
-        power_diag_values, band_weight = self.leranable_diag(de_feat)  # [B, C]
+        power_diag_values, band_weight = self.leranable_diag(de_for_model)  # [B, C]
 
         # =====================================================
         # 4. 分支 2：原始信号 PLV 构图 + DE 对角线 + GCN + 图读出
@@ -2512,9 +2528,11 @@ class BrainGraphBackbone(nn.Module):
         if self.use_biomarkers and self.biomarker_extractor is not None:
             bio_dict = self.biomarker_extractor(
                 x,
-                de_feat=de_feat,
+                de_feat=de_for_model,
                 hjorth=hjorth,
                 plv_matrix=plv_graph_dict["plv_matrix"],
+                subject_bio_mu=subject_bio_mu,
+                subject_bio_std=subject_bio_std,
             )
             z_bio = bio_dict["bio_feat"]  # [B, biomarker_dim]
             z = torch.cat([z_core, z_bio], dim=-1)
@@ -2530,6 +2548,9 @@ class BrainGraphBackbone(nn.Module):
             "z_plv": z_plv,
             "bio_feat": z_bio,
             "bio_raw": bio_dict.get("bio_raw", None),
+            "bio_raw_rel": bio_dict.get("bio_raw_rel", None),
+            "bio_raw_z": bio_dict.get("bio_raw_z", None),
+            "bio_input": bio_dict.get("bio_input", None),
             "bio_freq_feat": bio_dict.get("bio_freq_feat", None),
             "bio_asym_feat": bio_dict.get("bio_asym_feat", None),
             "bio_hjorth_feat": bio_dict.get("bio_hjorth_feat", None),
@@ -2559,6 +2580,10 @@ class BrainGraphBackbone(nn.Module):
 
             "power_diag_values": power_diag_values,
             "de_band_weight": band_weight,
+            "de_rel": de_rel,
+            "de_z": de_z,
+            "de_input": de_input,
+            "de_for_model": de_for_model,
             "hjorth": hjorth,
         }
 
@@ -2719,7 +2744,11 @@ class EmotionPretrainModel(nn.Module):
             contrast_dim: int = 64,
             contrast_hidden_dim: int = 128,
             use_biomarkers: bool = True,
-            biomarker_dim: int = 64,
+            biomarker_dim: int = 57,
+            use_subject_relative_de: bool = False,
+            use_subject_relative_bio: bool = False,
+            bio_abs_scale: float = 0.3,
+            relative_eps: float = 1e-6,
             # 下面参数用于兼容旧 main 中可能传入的 nclass / aux_nclass / de_num_bands
             nclass: Optional[int] = None,
             aux_nclass: Optional[int] = None,
@@ -2741,7 +2770,16 @@ class EmotionPretrainModel(nn.Module):
             dropout=dropout,
             use_biomarkers=use_biomarkers,
             biomarker_dim=biomarker_dim,
+            use_subject_relative_de=use_subject_relative_de,
+            use_subject_relative_bio=use_subject_relative_bio,
+            bio_abs_scale=bio_abs_scale,
+            relative_eps=relative_eps,
+            de_num_bands=5 if de_num_bands is None else int(de_num_bands),
         )
+        self.use_subject_relative_de = bool(use_subject_relative_de)
+        self.use_subject_relative_bio = bool(use_subject_relative_bio)
+        self.bio_abs_scale = float(bio_abs_scale)
+        self.relative_eps = float(relative_eps)
 
         self.in_dim = self.backbone.out_dim  # 128
         self.emotion_nclass = emotion_nclass
@@ -2791,6 +2829,11 @@ class EmotionPretrainModel(nn.Module):
             lambda_subject: float = 0.0,
             lambda_dom: Optional[float] = None,
             dataset_name: str = "competition",
+            subject_id: Optional[torch.Tensor] = None,
+            subject_de_mu: Optional[torch.Tensor] = None,
+            subject_de_std: Optional[torch.Tensor] = None,
+            subject_bio_mu: Optional[torch.Tensor] = None,
+            subject_bio_std: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -2804,7 +2847,14 @@ class EmotionPretrainModel(nn.Module):
         if lambda_dom is not None:
             lambda_subject = float(lambda_dom)
 
-        out = self.backbone(x, de_feat=de_feat)
+        out = self.backbone(
+            x,
+            de_feat=de_feat,
+            subject_de_mu=subject_de_mu,
+            subject_de_std=subject_de_std,
+            subject_bio_mu=subject_bio_mu,
+            subject_bio_std=subject_bio_std,
+        )
         z = out["z"]
 
         emo_logits = self.emotion_head(z)

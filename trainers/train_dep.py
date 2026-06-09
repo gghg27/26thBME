@@ -108,6 +108,145 @@ def seed_worker(worker_id: int):
 
 
 # =========================================================
+# Subject-relative baseline utilities
+# =========================================================
+
+def _to_subject_int(subject_id):
+    if isinstance(subject_id, torch.Tensor):
+        return int(subject_id.detach().cpu().item())
+    return int(subject_id)
+
+
+def compute_subject_de_baselines(dataset, eps=1e-6):
+    """
+    遍历 dataset，按 subject_id 聚合 de_feat。
+
+    返回：
+        subject_de_mu: dict[int, torch.Tensor], shape [C, K]
+        subject_de_std: dict[int, torch.Tensor], shape [C, K]
+    """
+    sums = {}
+    sq_sums = {}
+    counts = defaultdict(int)
+
+    for idx in tqdm(range(len(dataset)), desc="DE baseline", leave=False):
+        item = dataset[idx]
+        sid = _to_subject_int(item["subject_id"])
+        de_feat = torch.as_tensor(item["de_feat"], dtype=torch.float32)
+
+        if sid not in sums:
+            sums[sid] = torch.zeros_like(de_feat)
+            sq_sums[sid] = torch.zeros_like(de_feat)
+        sums[sid] += de_feat
+        sq_sums[sid] += de_feat * de_feat
+        counts[sid] += 1
+
+    subject_de_mu = {}
+    subject_de_std = {}
+    for sid, total in sums.items():
+        count = max(int(counts[sid]), 1)
+        mu = total / count
+        var = sq_sums[sid] / count - mu * mu
+        subject_de_mu[int(sid)] = mu
+        subject_de_std[int(sid)] = torch.sqrt(torch.clamp(var, min=0.0) + eps)
+
+    return subject_de_mu, subject_de_std
+
+
+def gather_subject_baseline(subject_ids, baseline_dict, device, dtype=None):
+    """
+    subject_ids: batch["subject_id"]
+    baseline_dict: dict[int, Tensor/ndarray]
+    return: [B, ...]
+
+    如果 baseline 缺失，返回 None，让模型自动退化为原始特征。
+    """
+    if baseline_dict is None:
+        return None
+
+    if isinstance(subject_ids, torch.Tensor):
+        ids = subject_ids.detach().cpu().view(-1).tolist()
+    else:
+        ids = list(subject_ids)
+
+    values = []
+    for sid in ids:
+        sid = int(sid)
+        if sid not in baseline_dict:
+            return None
+        values.append(torch.as_tensor(baseline_dict[sid]))
+
+    out = torch.stack(values, dim=0).to(device=device)
+    if dtype is not None:
+        out = out.to(dtype=dtype)
+    return out
+
+
+@torch.no_grad()
+def compute_subject_bio_baselines(
+    model,
+    loader,
+    device,
+    subject_de_mu=None,
+    subject_de_std=None,
+    eps=1e-6,
+):
+    """
+    用无梯度前向离线提取 out["bio_raw"]，按 subject_id 聚合 bio baseline。
+
+    这里不传 subject_bio_mu/std，因此即使模型开启 bio 相对化，也会先走原始
+    bio_raw 路径，避免 baseline 递归依赖。标签不会参与计算。
+    """
+    model.eval()
+    sums = {}
+    sq_sums = {}
+    counts = defaultdict(int)
+
+    for batch in tqdm(loader, desc="Bio baseline", leave=False):
+        x = batch["x"].to(device)
+        de_feat = batch["de_feat"].to(device)
+        subject_ids = batch["subject_id"]
+        de_mu_batch = gather_subject_baseline(subject_ids, subject_de_mu, device, dtype=de_feat.dtype)
+        de_std_batch = gather_subject_baseline(subject_ids, subject_de_std, device, dtype=de_feat.dtype)
+
+        out = model(
+            x,
+            de_feat=de_feat,
+            lambda_diag=0.0,
+            lambda_subject=0.0,
+            subject_de_mu=de_mu_batch,
+            subject_de_std=de_std_batch,
+            subject_bio_mu=None,
+            subject_bio_std=None,
+        )
+        bio_raw = out.get("bio_raw", None)
+        if bio_raw is None:
+            raise RuntimeError("模型 forward 未返回 bio_raw，无法计算 bio baseline。")
+        bio_raw = bio_raw.detach().cpu().float()
+
+        for i, sid in enumerate(subject_ids.detach().cpu().view(-1).tolist()):
+            sid = int(sid)
+            feat = bio_raw[i]
+            if sid not in sums:
+                sums[sid] = torch.zeros_like(feat)
+                sq_sums[sid] = torch.zeros_like(feat)
+            sums[sid] += feat
+            sq_sums[sid] += feat * feat
+            counts[sid] += 1
+
+    subject_bio_mu = {}
+    subject_bio_std = {}
+    for sid, total in sums.items():
+        count = max(int(counts[sid]), 1)
+        mu = total / count
+        var = sq_sums[sid] / count - mu * mu
+        subject_bio_mu[int(sid)] = mu
+        subject_bio_std[int(sid)] = torch.sqrt(torch.clamp(var, min=0.0) + eps)
+
+    return subject_bio_mu, subject_bio_std
+
+
+# =========================================================
 # Label utilities
 # =========================================================
 
@@ -321,6 +460,157 @@ def compute_trial_level_metrics(segment_records, threshold=0.5, vote_method="har
         "trial_probs": trial_probs,
         "trial_preds": trial_preds,
         "trial_labels": trial_labels,
+    }
+
+
+def apply_subject_topk_prediction(trial_score_records, k_pos=4):
+    """
+    输入每个 trial 的 subject_id、trial_id、score_pos、prob_pos。
+    对每个 subject 内部按 score_pos 排序，top k_pos 判为 1，其余判为 0。
+    返回带 Emotion_label 的结果。
+    """
+    subject_trials = defaultdict(list)
+    for r in trial_score_records:
+        rec = dict(r)
+        rec["subject_id"] = int(rec.get("subject_id", rec.get("user_id")))
+        rec["trial_id"] = int(rec["trial_id"])
+        rec["score_pos"] = float(rec.get("score_pos", rec.get("prob_pos", 0.0)))
+        if "prob_pos" in rec:
+            rec["prob_pos"] = float(rec["prob_pos"])
+        subject_trials[rec["subject_id"]].append(rec)
+
+    results = []
+    for subject_id, records in subject_trials.items():
+        records = sorted(records, key=lambda x: x["score_pos"], reverse=True)
+        cur_k = int(k_pos) if len(records) == 8 else int(round(len(records) * 0.5))
+        cur_k = max(0, min(cur_k, len(records)))
+        positive_keys = {(r["subject_id"], r["trial_id"]) for r in records[:cur_k]}
+        for r in records:
+            out = dict(r)
+            out["Emotion_label"] = 1 if (r["subject_id"], r["trial_id"]) in positive_keys else 0
+            results.append(out)
+
+    return sorted(results, key=lambda x: (x["subject_id"], x["trial_id"]))
+
+
+def compute_subject_topk_trial_metrics(
+    segment_records,
+    k_pos=4,
+    score_key="score_pos",
+    fallback_prob_key="prob_pos",
+):
+    """
+    先 window -> trial 聚合，再 subject 内 top-k。
+    每个 subject 的 trial_score 最高的 k_pos 个 trial 判为 positive，其余判为 neutral。
+    """
+    trial_dict = defaultdict(list)
+    for r in segment_records:
+        key = (int(r["subject_id"]), int(r["trial_id"]))
+        trial_dict[key].append(r)
+
+    trial_score_records = []
+    for (subject_id, trial_id), records in trial_dict.items():
+        scores = [
+            float(r[score_key] if score_key in r else r.get(fallback_prob_key, 0.0))
+            for r in records
+        ]
+        probs = [float(r.get(fallback_prob_key, 0.0)) for r in records]
+        labels = [int(r["label_emo"]) for r in records]
+        trial_score_records.append({
+            "subject_id": int(subject_id),
+            "trial_id": int(trial_id),
+            "score_pos": float(np.mean(scores)),
+            "prob_pos": float(np.mean(probs)),
+            "label_emo": int(round(float(np.mean(labels)))),
+        })
+
+    topk_records = apply_subject_topk_prediction(trial_score_records, k_pos=k_pos)
+    label_map = {
+        (int(r["subject_id"]), int(r["trial_id"])): int(r["label_emo"])
+        for r in trial_score_records
+    }
+    score_map = {
+        (int(r["subject_id"]), int(r["trial_id"])): float(r["score_pos"])
+        for r in trial_score_records
+    }
+    prob_map = {
+        (int(r["subject_id"]), int(r["trial_id"])): float(r["prob_pos"])
+        for r in trial_score_records
+    }
+
+    topk_trial_keys = []
+    topk_trial_scores = []
+    topk_trial_probs = []
+    topk_trial_preds = []
+    topk_trial_labels = []
+
+    for r in topk_records:
+        key = (int(r["subject_id"]), int(r["trial_id"]))
+        topk_trial_keys.append(key)
+        topk_trial_scores.append(score_map[key])
+        topk_trial_probs.append(prob_map[key])
+        topk_trial_preds.append(int(r["Emotion_label"]))
+        topk_trial_labels.append(label_map[key])
+
+    if len(topk_trial_labels) == 0:
+        return {
+            "topk_trial_acc": 0.0,
+            "topk_trial_macro_f1": 0.0,
+            "topk_trial_confusion_matrix": np.zeros((2, 2), dtype=int),
+            "topk_trial_per_class": {},
+            "topk_trial_keys": [],
+            "topk_trial_scores": [],
+            "topk_trial_probs": [],
+            "topk_trial_preds": [],
+            "topk_trial_labels": [],
+            "topk_subject_gap_mean": 0.0,
+            "topk_subject_gap_std": 0.0,
+        }
+
+    topk_trial_acc = accuracy_score(topk_trial_labels, topk_trial_preds)
+    topk_trial_macro_f1 = f1_score(
+        topk_trial_labels,
+        topk_trial_preds,
+        average="macro",
+        labels=[0, 1],
+        zero_division=0,
+    )
+    topk_trial_cm = confusion_matrix(topk_trial_labels, topk_trial_preds, labels=[0, 1])
+    p, r, f1, s = precision_recall_fscore_support(
+        topk_trial_labels,
+        topk_trial_preds,
+        labels=[0, 1],
+        zero_division=0,
+    )
+    topk_trial_per_class = {
+        int(c): {"precision": float(p[i]), "recall": float(r[i]), "f1": float(f1[i]), "support": int(s[i])}
+        for i, c in enumerate([0, 1])
+    }
+
+    gaps = []
+    by_subject = defaultdict(list)
+    for key, score, pred in zip(topk_trial_keys, topk_trial_scores, topk_trial_preds):
+        subject_id, trial_id = key
+        by_subject[int(subject_id)].append((int(trial_id), float(score), int(pred)))
+
+    for records in by_subject.values():
+        pos_scores = [score for _tid, score, pred in records if pred == 1]
+        neg_scores = [score for _tid, score, pred in records if pred == 0]
+        if len(pos_scores) > 0 and len(neg_scores) > 0:
+            gaps.append(float(np.mean(pos_scores) - np.mean(neg_scores)))
+
+    return {
+        "topk_trial_acc": topk_trial_acc,
+        "topk_trial_macro_f1": topk_trial_macro_f1,
+        "topk_trial_confusion_matrix": topk_trial_cm,
+        "topk_trial_per_class": topk_trial_per_class,
+        "topk_trial_keys": topk_trial_keys,
+        "topk_trial_scores": topk_trial_scores,
+        "topk_trial_probs": topk_trial_probs,
+        "topk_trial_preds": topk_trial_preds,
+        "topk_trial_labels": topk_trial_labels,
+        "topk_subject_gap_mean": float(np.mean(gaps)) if len(gaps) > 0 else 0.0,
+        "topk_subject_gap_std": float(np.std(gaps)) if len(gaps) > 0 else 0.0,
     }
 
 
@@ -588,6 +878,10 @@ def train_one_epoch_emotion_grl(
     con_temperature: float = 0.1,
     grl_diag: float = 0.0,
     grl_subject: float = 0.01,
+    subject_de_mu=None,
+    subject_de_std=None,
+    subject_bio_mu=None,
+    subject_bio_std=None,
 ):
     model.train()
 
@@ -610,6 +904,11 @@ def train_one_epoch_emotion_grl(
         x = batch["x"].to(device)
         de_feat = batch["de_feat"].to(device)
         _, y_emo, y_diag, y_subject = get_targets(batch, device)
+        subject_ids_cpu = batch["subject_id"]
+        de_mu_batch = gather_subject_baseline(subject_ids_cpu, subject_de_mu, device, dtype=de_feat.dtype)
+        de_std_batch = gather_subject_baseline(subject_ids_cpu, subject_de_std, device, dtype=de_feat.dtype)
+        bio_mu_batch = gather_subject_baseline(subject_ids_cpu, subject_bio_mu, device, dtype=de_feat.dtype)
+        bio_std_batch = gather_subject_baseline(subject_ids_cpu, subject_bio_std, device, dtype=de_feat.dtype)
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -618,6 +917,11 @@ def train_one_epoch_emotion_grl(
             de_feat=de_feat,
             lambda_diag=grl_diag if lambda_diag > 0 else 0.0,
             lambda_subject=grl_subject if lambda_subject > 0 else 0.0,
+            subject_id=subject_ids_cpu,
+            subject_de_mu=de_mu_batch,
+            subject_de_std=de_std_batch,
+            subject_bio_mu=bio_mu_batch,
+            subject_bio_std=bio_std_batch,
         )
 
         emo_logits = out["emo_logits"]
@@ -729,6 +1033,10 @@ def validate_one_epoch_emotion_grl(
     lambda_graph: float = 0.0,
     lambda_con: float = 0.05,
     con_temperature: float = 0.1,
+    subject_de_mu=None,
+    subject_de_std=None,
+    subject_bio_mu=None,
+    subject_bio_std=None,
 ):
     """验证一轮 — 已注释验证时恒为 0 的损失以加速。"""
     model.eval()
@@ -750,12 +1058,23 @@ def validate_one_epoch_emotion_grl(
         x = batch["x"].to(device)
         de_feat = batch["de_feat"].to(device)
         _, y_emo, y_diag, y_subject = get_targets(batch, device)
+        subject_ids_cpu = batch["subject_id"]
+        trial_ids_cpu = batch["trial_id"]
+        de_mu_batch = gather_subject_baseline(subject_ids_cpu, subject_de_mu, device, dtype=de_feat.dtype)
+        de_std_batch = gather_subject_baseline(subject_ids_cpu, subject_de_std, device, dtype=de_feat.dtype)
+        bio_mu_batch = gather_subject_baseline(subject_ids_cpu, subject_bio_mu, device, dtype=de_feat.dtype)
+        bio_std_batch = gather_subject_baseline(subject_ids_cpu, subject_bio_std, device, dtype=de_feat.dtype)
 
         out = model(
             x,
             de_feat=de_feat,
             lambda_diag=0.0,
             lambda_subject=0.0,
+            subject_id=subject_ids_cpu,
+            subject_de_mu=de_mu_batch,
+            subject_de_std=de_std_batch,
+            subject_bio_mu=bio_mu_batch,
+            subject_bio_std=bio_std_batch,
         )
 
         emo_logits = out["emo_logits"]
@@ -785,18 +1104,17 @@ def validate_one_epoch_emotion_grl(
 
         prob_emo = torch.softmax(emo_logits, dim=1)
         prob_pos = prob_emo[:, 1]
+        score_pos = emo_logits[:, 1] - emo_logits[:, 0]
 
         pred_emo = emo_logits.argmax(dim=1)
         pred_diag = diagnosis_logits.argmax(dim=1)
-
-        subject_ids_cpu = batch["subject_id"]
-        trial_ids_cpu = batch["trial_id"]
 
         for i in range(x.size(0)):
             segment_records.append({
                 "subject_id": int(subject_ids_cpu[i]),
                 "trial_id": int(trial_ids_cpu[i]),
                 "prob_pos": float(prob_pos[i].detach().cpu()),
+                "score_pos": float(score_pos[i].detach().cpu()),
                 "pred_emo": int(pred_emo[i].detach().cpu()),
                 "label_emo": int(y_emo[i].detach().cpu()),
                 "pred_diag": int(pred_diag[i].detach().cpu()),
@@ -862,6 +1180,11 @@ def validate_one_epoch_emotion_grl(
     subject_acc = 0.0
 
     trial_metrics = compute_trial_level_metrics(segment_records, threshold=0.5, vote_method="hard")
+    topk_trial_metrics = compute_subject_topk_trial_metrics(
+        segment_records,
+        k_pos=4,
+        score_key="score_pos",
+    )
 
     pt, rt, f1t, st = precision_recall_fscore_support(
         trial_metrics["trial_labels"],
@@ -907,6 +1230,18 @@ def validate_one_epoch_emotion_grl(
         "trial_probs": trial_metrics["trial_probs"],
         "trial_preds": trial_metrics["trial_preds"],
         "trial_labels": trial_metrics["trial_labels"],
+
+        "topk_trial_acc": topk_trial_metrics["topk_trial_acc"],
+        "topk_trial_macro_f1": topk_trial_metrics["topk_trial_macro_f1"],
+        "topk_trial_confusion_matrix": topk_trial_metrics["topk_trial_confusion_matrix"],
+        "topk_trial_per_class": topk_trial_metrics["topk_trial_per_class"],
+        "topk_trial_keys": topk_trial_metrics["topk_trial_keys"],
+        "topk_trial_scores": topk_trial_metrics["topk_trial_scores"],
+        "topk_trial_probs": topk_trial_metrics["topk_trial_probs"],
+        "topk_trial_preds": topk_trial_metrics["topk_trial_preds"],
+        "topk_trial_labels": topk_trial_metrics["topk_trial_labels"],
+        "topk_subject_gap_mean": topk_trial_metrics["topk_subject_gap_mean"],
+        "topk_subject_gap_std": topk_trial_metrics["topk_subject_gap_std"],
 
         "segment_records": segment_records,
     }
@@ -1012,6 +1347,10 @@ def train_competition_cross_subject(
     early_stop_warmup: int = 15,
     early_stop_min_delta: float = 1e-6,
     early_stop_track: str = "combined",
+    use_subject_relative_de: bool = True,
+    use_subject_relative_bio: bool = True,
+    bio_abs_scale: float = 0.3,
+    relative_eps: float = 1e-6,
 ):
     os.makedirs(save_dir, exist_ok=True)
     train_group = normalize_train_group(train_group)
@@ -1121,6 +1460,66 @@ def train_competition_cross_subject(
         generator=loader_generator,
     )
 
+    use_subject_relative_de = bool(use_subject_relative_de and getattr(model, "use_subject_relative_de", False))
+    use_subject_relative_bio = bool(use_subject_relative_bio and getattr(model, "use_subject_relative_bio", False))
+    print(
+        f"[Subject Relative] DE={use_subject_relative_de}, "
+        f"bio={use_subject_relative_bio}, bio_abs_scale={bio_abs_scale}, eps={relative_eps}"
+    )
+
+    subject_de_mu = subject_de_std = None
+    subject_bio_mu = subject_bio_std = None
+    val_subject_de_mu = val_subject_de_std = None
+    val_subject_bio_mu = val_subject_bio_std = None
+
+    if use_subject_relative_de or use_subject_relative_bio:
+        train_baseline_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False,
+            collate_fn=collate_fn,
+            worker_init_fn=seed_worker,
+        )
+        val_baseline_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False,
+            collate_fn=collate_fn,
+            worker_init_fn=seed_worker,
+        )
+    else:
+        train_baseline_loader = val_baseline_loader = None
+
+    if use_subject_relative_de:
+        print("[Subject Relative] computing train/val DE baselines from each split itself...")
+        subject_de_mu, subject_de_std = compute_subject_de_baselines(train_dataset, eps=relative_eps)
+        val_subject_de_mu, val_subject_de_std = compute_subject_de_baselines(val_dataset, eps=relative_eps)
+
+    if use_subject_relative_bio:
+        print("[Subject Relative] computing train/val bio baselines with model forward, labels are not used...")
+        subject_bio_mu, subject_bio_std = compute_subject_bio_baselines(
+            model,
+            train_baseline_loader,
+            device,
+            subject_de_mu=subject_de_mu,
+            subject_de_std=subject_de_std,
+            eps=relative_eps,
+        )
+        val_subject_bio_mu, val_subject_bio_std = compute_subject_bio_baselines(
+            model,
+            val_baseline_loader,
+            device,
+            subject_de_mu=val_subject_de_mu,
+            subject_de_std=val_subject_de_std,
+            eps=relative_eps,
+        )
+
     # -------- losses --------
     emotion_weights = build_emotion_class_weights(index_csv, train_subjects).to(device)
     diagnosis_weights = build_diagnosis_class_weights(index_csv, train_subjects).to(device)
@@ -1159,15 +1558,43 @@ def train_competition_cross_subject(
         "early_stop_warmup": early_stop_warmup,
         "early_stop_min_delta": early_stop_min_delta,
         "early_stop_track": early_stop_track,
+        "use_subject_relative_de": use_subject_relative_de,
+        "use_subject_relative_bio": use_subject_relative_bio,
+        "bio_abs_scale": bio_abs_scale,
+        "relative_eps": relative_eps,
     }
 
     best_trackers = {
         "combined": {
             "criteria": [
+                ("topk_trial_macro_f1", "max"),
+                ("topk_trial_acc", "max"),
                 ("trial_macro_f1", "max"),
                 ("trial_acc", "max"),
                 ("emotion_macro_f1", "max"),
                 ("emotion_acc", "max"),
+                ("loss", "min"),
+            ],
+            "best_metrics": None,
+            "best_epoch": None,
+            "checkpoint_path": None,
+        },
+        "topk_trial_f1": {
+            "criteria": [
+                ("topk_trial_macro_f1", "max"),
+                ("topk_trial_acc", "max"),
+                ("topk_subject_gap_mean", "max"),
+                ("loss", "min"),
+            ],
+            "best_metrics": None,
+            "best_epoch": None,
+            "checkpoint_path": None,
+        },
+        "topk_trial_acc": {
+            "criteria": [
+                ("topk_trial_acc", "max"),
+                ("topk_trial_macro_f1", "max"),
+                ("topk_subject_gap_mean", "max"),
                 ("loss", "min"),
             ],
             "best_metrics": None,
@@ -1244,6 +1671,10 @@ def train_competition_cross_subject(
             con_temperature=con_temperature,
             grl_diag=grl_diag,
             grl_subject=grl_subject,
+            subject_de_mu=subject_de_mu,
+            subject_de_std=subject_de_std,
+            subject_bio_mu=subject_bio_mu,
+            subject_bio_std=subject_bio_std,
         )
 
         val_metrics = validate_one_epoch_emotion_grl(
@@ -1259,6 +1690,10 @@ def train_competition_cross_subject(
             lambda_graph=lambda_graph,
             lambda_con=lambda_con,
             con_temperature=con_temperature,
+            subject_de_mu=val_subject_de_mu,
+            subject_de_std=val_subject_de_std,
+            subject_bio_mu=val_subject_bio_mu,
+            subject_bio_std=val_subject_bio_std,
         )
 
         scheduler.step()
@@ -1282,6 +1717,9 @@ def train_competition_cross_subject(
             f"seg_emo_f1={val_metrics['emotion_macro_f1']:.4f} "
             f"trial_acc={val_metrics['trial_acc']:.4f} "
             f"trial_f1={val_metrics['trial_macro_f1']:.4f} "
+            f"topk_trial_acc={val_metrics['topk_trial_acc']:.4f} "
+            f"topk_trial_f1={val_metrics['topk_trial_macro_f1']:.4f} "
+            f"topk_gap={val_metrics['topk_subject_gap_mean']:.4f} "
             f"diag_acc={val_metrics['diagnosis_acc']:.4f}"
         )
 
@@ -1440,6 +1878,11 @@ if __name__ == "__main__":
                 diagnosis_nclass=2,
                 contrast_dim=64,
                 contrast_hidden_dim=128,
+                use_subject_relative_de=True,
+                use_subject_relative_bio=True,
+                bio_abs_scale=0.3,
+                relative_eps=1e-6,
+                de_num_bands=5,
             )
 
             result = train_competition_cross_subject(
@@ -1462,7 +1905,7 @@ if __name__ == "__main__":
                 lambda_emo=1.0,
 
                 # 监督对比学习：同一情绪类拉近，不同情绪类拉远
-                lambda_con=0.05,
+                lambda_con=0.0,
                 con_temperature=0.1,
 
                 # train_group='hc'/'dep' 时诊断标签恒定，建议关闭
@@ -1471,8 +1914,8 @@ if __name__ == "__main__":
                 grl_diag=0.0,
 
                 # 被试域对抗，建议小权重起步
-                lambda_subject=0.01,
-                grl_subject=0.01,
+                lambda_subject=0.0,
+                grl_subject=0.0,
 
                 # 图正则先关闭，主任务稳定后再开
                 lambda_graph=0.0,
@@ -1484,6 +1927,10 @@ if __name__ == "__main__":
                 early_stop_patience=25,
                 early_stop_warmup=15,
                 early_stop_min_delta=1e-6,
+                use_subject_relative_de=True,
+                use_subject_relative_bio=True,
+                bio_abs_scale=0.3,
+                relative_eps=1e-6,
             )
 
             combined_tracker = result["best_models"]["combined"]
@@ -1527,6 +1974,9 @@ if __name__ == "__main__":
             print(f"val_segment_emo_f1 = {combined_metrics['emotion_macro_f1']:.4f}")
             print(f"val_trial_acc = {combined_metrics['trial_acc']:.4f}")
             print(f"val_trial_f1 = {combined_metrics['trial_macro_f1']:.4f}")
+            print(f"val_topk_trial_acc = {combined_metrics['topk_trial_acc']:.4f}")
+            print(f"val_topk_trial_f1 = {combined_metrics['topk_trial_macro_f1']:.4f}")
+            print(f"val_topk_subject_gap = {combined_metrics['topk_subject_gap_mean']:.4f}")
 
         seed_df = pd.DataFrame(seed_combined_rows)
         seed_csv = os.path.join(version, f"seed{rand}_combined_5fold_results.csv")
@@ -1537,6 +1987,9 @@ if __name__ == "__main__":
             "val_emotion_macro_f1",
             "val_trial_acc",
             "val_trial_macro_f1",
+            "val_topk_trial_acc",
+            "val_topk_trial_macro_f1",
+            "val_topk_subject_gap_mean",
             "val_loss",
         ]
 
@@ -1576,6 +2029,9 @@ if __name__ == "__main__":
             "val_emotion_macro_f1",
             "val_trial_acc",
             "val_trial_macro_f1",
+            "val_topk_trial_acc",
+            "val_topk_trial_macro_f1",
+            "val_topk_subject_gap_mean",
             "val_loss",
         ]
 
