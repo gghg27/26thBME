@@ -273,6 +273,8 @@ def ensemble_and_save(all_probs: list[pd.DataFrame], output_dir: Path):
 # =========================================================
 
 def main():
+    global USE_TOPK, K_POS  # noqa: PLW0603
+
     parser = argparse.ArgumentParser(description="V1 测试集集成预测")
     parser.add_argument("--params_dir", type=Path, default=PARAMS_DIR)
     parser.add_argument("--test_csv", type=Path, default=TEST_CSV)
@@ -280,13 +282,13 @@ def main():
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
     parser.add_argument("--device", type=str, default=DEVICE)
     parser.add_argument("--no_topk", action="store_true", help="禁用 top-K 预测")
-    parser.add_argument("--k_pos", type=int, default=K_POS, help="top-K 中每被试正性 trial 数")
+    parser.add_argument("--k_pos", type=int, default=0, help="top-K 中每被试正性 trial 数（0=使用默认4）")
     args = parser.parse_args()
 
-    global USE_TOPK, K_POS  # noqa: PLW0603
     if args.no_topk:
         USE_TOPK = False
-    K_POS = args.k_pos
+    if args.k_pos > 0:
+        K_POS = args.k_pos
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
