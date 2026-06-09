@@ -1,20 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-EEG 抑郁症/正常人跨被试二分类训练脚本。
+EEG 情绪二分类 + 四分类辅助任务跨被试训练脚本。
 
-适用目标：
-    diagnosis_label 二分类：0/1 分别代表你的数据集中定义的两个诊断类别。
-    请确认 com_index_sub_2s.csv 中 diagnosis_label 的编码含义，常见是：
-        0 = HC/正常人，1 = DEP/抑郁症
-    如果你的编码相反，指标含义也相反，但训练逻辑不受影响。
+双任务架构：
+    - 四分类头 (cls4_head)：z_conv → 4 类情绪 (DEP_neu, DEP_pos, HC_neu, HC_pos)
+    - 二分类头 (cls2_head)：z_diag → 2 类情绪 (中性, 正性)
+    - 域对抗头 (domain_head)：z_diag → 被试域分类 (GRL)
 
-主要修正：
-1. 当 nclass=2 时，训练标签统一使用 batch["diagnosis_label"]。
-2. 二分类也使用 diagnosis_label 的类别权重，缓解 DEP/HC 样本不均衡。
-3. lambda_graph=0 或模型不返回 adj_dense 时，不再强制访问 out["adj_dense"]。
-4. trial 级指标改为诊断二分类指标；额外增加 subject 级诊断指标。
-5. 打印、保存和画图命名改为 diagnosis/diag，避免与 emotion 或 4-class 混淆。
-6. 保留 nclass=4 分支兼容性，但本脚本默认 nclass=2。
+Loss:
+    L = L_4cls(z_conv, label4) + λ_diag × L_2cls(z_diag, emotion_binary)
+        + λ_domain × L_domain + λ_center × L_center
+
+注意：
+    二分类头做的是情绪正/负性分类（从 label4 % 2 推算），不是抑郁症诊断。
+    如需做诊断二分类，请使用 batch["diagnosis_label"] 替换 y_2cls。
 """
 
 import os
@@ -114,6 +113,7 @@ def validate_one_epoch_two_branch(
     criterion_4cls,
     criterion_2cls,
     device,
+    lambda_diag: float = 1.0,
     lambda_graph: float = 0.1,
 ):
     """
@@ -164,9 +164,9 @@ def validate_one_epoch_two_branch(
                 loss_graph = intra_class_graph_loss(adj_dense, y_4cls)
             else:
                 loss_graph = logits_4cls.new_tensor(0.0)
-            loss = loss_4cls + loss_2cls + lambda_graph * loss_graph
+            loss = loss_4cls + lambda_diag * loss_2cls + lambda_graph * loss_graph
         else:
-            loss = loss_4cls + loss_2cls
+            loss = loss_4cls + lambda_diag * loss_2cls
 
         pred_4cls = logits_4cls.argmax(dim=1)
         pred_2cls = logits_2cls.argmax(dim=1)
@@ -186,12 +186,10 @@ def validate_one_epoch_two_branch(
             segment_records.append({
                 "subject_id": int(subject_ids_cpu[i]),
                 "trial_id": int(trial_ids_cpu[i]),
-                "prob_pos": float(prob_pos_emo[i].detach().cpu()),
-                "prob_diag1": float(prob_pos_2[i].detach().cpu()),    # 情绪正性概率
+                "prob_emo4": float(prob_pos_emo[i].detach().cpu()),   # 四分类头正性概率 P(class=1)+P(class=3)
+                "prob_emo2": float(prob_pos_2[i].detach().cpu()),    # 二分类头正性概率 P(class=1)
                 "pred_emo": int(pred_2cls[i].detach().cpu()),
-                "pred_diag": int(pred_2cls[i].detach().cpu()),
                 "label_emo": int(y_2cls[i].detach().cpu()),
-                "label_diag": int(y_2cls[i].detach().cpu()),          # = label_emo
                 "pred_cls": int(pred_4cls[i].detach().cpu()),
                 "label_cls": int(y_4cls[i].detach().cpu()),
                 "pred4": int(pred_4cls[i].detach().cpu()),
@@ -266,7 +264,7 @@ def validate_one_epoch_two_branch(
         "loss": total_loss / total_num,
         "ce_loss_4cls": total_ce_4cls / total_num,
         "ce_loss_2cls": total_ce_2cls / total_num,
-        "ce_loss": (total_ce_4cls + total_ce_2cls) / total_num,
+        "ce_loss": (total_ce_4cls + lambda_diag * total_ce_2cls) / total_num,
         "graph_loss": 0.0,
         "contrast_loss": 0.0,
 
@@ -310,14 +308,11 @@ def validate_one_epoch_two_branch(
         "subject_preds": subject_metrics["subject_preds"],
         "subject_labels": subject_metrics["subject_labels"],
 
-        # 诊断二分类别名
-        "diagnosis_acc": emotion_acc,
-        "diagnosis_macro_f1": emotion_macro_f1,
-        "diagnosis_confusion_matrix": emotion_cm,
-        "trial_diagnosis_acc": trial_metrics["trial_acc"],
-        "trial_diagnosis_macro_f1": trial_metrics["trial_macro_f1"],
-        "subject_diagnosis_acc": subject_metrics["subject_acc"],
-        "subject_diagnosis_macro_f1": subject_metrics["subject_macro_f1"],
+        # 情绪二分类别名（subject / trial 级）
+        "subject_emotion_acc": subject_metrics["subject_acc"],
+        "subject_emotion_macro_f1": subject_metrics["subject_macro_f1"],
+        "trial_emotion_acc": trial_metrics["trial_acc"],
+        "trial_emotion_macro_f1": trial_metrics["trial_macro_f1"],
 
         "segment_records": segment_records,
     }
@@ -347,7 +342,7 @@ def train_one_epoch_two_branch(
     current_epoch: int = 1,
 ):
     """
-    双任务训练：四分类情绪 + 二分类诊断。
+    双任务训练：四分类情绪 + 二分类情绪。
 
     L = L_4cls(z_conv, label4) + λ_diag × L_2cls(z_diag, emotion_binary)
         + λ_domain × L_domain + λ_center × L_center
@@ -450,7 +445,7 @@ def train_one_epoch_two_branch(
         "loss_center": total_loss_center / total_num,
         "acc_4cls": total_correct_4cls / total_num,
         "acc_2cls": total_correct_2cls / total_num,
-        "acc": total_correct_2cls / total_num,  # 兼容旧接口：acc = 二分类
+        "acc": total_correct_4cls / total_num,  # 兼容旧接口：acc = 四分类
     }
     return metrics
 
@@ -555,7 +550,8 @@ def intra_class_graph_loss(
 
 def build_class_weights(index_csv: str, subject_ids):
     df = pd.read_csv(index_csv)
-    df = df[df["subject_id"].isin(subject_ids)].reset_index(drop=True)
+    subject_set = {str(s) for s in subject_ids}
+    df = df[df["subject_id"].astype(str).isin(subject_set)].reset_index(drop=True)
 
     counts = df["label4"].value_counts().sort_index()
     counts = counts.reindex([0, 1, 2, 3], fill_value=1)
@@ -574,7 +570,8 @@ def build_diagnosis_class_weights(index_csv: str, subject_ids):
     返回顺序固定为 [class0_weight, class1_weight]。
     """
     df = pd.read_csv(index_csv)
-    df = df[df["subject_id"].isin(subject_ids)].reset_index(drop=True)
+    subject_set = {str(s) for s in subject_ids}
+    df = df[df["subject_id"].astype(str).isin(subject_set)].reset_index(drop=True)
 
     if "diagnosis_label" not in df.columns:
         raise KeyError("index_csv 中缺少 diagnosis_label，无法进行抑郁症/正常人二分类。")
@@ -682,14 +679,14 @@ class ClassCenterContrastLoss(torch.nn.Module):
     类中心对比 CE / Prototype CE。
 
     作用：
-        1. 将融合特征 z 投影到对比空间；
+        1. 将特征 z 投影到对比空间；
         2. 维护 num_classes 个可学习类中心；
         3. 用 cosine(z, center) / tau 得到 center_logits；
-        4. 对 center_logits 和 diagnosis_label 做 CE。
+        4. 对 center_logits 和 labels 做 CE。
 
-    对二分类诊断：
-        center_0: 诊断类别0中心
-        center_1: 诊断类别1中心
+    对情绪二分类：
+        center_0: 中性情绪中心
+        center_1: 正性情绪中心
     """
 
     def __init__(
@@ -722,7 +719,7 @@ class ClassCenterContrastLoss(torch.nn.Module):
     def forward(self, features, labels):
         """
         features: [B, in_dim]，建议传 out["graph_feat"]
-        labels:   [B]，diagnosis_label
+        labels:   [B]，情绪二分类标签 (0=中性, 1=正性)
         """
         z = self.projector(features)
         z = F.normalize(z, dim=1)
@@ -754,11 +751,10 @@ class ClassCenterContrastLoss(torch.nn.Module):
 
 def compute_trial_level_metrics(segment_records, threshold=0.5, vote_method="hard"):
     """
-    根据 segment 级预测结果聚合成 trial 级二分类结果。
+    将 segment 级预测聚合成 trial 级情绪二分类结果。
 
-    对 nclass=2 的诊断任务：
-        pred_emo / label_emo 实际表示 pred_diag / label_diag。
-        prob_pos 实际表示类别 1 的概率，比如 P(DEP) 或 P(HC)，取决于你的 diagnosis_label 编码。
+    情绪二分类: 0=中性, 1=正性。
+    使用二分类头概率 prob_emo2 和预测 pred_emo。
     """
     trial_dict = defaultdict(list)
 
@@ -772,7 +768,7 @@ def compute_trial_level_metrics(segment_records, threshold=0.5, vote_method="har
     trial_keys = []
 
     for key, records in trial_dict.items():
-        probs = [float(r["prob_pos"]) for r in records]
+        probs = [float(r["prob_emo2"]) for r in records]    # 二分类头正性概率
         preds = [int(r["pred_emo"]) for r in records]
         labels = [int(r["label_emo"]) for r in records]
 
@@ -821,10 +817,10 @@ def compute_trial_level_metrics(segment_records, threshold=0.5, vote_method="har
 
 def compute_subject_level_metrics(segment_records, threshold=0.5, vote_method="trial_hard"):
     """
-    将 segment 预测进一步聚合到 subject 级。
+    将 segment 预测进一步聚合到 subject 级情绪二分类。
 
-    诊断二分类本质上是被试级任务，因此 subject_acc / subject_macro_f1
-    比 segment_acc 或 trial_acc 更接近最终任务目标。
+    subject_acc / subject_macro_f1 比 segment 或 trial 级指标
+    更能反映模型在被试层面的泛化能力。
 
     聚合方式：
         1. 先按 trial 聚合 segment。
@@ -1481,6 +1477,7 @@ def train_competition_cross_subject(
             criterion_4cls=criterion_4cls,
             criterion_2cls=criterion_2cls,
             device=device,
+            lambda_diag=lambda_diag,
             lambda_graph=lambda_graph,
         )
 
@@ -1502,12 +1499,12 @@ def train_competition_cross_subject(
             f"L2={val_metrics['ce_loss_2cls']:.4f} "
             f"acc4={val_metrics['acc_4cls']:.4f} "
             f"f1_4={val_metrics['macro_f1_4cls']:.4f} "
-            f"seg_diag_acc={val_metrics['emotion_acc']:.4f} "
-            f"seg_diag_f1={val_metrics['emotion_macro_f1']:.4f} "
-            f"trial_diag_acc={val_metrics['trial_acc']:.4f} "
-            f"trial_diag_f1={val_metrics['trial_macro_f1']:.4f} "
-            f"subject_diag_acc={val_metrics['subject_acc']:.4f} "
-            f"subject_diag_f1={val_metrics['subject_macro_f1']:.4f}"
+            f"seg_emo_acc={val_metrics['emotion_acc']:.4f} "
+            f"seg_emo_f1={val_metrics['emotion_macro_f1']:.4f} "
+            f"trial_emo_acc={val_metrics['trial_acc']:.4f} "
+            f"trial_emo_f1={val_metrics['trial_macro_f1']:.4f} "
+            f"subject_emo_acc={val_metrics['subject_acc']:.4f} "
+            f"subject_emo_f1={val_metrics['subject_macro_f1']:.4f}"
         )
 
         hist_row = {
@@ -1638,7 +1635,8 @@ def build_emotion_class_weights(index_csv: str, subject_ids):
     emotion = label4 % 2: 0=中性, 1=正性
     """
     df = pd.read_csv(index_csv)
-    df = df[df["subject_id"].isin(subject_ids)].reset_index(drop=True)
+    subject_set = {str(s) for s in subject_ids}
+    df = df[df["subject_id"].astype(str).isin(subject_set)].reset_index(drop=True)
 
     if "label4" not in df.columns:
         raise KeyError("index_csv 中缺少 label4 列。")
@@ -1840,10 +1838,10 @@ if __name__ == "__main__":
     all_fold_rows = []
     all_best_rows_long = []
     all_ckpt_paths: list[Path] = []
-    combined_diagnosis_confusions = []
-    combined_segment_diag_confusions = []
-    combined_trial_diag_confusions = []
-    combined_subject_diag_confusions = []
+    combined_4cls_confusions = []
+    combined_segment_emo_confusions = []
+    combined_trial_emo_confusions = []
+    combined_subject_emo_confusions = []
 
     # 多随机种子 × 五折交叉验证
     for repeat, rand in enumerate(config.DIAG_REPEAT_SEEDS):
@@ -1934,21 +1932,21 @@ if __name__ == "__main__":
                 all_best_rows_long.append(row)
 
             if combined_metrics is not None:
-                combined_diagnosis_confusions.append(combined_metrics["confusion_matrix"])
-                combined_segment_diag_confusions.append(combined_metrics["emotion_confusion_matrix"])
-                combined_trial_diag_confusions.append(combined_metrics["trial_confusion_matrix"])
-                combined_subject_diag_confusions.append(combined_metrics["subject_confusion_matrix"])
+                combined_4cls_confusions.append(combined_metrics["confusion_matrix"])
+                combined_segment_emo_confusions.append(combined_metrics["emotion_confusion_matrix"])
+                combined_trial_emo_confusions.append(combined_metrics["trial_confusion_matrix"])
+                combined_subject_emo_confusions.append(combined_metrics["subject_confusion_matrix"])
 
             print(f"第 {fold + 1} 折 combined 最优结果:")
             print(f"best_epoch = {combined_tracker['best_epoch']}")
             print(f"val_acc_4cls = {combined_metrics['acc_4cls']:.4f}")
             print(f"val_macro_f1_4cls = {combined_metrics['macro_f1_4cls']:.4f}")
-            print(f"val_segment_diag_acc = {combined_metrics['emotion_acc']:.4f}")
-            print(f"val_segment_diag_f1 = {combined_metrics['emotion_macro_f1']:.4f}")
-            print(f"val_trial_diag_acc = {combined_metrics['trial_acc']:.4f}")
-            print(f"val_trial_diag_f1 = {combined_metrics['trial_macro_f1']:.4f}")
-            print(f"val_subject_diag_acc = {combined_metrics['subject_acc']:.4f}")
-            print(f"val_subject_diag_f1 = {combined_metrics['subject_macro_f1']:.4f}")
+            print(f"val_segment_emo_acc = {combined_metrics['emotion_acc']:.4f}")
+            print(f"val_segment_emo_f1 = {combined_metrics['emotion_macro_f1']:.4f}")
+            print(f"val_trial_emo_acc = {combined_metrics['trial_acc']:.4f}")
+            print(f"val_trial_emo_f1 = {combined_metrics['trial_macro_f1']:.4f}")
+            print(f"val_subject_emo_acc = {combined_metrics['subject_acc']:.4f}")
+            print(f"val_subject_emo_f1 = {combined_metrics['subject_macro_f1']:.4f}")
 
         seed_df = pd.DataFrame(seed_combined_rows)
         seed_csv = os.path.join(version, f"seed{rand}_combined_5fold_results.csv")
@@ -1966,8 +1964,8 @@ if __name__ == "__main__":
             "val_trial_macro_f1",
             "val_subject_acc",
             "val_subject_macro_f1",
-            "val_diagnosis_acc",
-            "val_diagnosis_macro_f1",
+            "val_subject_emotion_acc",
+            "val_subject_emotion_macro_f1",
         ]
         summary_lines = []
         print(f"\n{'=' * 50}")
@@ -1995,10 +1993,10 @@ if __name__ == "__main__":
     all_best_df.to_csv(all_best_csv, index=False, encoding="utf-8-sig")
     print(f"全部并列 best 指标已保存到: {all_best_csv}")
 
-    np.save(os.path.join(version, "combined_diagnosis_confusions.npy"), np.array(combined_diagnosis_confusions, dtype=object))
-    np.save(os.path.join(version, "combined_segment_diag_confusions.npy"), np.array(combined_segment_diag_confusions, dtype=object))
-    np.save(os.path.join(version, "combined_trial_diag_confusions.npy"), np.array(combined_trial_diag_confusions, dtype=object))
-    np.save(os.path.join(version, "combined_subject_diag_confusions.npy"), np.array(combined_subject_diag_confusions, dtype=object))
+    np.save(os.path.join(version, "combined_4cls_confusions.npy"), np.array(combined_4cls_confusions, dtype=object))
+    np.save(os.path.join(version, "combined_segment_emo_confusions.npy"), np.array(combined_segment_emo_confusions, dtype=object))
+    np.save(os.path.join(version, "combined_trial_emo_confusions.npy"), np.array(combined_trial_emo_confusions, dtype=object))
+    np.save(os.path.join(version, "combined_subject_emo_confusions.npy"), np.array(combined_subject_emo_confusions, dtype=object))
 
     if len(all_fold_df) > 0:
         metric_cols = [
@@ -2013,8 +2011,8 @@ if __name__ == "__main__":
             "val_trial_macro_f1",
             "val_subject_acc",
             "val_subject_macro_f1",
-            "val_diagnosis_acc",
-            "val_diagnosis_macro_f1",
+            "val_subject_emotion_acc",
+            "val_subject_emotion_macro_f1",
         ]
 
         print(f"\n{'=' * 50}")
@@ -2044,8 +2042,8 @@ if __name__ == "__main__":
             f.write(f"\n全部详细指标 CSV: {all_fold_csv}\n")
             f.write(f"全部并列 best 指标 CSV: {all_best_csv}\n")
 
-        # 平均 segment 级诊断二分类混淆矩阵
-        valid_confs = [np.array(c, dtype=np.float32) for c in combined_diagnosis_confusions if c is not None]
+        # 平均 segment 级情绪二分类混淆矩阵（四分类头视角: acc=四分类）
+        valid_confs = [np.array(c, dtype=np.float32) for c in combined_4cls_confusions if c is not None]
         if len(valid_confs) > 0:
             conf_stack = np.stack(valid_confs, axis=0)
             avg_conf = conf_stack.mean(axis=0)
@@ -2054,16 +2052,16 @@ if __name__ == "__main__":
 
             import matplotlib.pyplot as plt
 
-            labels = ["Diag_0", "Diag_1"]
-            fig, ax = plt.subplots(figsize=(6, 5))
+            labels_4cls = ["DEP_neu", "DEP_pos", "HC_neu", "HC_pos"]
+            fig, ax = plt.subplots(figsize=(7, 6))
             im = ax.imshow(avg_conf_norm, interpolation="nearest", cmap="Blues")
-            ax.set_xticks(np.arange(len(labels)))
-            ax.set_yticks(np.arange(len(labels)))
-            ax.set_xticklabels(labels, rotation=45, ha="right")
-            ax.set_yticklabels(labels)
+            ax.set_xticks(np.arange(len(labels_4cls)))
+            ax.set_yticks(np.arange(len(labels_4cls)))
+            ax.set_xticklabels(labels_4cls, rotation=45, ha="right")
+            ax.set_yticklabels(labels_4cls)
             ax.set_xlabel("Predicted")
             ax.set_ylabel("True")
-            ax.set_title("Average Segment-level Diagnosis Confusion Matrix")
+            ax.set_title("Average 4-Class Emotion Confusion Matrix")
 
             thresh = avg_conf_norm.max() / 2.0 if avg_conf_norm.max() != 0 else 0.5
             for i in range(avg_conf_norm.shape[0]):
@@ -2080,13 +2078,13 @@ if __name__ == "__main__":
 
             fig.colorbar(im, ax=ax)
             fig.tight_layout()
-            fig_path = os.path.join(version, "avg_segment_diagnosis_confusion.png")
+            fig_path = os.path.join(version, "avg_4cls_confusion.png")
             fig.savefig(fig_path, dpi=200)
             plt.close(fig)
-            print(f"平均 segment 级诊断二分类混淆矩阵图已保存到: {fig_path}")
+            print(f"平均四分类混淆矩阵图已保存到: {fig_path}")
 
-        # 平均 trial 级诊断二分类混淆矩阵
-        valid_trial_confs = [np.array(c, dtype=np.float32) for c in combined_trial_diag_confusions if c is not None]
+        # 平均 trial 级情绪二分类混淆矩阵
+        valid_trial_confs = [np.array(c, dtype=np.float32) for c in combined_trial_emo_confusions if c is not None]
         if len(valid_trial_confs) > 0:
             trial_conf_stack = np.stack(valid_trial_confs, axis=0)
             avg_trial_conf = trial_conf_stack.mean(axis=0)
@@ -2095,16 +2093,16 @@ if __name__ == "__main__":
 
             import matplotlib.pyplot as plt
 
-            labels = ["Diag_0", "Diag_1"]
+            labels_emo = ["Neutral", "Positive"]
             fig, ax = plt.subplots(figsize=(5, 4))
             im = ax.imshow(avg_trial_conf_norm, interpolation="nearest", cmap="Blues")
-            ax.set_xticks(np.arange(len(labels)))
-            ax.set_yticks(np.arange(len(labels)))
-            ax.set_xticklabels(labels)
-            ax.set_yticklabels(labels)
+            ax.set_xticks(np.arange(len(labels_emo)))
+            ax.set_yticks(np.arange(len(labels_emo)))
+            ax.set_xticklabels(labels_emo)
+            ax.set_yticklabels(labels_emo)
             ax.set_xlabel("Predicted")
             ax.set_ylabel("True")
-            ax.set_title("Average Trial-level Diagnosis Confusion Matrix")
+            ax.set_title("Average Trial-level Emotion Confusion Matrix")
 
             thresh = avg_trial_conf_norm.max() / 2.0 if avg_trial_conf_norm.max() != 0 else 0.5
             for i in range(avg_trial_conf_norm.shape[0]):
@@ -2121,14 +2119,14 @@ if __name__ == "__main__":
 
             fig.colorbar(im, ax=ax)
             fig.tight_layout()
-            fig_path = os.path.join(version, "avg_trial_diagnosis_confusion.png")
+            fig_path = os.path.join(version, "avg_trial_emotion_confusion.png")
             fig.savefig(fig_path, dpi=200)
             plt.close(fig)
-            print(f"平均 trial 级诊断二分类混淆矩阵图已保存到: {fig_path}")
+            print(f"平均 trial 级情绪二分类混淆矩阵图已保存到: {fig_path}")
 
 
-        # 平均 subject 级诊断二分类混淆矩阵
-        valid_subject_confs = [np.array(c, dtype=np.float32) for c in combined_subject_diag_confusions if c is not None]
+        # 平均 subject 级情绪二分类混淆矩阵
+        valid_subject_confs = [np.array(c, dtype=np.float32) for c in combined_subject_emo_confusions if c is not None]
         if len(valid_subject_confs) > 0:
             subject_conf_stack = np.stack(valid_subject_confs, axis=0)
             avg_subject_conf = subject_conf_stack.mean(axis=0)
@@ -2137,16 +2135,16 @@ if __name__ == "__main__":
 
             import matplotlib.pyplot as plt
 
-            labels = ["Diag_0", "Diag_1"]
+            labels_emo = ["Neutral", "Positive"]
             fig, ax = plt.subplots(figsize=(5, 4))
             im = ax.imshow(avg_subject_conf_norm, interpolation="nearest", cmap="Blues")
-            ax.set_xticks(np.arange(len(labels)))
-            ax.set_yticks(np.arange(len(labels)))
-            ax.set_xticklabels(labels)
-            ax.set_yticklabels(labels)
+            ax.set_xticks(np.arange(len(labels_emo)))
+            ax.set_yticks(np.arange(len(labels_emo)))
+            ax.set_xticklabels(labels_emo)
+            ax.set_yticklabels(labels_emo)
             ax.set_xlabel("Predicted")
             ax.set_ylabel("True")
-            ax.set_title("Average Subject-level Diagnosis Confusion Matrix")
+            ax.set_title("Average Subject-level Emotion Confusion Matrix")
 
             thresh = avg_subject_conf_norm.max() / 2.0 if avg_subject_conf_norm.max() != 0 else 0.5
             for i in range(avg_subject_conf_norm.shape[0]):
@@ -2163,10 +2161,10 @@ if __name__ == "__main__":
 
             fig.colorbar(im, ax=ax)
             fig.tight_layout()
-            fig_path = os.path.join(version, "avg_subject_diagnosis_confusion.png")
+            fig_path = os.path.join(version, "avg_subject_emotion_confusion.png")
             fig.savefig(fig_path, dpi=200)
             plt.close(fig)
-            print(f"平均 subject 级诊断二分类混淆矩阵图已保存到: {fig_path}")
+            print(f"平均 subject 级情绪二分类混淆矩阵图已保存到: {fig_path}")
     else:
         print("没有收集到任何 fold 结果，无法计算总体统计与混淆矩阵。")
 
