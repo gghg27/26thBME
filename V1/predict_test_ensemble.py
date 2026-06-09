@@ -163,8 +163,33 @@ class _TestDataset(torch.utils.data.Dataset):
         self._trial_cache: dict[str, np.ndarray | None] = {}
 
     def _resolve(self, path_val: str) -> Path:
-        p = Path(str(path_val).replace("\\", "/"))
-        return p if p.is_absolute() else self.root / p
+        """解析数据文件路径，兼容 test CSV 中的相对路径。"""
+        text = str(path_val).replace("\\", "/")
+        p = Path(text)
+        if p.is_absolute():
+            return p
+
+        # 候选路径（与 utils/data.py 的 resolve_data_path 保持一致）
+        candidates = [
+            self.root / p,                           # root + 原始相对路径
+            self.root / "data" / p.name,             # root/data/文件名
+            self.root / "testdata" / p.name,         # root/testdata/文件名
+        ]
+        # 去掉开头的 ../ 后再试
+        cleaned = text
+        while cleaned.startswith("../"):
+            cleaned = cleaned[3:]
+        if cleaned.startswith("data/"):
+            candidates.append(self.root / cleaned[len("data/"):])       # 去掉 data/ 前缀直接放 root
+            candidates.append(self.root / "data" / cleaned[len("data/"):])  # root/data/ 下
+        candidates.append(self.root / cleaned)
+        candidates.append(self.root / "data" / Path(cleaned).name)
+
+        for c in candidates:
+            if c.exists():
+                return c
+        # 都不存在则返回第一个候选用于报错
+        return candidates[0]
 
     def _load_trial(self, path_val: str) -> np.ndarray | None:
         if path_val in self._trial_cache:
