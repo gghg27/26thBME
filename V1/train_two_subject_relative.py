@@ -2126,12 +2126,38 @@ def predict_test_trial(
 
     model.eval()
 
-    # 加载测试 CSV，展开窗口索引
+    # 加载测试 CSV
     test_df = pd.read_csv(test_csv)
     id_col = "user_id" if "user_id" in test_df.columns else "subject_id"
     print(f"[predict_test] test samples: {len(test_df)}, id_col={id_col}")
 
-    test_df = expand_window_index(test_df, root=root)
+    # 展开窗口索引：如果 CSV 已有 de_win_id 则无需展开；
+    # 否则尝试 expand_window_index，失败则用 n_windows 直接展开
+    if "de_win_id" not in test_df.columns:
+        # 先尝试标准展开（需要 trial_path 对应的 .npy 文件可访问）
+        try:
+            test_df = expand_window_index(test_df, root=root)
+        except (FileNotFoundError, OSError) as e:
+            print(f"[predict_test] expand_window_index 失败: {e}")
+            print("[predict_test] 尝试用 n_windows 列直接展开...")
+            if "n_windows" not in test_df.columns:
+                raise RuntimeError(
+                    "测试 CSV 缺少 de_win_id / n_windows 列，无法展开窗口。"
+                    "请确保测试 CSV 有 de_win_id 列（窗口级），或 n_windows 列（trial 级），"
+                    "或 trial_path 指向可访问的原始信号文件。"
+                )
+            rows = []
+            for _, row in test_df.iterrows():
+                nw = int(row["n_windows"])
+                if nw <= 0:
+                    raise ValueError(f"n_windows={nw} <= 0")
+                for win_id in range(nw):
+                    item = row.to_dict()
+                    item["de_win_id"] = win_id
+                    rows.append(item)
+            test_df = pd.DataFrame(rows)
+            print(f"[predict_test] 用 n_windows 展开: {len(test_df)} 窗口")
+
     print(f"[predict_test] expanded windows: {len(test_df)}")
 
     # 构造无标签 dataset
