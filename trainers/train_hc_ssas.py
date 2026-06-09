@@ -979,7 +979,7 @@ if __name__ == "__main__":
                 train_group=train_group,
                 n_splits=n_splits,
                 epochs=100,
-                batch_size=256,
+                batch_size=128,
                 subjects_per_batch=4,
                 lr=1e-4,
                 rand=rand,
