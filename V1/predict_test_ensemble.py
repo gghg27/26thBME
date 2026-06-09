@@ -80,9 +80,11 @@ def find_checkpoints(params_dir: Path) -> list[Path]:
         if ckpt_path.exists():
             ckpts.append(ckpt_path)
         else:
-            alt = sorted(subdir.glob("best*.pt"))
+            alt = sorted(subdir.glob("best_combined*.pt"))
             if alt:
                 ckpts.append(alt[0])
+            else:
+                print(f"[warn] {subdir} 缺少 combined checkpoint: {CKPT_FILENAME}")
     return ckpts
 
 
@@ -107,7 +109,14 @@ def load_model(ckpt_path: Path, device: torch.device):
     # 诊断：打印模型是否启用了被试相对化特征
     de_rel = getattr(model, "use_subject_relative_de", False)
     bio_rel = getattr(model, "use_subject_relative_bio", False)
-    print(f"[load] {ckpt_path.name}: use_subject_relative_de={de_rel}, use_subject_relative_bio={bio_rel}")
+    best_name = ckpt.get("best_name", "MISSING")
+    epoch = ckpt.get("epoch", "MISSING")
+    print(
+        f"[load] {ckpt_path.name}: best_name={best_name}, epoch={epoch}, "
+        f"use_subject_relative_de={de_rel}, use_subject_relative_bio={bio_rel}"
+    )
+    if best_name != "combined":
+        print(f"[warn] {ckpt_path} 不是 combined best；当前预测要求 best.pt 对应 combined。")
     print(f"[load]   ckpt_config keys: de={ckpt_config.get('use_subject_relative_de', 'MISSING')}, "
           f"bio={ckpt_config.get('use_subject_relative_bio', 'MISSING')}")
 

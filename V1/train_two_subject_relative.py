@@ -409,7 +409,10 @@ def validate_one_epoch_two_branch(
     }
 
     # ── trial / subject 级聚合 ──
+    # hard vote 保留旧指标；prob vote 与 test threshold 口径一致：
+    # 先对同一 trial 的窗口概率求均值，再用 0.5 阈值判定。
     trial_metrics = compute_trial_level_metrics(segment_records, threshold=0.5, vote_method="hard")
+    trial_prob_metrics = compute_trial_level_metrics(segment_records, threshold=0.5, vote_method="prob")
     topk_trial_metrics = compute_subject_topk_trial_metrics(
         segment_records,
         k_pos=4,
@@ -463,6 +466,17 @@ def validate_one_epoch_two_branch(
         "trial_probs": trial_metrics["trial_probs"],
         "trial_preds": trial_metrics["trial_preds"],
         "trial_labels": trial_metrics["trial_labels"],
+
+        # trial 级（与 predict_test_ensemble threshold 提交一致）
+        "trial_prob_acc": trial_prob_metrics["trial_acc"],
+        "trial_prob_macro_f1": trial_prob_metrics["trial_macro_f1"],
+        "trial_prob_confusion_matrix": trial_prob_metrics["trial_confusion_matrix"],
+        "trial_prob_keys": trial_prob_metrics["trial_keys"],
+        "trial_prob_probs": trial_prob_metrics["trial_probs"],
+        "trial_prob_preds": trial_prob_metrics["trial_preds"],
+        "trial_prob_labels": trial_prob_metrics["trial_labels"],
+        "trial_threshold_acc": trial_prob_metrics["trial_acc"],
+        "trial_threshold_macro_f1": trial_prob_metrics["trial_macro_f1"],
 
         # subject 内 top-4 trial 级
         "topk_trial_acc": topk_trial_metrics["topk_trial_acc"],
@@ -1457,7 +1471,7 @@ def save_best_checkpoint(
     """
     os.makedirs(save_dir, exist_ok=True)
 
-    model_file = "best.pt" if best_name in ["combined", "trial_f1"] else f"best_{best_name}_fold{fold}.pt"
+    model_file = "best.pt" if best_name == "combined" else f"best_{best_name}_fold{fold}.pt"
     ckpt_path = os.path.join(save_dir, model_file)
     json_path = os.path.join(save_dir, f"best_{best_name}_fold{fold}_metrics.json")
     csv_path = os.path.join(save_dir, f"best_{best_name}_fold{fold}_summary.csv")
@@ -1785,6 +1799,8 @@ def train_competition_cross_subject(
             "criteria": [
                 ("topk_trial_macro_f1", "max"),
                 ("topk_trial_acc", "max"),
+                ("trial_prob_macro_f1", "max"),
+                ("trial_prob_acc", "max"),
                 ("trial_macro_f1", "max"),
                 ("trial_acc", "max"),
                 ("emotion_macro_f1", "max"),
@@ -1821,6 +1837,8 @@ def train_competition_cross_subject(
             "criteria": [
                 ("trial_macro_f1", "max"),
                 ("trial_acc", "max"),
+                ("trial_prob_macro_f1", "max"),
+                ("trial_prob_acc", "max"),
                 ("emotion_macro_f1", "max"),
                 ("emotion_acc", "max"),
                 ("macro_f1", "max"),
@@ -1835,6 +1853,8 @@ def train_competition_cross_subject(
             "criteria": [
                 ("trial_acc", "max"),
                 ("trial_macro_f1", "max"),
+                ("trial_prob_acc", "max"),
+                ("trial_prob_macro_f1", "max"),
                 ("emotion_acc", "max"),
                 ("emotion_macro_f1", "max"),
                 ("acc", "max"),
@@ -1953,6 +1973,8 @@ def train_competition_cross_subject(
             f"seg_emo_f1={val_metrics['emotion_macro_f1']:.4f} "
             f"trial_emo_acc={val_metrics['trial_acc']:.4f} "
             f"trial_emo_f1={val_metrics['trial_macro_f1']:.4f} "
+            f"trial_prob_acc={val_metrics['trial_prob_acc']:.4f} "
+            f"trial_prob_f1={val_metrics['trial_prob_macro_f1']:.4f} "
             f"topk_trial_acc={val_metrics['topk_trial_acc']:.4f} "
             f"topk_trial_f1={val_metrics['topk_trial_macro_f1']:.4f} "
             f"topk_gap={val_metrics['topk_subject_gap_mean']:.4f}"
@@ -2483,6 +2505,8 @@ if __name__ == "__main__":
             print(f"val_segment_emo_f1 = {combined_metrics['emotion_macro_f1']:.4f}")
             print(f"val_trial_emo_acc = {combined_metrics['trial_acc']:.4f}")
             print(f"val_trial_emo_f1 = {combined_metrics['trial_macro_f1']:.4f}")
+            print(f"val_trial_prob_acc = {combined_metrics['trial_prob_acc']:.4f}")
+            print(f"val_trial_prob_f1 = {combined_metrics['trial_prob_macro_f1']:.4f}")
             print(f"val_topk_trial_acc = {combined_metrics['topk_trial_acc']:.4f}")
             print(f"val_topk_trial_f1 = {combined_metrics['topk_trial_macro_f1']:.4f}")
             print(f"val_topk_subject_gap = {combined_metrics['topk_subject_gap_mean']:.4f}")
@@ -2501,6 +2525,8 @@ if __name__ == "__main__":
             "val_emotion_macro_f1",
             "val_trial_acc",
             "val_trial_macro_f1",
+            "val_trial_prob_acc",
+            "val_trial_prob_macro_f1",
             "val_trial_emotion_acc",
             "val_trial_emotion_macro_f1",
             "val_topk_trial_acc",
@@ -2547,6 +2573,8 @@ if __name__ == "__main__":
             "val_emotion_macro_f1",
             "val_trial_acc",
             "val_trial_macro_f1",
+            "val_trial_prob_acc",
+            "val_trial_prob_macro_f1",
             "val_trial_emotion_acc",
             "val_trial_emotion_macro_f1",
             "val_topk_trial_acc",
