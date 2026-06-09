@@ -103,6 +103,14 @@ def load_model(ckpt_path: Path, device: torch.device):
     model = model_cls(**kwargs).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
+
+    # 诊断：打印模型是否启用了被试相对化特征
+    de_rel = getattr(model, "use_subject_relative_de", False)
+    bio_rel = getattr(model, "use_subject_relative_bio", False)
+    print(f"[load] {ckpt_path.name}: use_subject_relative_de={de_rel}, use_subject_relative_bio={bio_rel}")
+    print(f"[load]   ckpt_config keys: de={ckpt_config.get('use_subject_relative_de', 'MISSING')}, "
+          f"bio={ckpt_config.get('use_subject_relative_bio', 'MISSING')}")
+
     return model
 
 
@@ -379,6 +387,12 @@ def predict_single_model(
         num_workers=0, pin_memory=True, collate_fn=_dict_collate,
     )
 
+    # 诊断：确认基线是否传入
+    _has_de = subject_de_mu is not None and len(subject_de_mu) > 0
+    _has_bio = subject_bio_mu is not None and len(subject_bio_mu) > 0
+    print(f"[predict] DE baseline: {_has_de} ({len(subject_de_mu)} subjects)" if _has_de else "[predict] DE baseline: NO")
+    print(f"[predict] Bio baseline: {_has_bio} ({len(subject_bio_mu)} subjects)" if _has_bio else "[predict] Bio baseline: NO")
+
     user_ids, trial_ids, probs, scores = [], [], [], []
     for batch in tqdm(loader, desc="Predict", leave=False):
         x = batch["x"].to(device)
@@ -560,6 +574,7 @@ def main():
         # --- 被试相对化基线：DE baseline 只算一次，bio baseline 每个模型各算一次 ---
         use_de_rel = getattr(model, "use_subject_relative_de", False)
         use_bio_rel = getattr(model, "use_subject_relative_bio", False)
+        print(f"[model] use_subject_relative_de={use_de_rel}, use_subject_relative_bio={use_bio_rel}")
 
         if use_de_rel or use_bio_rel:
             # DE baseline（模型无关，只需算一次）
@@ -583,6 +598,7 @@ def main():
                 )
                 print(f"[baseline] bio baselines: {len(subject_bio_mu)} subjects")
         else:
+            print("[baseline] subject-relative DISABLED for this model, using raw features")
             subject_de_mu = subject_de_std = None
             subject_bio_mu = subject_bio_std = None
 
