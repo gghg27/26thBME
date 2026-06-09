@@ -408,17 +408,18 @@ def predict_single_model(
                     subject_de_mu=de_mu_batch, subject_de_std=de_std_batch,
                     subject_bio_mu=bio_mu_batch, subject_bio_std=bio_std_batch)
 
-        # 情绪分类任务：统一使用四分类情绪头 (logits_4cls)
-        # prob_pos: 正性情绪概率 = P(class=1) + P(class=3)
-        # score_pos: 与 prob_pos 相同，用于被试内 top-K 排序
-        if "logits_4cls" in out:
+        # 情绪二分类：与验证 pipeline 保持严格一致
+        #   prob_pos  = softmax(logits_2cls)[:, 1]          → 阈值法
+        #   score_pos = logits_2cls[:, 1] - logits_2cls[:, 0] → top-K 排序
+        # 注：logits_2cls 训练时 label = (label4 % 2)，即情绪正/负性二分类
+        if "logits_2cls" in out:
+            p2 = torch.softmax(out["logits_2cls"], dim=1)
+            prob_pos = p2[:, 1]
+            score_pos = out["logits_2cls"][:, 1] - out["logits_2cls"][:, 0]
+        elif "logits_4cls" in out:
+            # 回退：用四分类头的 P(class=1)+P(class=3) 作为正性概率
             p4 = torch.softmax(out["logits_4cls"], dim=1)
             prob_pos = p4[:, 1] + p4[:, 3]
-            score_pos = prob_pos
-        elif "logits_2cls" in out:
-            # 回退：如果没有四分类头，用二分类头（训练时作为情绪正/负性分类器）
-            p = torch.softmax(out["logits_2cls"], dim=1)
-            prob_pos = p[:, 1]
             score_pos = prob_pos
         else:
             p = torch.softmax(out["logits"], dim=1)
