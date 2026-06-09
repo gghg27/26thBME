@@ -136,7 +136,7 @@ def validate_one_epoch_two_branch(
     输出指标：
         - 四分类（情绪）：acc, macro_f1, per_class_4
         - 二分类（情绪）：emotion_acc/emotion_macro_f1（segment 级）、
-          trial_acc/trial_macro_f1（trial 级）、subject_acc/subject_macro_f1（subject 级）
+          trial_acc/trial_macro_f1（trial 级）
     """
     model.eval()
 
@@ -1456,7 +1456,7 @@ def save_best_checkpoint(
     """
     os.makedirs(save_dir, exist_ok=True)
 
-    model_file = "diag_best.pt" if best_name == "combined" else f"best_{best_name}_fold{fold}.pt"
+    model_file = "best.pt" if best_name == "trial_f1" else f"best_{best_name}_fold{fold}.pt"
     ckpt_path = os.path.join(save_dir, model_file)
     json_path = os.path.join(save_dir, f"best_{best_name}_fold{fold}_metrics.json")
     csv_path = os.path.join(save_dir, f"best_{best_name}_fold{fold}_summary.csv")
@@ -1530,7 +1530,7 @@ def train_competition_cross_subject(
     early_stop_patience: int = 20,
     early_stop_warmup: int = 15,
     early_stop_min_delta: float = 1e-6,
-    early_stop_track: str = "combined",
+    early_stop_track: str = "trial_f1",
     # 类中心损失
     lambda_center: float = 0.0,
     center_tau: float = 0.1,
@@ -1776,10 +1776,8 @@ def train_competition_cross_subject(
 
     # -------- 并列保存多个最优模型 --------
     best_trackers = {
-        "combined": {
+        "trial_f1": {
             "criteria": [
-                ("subject_macro_f1", "max"),
-                ("subject_acc", "max"),
                 ("trial_macro_f1", "max"),
                 ("trial_acc", "max"),
                 ("emotion_macro_f1", "max"),
@@ -1792,26 +1790,13 @@ def train_competition_cross_subject(
             "best_epoch": None,
             "checkpoint_path": None,
         },
-        "trial_f1": {
-            "criteria": [
-                ("trial_macro_f1", "max"),
-                ("trial_acc", "max"),
-                ("subject_macro_f1", "max"),
-                ("subject_acc", "max"),
-                ("emotion_macro_f1", "max"),
-                ("loss", "min"),
-            ],
-            "best_metrics": None,
-            "best_epoch": None,
-            "checkpoint_path": None,
-        },
         "trial_acc": {
             "criteria": [
                 ("trial_acc", "max"),
                 ("trial_macro_f1", "max"),
-                ("subject_acc", "max"),
-                ("subject_macro_f1", "max"),
                 ("emotion_acc", "max"),
+                ("emotion_macro_f1", "max"),
+                ("acc", "max"),
                 ("loss", "min"),
             ],
             "best_metrics": None,
@@ -1922,9 +1907,7 @@ def train_competition_cross_subject(
             f"seg_emo_acc={val_metrics['emotion_acc']:.4f} "
             f"seg_emo_f1={val_metrics['emotion_macro_f1']:.4f} "
             f"trial_emo_acc={val_metrics['trial_acc']:.4f} "
-            f"trial_emo_f1={val_metrics['trial_macro_f1']:.4f} "
-            f"subject_emo_acc={val_metrics['subject_acc']:.4f} "
-            f"subject_emo_f1={val_metrics['subject_macro_f1']:.4f}"
+            f"trial_emo_f1={val_metrics['trial_macro_f1']:.4f}"
         )
 
         hist_row = {
@@ -2261,7 +2244,6 @@ if __name__ == "__main__":
     combined_4cls_confusions = []
     combined_segment_emo_confusions = []
     combined_trial_emo_confusions = []
-    combined_subject_emo_confusions = []
 
     # 多随机种子 × 五折交叉验证
     for repeat, rand in enumerate(config.DIAG_REPEAT_SEEDS):
@@ -2313,7 +2295,7 @@ if __name__ == "__main__":
                 device=device,
                 run_seed=run_seed,
                 deterministic=False,
-                early_stop_track="combined",
+                early_stop_track="trial_f1",
                 early_stop_patience=25,
                 early_stop_warmup=15,
                 early_stop_min_delta=1e-6,
@@ -2328,14 +2310,14 @@ if __name__ == "__main__":
                 ssas_dropout=0.2,
             )
 
-            combined_tracker = result["best_models"]["combined"]
+            combined_tracker = result["best_models"]["trial_f1"]
             combined_metrics = combined_tracker["best_metrics"]
 
             fold_row = {
                 "rand": rand,
                 "fold": fold,
                 "run_seed": run_seed,
-                "best_name": "combined",
+                "best_name": "trial_f1",
                 "best_epoch": combined_tracker["best_epoch"],
                 "checkpoint_path": combined_tracker["checkpoint_path"],
             }
@@ -2364,9 +2346,8 @@ if __name__ == "__main__":
                 combined_4cls_confusions.append(combined_metrics["confusion_matrix"])
                 combined_segment_emo_confusions.append(combined_metrics["emotion_confusion_matrix"])
                 combined_trial_emo_confusions.append(combined_metrics["trial_confusion_matrix"])
-                combined_subject_emo_confusions.append(combined_metrics["subject_confusion_matrix"])
 
-            print(f"第 {fold + 1} 折 combined 最优结果:")
+            print(f"第 {fold + 1} 折 optimal 最优结果:")
             print(f"best_epoch = {combined_tracker['best_epoch']}")
             print(f"val_acc_4cls = {combined_metrics['acc_4cls']:.4f}")
             print(f"val_macro_f1_4cls = {combined_metrics['macro_f1_4cls']:.4f}")
@@ -2374,8 +2355,6 @@ if __name__ == "__main__":
             print(f"val_segment_emo_f1 = {combined_metrics['emotion_macro_f1']:.4f}")
             print(f"val_trial_emo_acc = {combined_metrics['trial_acc']:.4f}")
             print(f"val_trial_emo_f1 = {combined_metrics['trial_macro_f1']:.4f}")
-            print(f"val_subject_emo_acc = {combined_metrics['subject_acc']:.4f}")
-            print(f"val_subject_emo_f1 = {combined_metrics['subject_macro_f1']:.4f}")
 
         seed_df = pd.DataFrame(seed_combined_rows)
         seed_csv = os.path.join(version, f"seed{rand}_combined_5fold_results.csv")
@@ -2391,14 +2370,12 @@ if __name__ == "__main__":
             "val_emotion_macro_f1",
             "val_trial_acc",
             "val_trial_macro_f1",
-            "val_subject_acc",
-            "val_subject_macro_f1",
-            "val_subject_emotion_acc",
-            "val_subject_emotion_macro_f1",
+            "val_trial_emotion_acc",
+            "val_trial_emotion_macro_f1",
         ]
         summary_lines = []
         print(f"\n{'=' * 50}")
-        print(f"Random seed {rand} 的 5 折 combined 平均结果:")
+        print(f"Random seed {rand} 的 5 折 optimal 平均结果:")
         print(f"{'=' * 50}")
         for col in metric_cols:
             if col in seed_df.columns:
@@ -2407,8 +2384,8 @@ if __name__ == "__main__":
                 print(f"{col}: {mean_v:.4f} ± {std_v:.4f}")
                 summary_lines.append(f"{col}: {mean_v:.4f} ± {std_v:.4f}\n")
 
-        with open(os.path.join(version, f"seed{rand}_combined_5fold_summary.txt"), "w", encoding="utf-8") as f:
-            f.write(f"Random seed {rand} combined 5折交叉验证结果\n")
+        with open(os.path.join(version, f"seed{rand}_optimal_5fold_summary.txt"), "w", encoding="utf-8") as f:
+            f.write(f"Random seed {rand} optimal 5折交叉验证结果\n")
             f.writelines(summary_lines)
             f.write(f"\n详细结果 CSV: {seed_csv}\n")
 
@@ -2425,7 +2402,6 @@ if __name__ == "__main__":
     np.save(os.path.join(version, "combined_4cls_confusions.npy"), np.array(combined_4cls_confusions, dtype=object))
     np.save(os.path.join(version, "combined_segment_emo_confusions.npy"), np.array(combined_segment_emo_confusions, dtype=object))
     np.save(os.path.join(version, "combined_trial_emo_confusions.npy"), np.array(combined_trial_emo_confusions, dtype=object))
-    np.save(os.path.join(version, "combined_subject_emo_confusions.npy"), np.array(combined_subject_emo_confusions, dtype=object))
 
     if len(all_fold_df) > 0:
         metric_cols = [
@@ -2438,14 +2414,12 @@ if __name__ == "__main__":
             "val_emotion_macro_f1",
             "val_trial_acc",
             "val_trial_macro_f1",
-            "val_subject_acc",
-            "val_subject_macro_f1",
-            "val_subject_emotion_acc",
-            "val_subject_emotion_macro_f1",
+            "val_trial_emotion_acc",
+            "val_trial_emotion_macro_f1",
         ]
 
         print(f"\n{'=' * 50}")
-        print("所有 seed × fold 的 combined 总体结果:")
+        print("所有 seed × fold 的 optimal 总体结果:")
         print(f"{'=' * 50}")
 
         overall_summary = []
@@ -2552,48 +2526,6 @@ if __name__ == "__main__":
             fig.savefig(fig_path, dpi=200)
             plt.close(fig)
             print(f"平均 trial 级情绪二分类混淆矩阵图已保存到: {fig_path}")
-
-
-        # 平均 subject 级情绪二分类混淆矩阵
-        valid_subject_confs = [np.array(c, dtype=np.float32) for c in combined_subject_emo_confusions if c is not None]
-        if len(valid_subject_confs) > 0:
-            subject_conf_stack = np.stack(valid_subject_confs, axis=0)
-            avg_subject_conf = subject_conf_stack.mean(axis=0)
-            row_sum = avg_subject_conf.sum(axis=1, keepdims=True)
-            avg_subject_conf_norm = avg_subject_conf / np.maximum(row_sum, 1e-12)
-
-            import matplotlib.pyplot as plt
-
-            labels_emo = ["Neutral", "Positive"]
-            fig, ax = plt.subplots(figsize=(5, 4))
-            im = ax.imshow(avg_subject_conf_norm, interpolation="nearest", cmap="Blues")
-            ax.set_xticks(np.arange(len(labels_emo)))
-            ax.set_yticks(np.arange(len(labels_emo)))
-            ax.set_xticklabels(labels_emo)
-            ax.set_yticklabels(labels_emo)
-            ax.set_xlabel("Predicted")
-            ax.set_ylabel("True")
-            ax.set_title("Average Subject-level Emotion Confusion Matrix")
-
-            thresh = avg_subject_conf_norm.max() / 2.0 if avg_subject_conf_norm.max() != 0 else 0.5
-            for i in range(avg_subject_conf_norm.shape[0]):
-                for j in range(avg_subject_conf_norm.shape[1]):
-                    val = avg_subject_conf_norm[i, j]
-                    ax.text(
-                        j,
-                        i,
-                        f"{val:.2f}",
-                        ha="center",
-                        va="center",
-                        color="white" if val > thresh else "black",
-                    )
-
-            fig.colorbar(im, ax=ax)
-            fig.tight_layout()
-            fig_path = os.path.join(version, "avg_subject_emotion_confusion.png")
-            fig.savefig(fig_path, dpi=200)
-            plt.close(fig)
-            print(f"平均 subject 级情绪二分类混淆矩阵图已保存到: {fig_path}")
     else:
         print("没有收集到任何 fold 结果，无法计算总体统计与混淆矩阵。")
 
