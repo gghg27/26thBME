@@ -26,6 +26,17 @@ from collections import defaultdict
 from itertools import cycle
 from pathlib import Path
 
+def _ensure_positive_thread_env(name: str, default: str = "1"):
+    try:
+        if int(str(os.environ.get(name, "")).strip()) <= 0:
+            os.environ[name] = default
+    except (TypeError, ValueError):
+        os.environ[name] = default
+
+
+_ensure_positive_thread_env("OMP_NUM_THREADS")
+_ensure_positive_thread_env("MKL_NUM_THREADS")
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -460,9 +471,10 @@ class UnlabeledCompetitionTargetDataset(Dataset):
     """Unlabeled val/test target windows with the same batch keys as Competition4ClassDataset."""
 
     def __init__(self, index_csv: str | Path, root: Path = ROOT, normalize: bool = False):
-        from utils.data import expand_window_index
+        from utils.data import expand_window_index, resolve_data_path
 
         self.root = Path(root)
+        self.resolve_data_path = resolve_data_path
         raw_df = pd.read_csv(index_csv)
         self.id_col = "user_id" if "user_id" in raw_df.columns else "subject_id"
         self.df = expand_window_index(raw_df, root=self.root).reset_index(drop=True)
@@ -471,12 +483,7 @@ class UnlabeledCompetitionTargetDataset(Dataset):
             raise ValueError(f"Target test csv is empty after expansion: {index_csv}")
 
     def _resolve_path(self, path_value) -> Path:
-        path = Path(str(path_value).replace("\\", "/"))
-        if not path.is_absolute():
-            path = self.root / path
-        if not path.exists():
-            raise FileNotFoundError(f"Data file not found: {path}")
-        return path
+        return self.resolve_data_path(path_value, self.root)
 
     def __len__(self):
         return len(self.df)
