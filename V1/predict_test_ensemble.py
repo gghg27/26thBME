@@ -106,8 +106,17 @@ def load_model(ckpt_path: Path, device: torch.device):
 
 def _dict_collate(batch_list):
     from torch.utils.data._utils.collate import default_collate
-    keys = list(batch_list[0].keys())
-    return {k: default_collate([b[k] for b in batch_list]) for k in keys}
+    # 分离 tensor 字段和非 tensor 字段
+    tensor_keys = ["x", "de_feat", "subject_id", "trial_id"]
+    result = {}
+    for k in tensor_keys:
+        if k in batch_list[0]:
+            result[k] = default_collate([b[k] for b in batch_list])
+    # 非 tensor 字段直接传 list
+    for k in ["_uid", "_tid"]:
+        if k in batch_list[0]:
+            result[k] = [b[k] for b in batch_list]
+    return result
 
 
 def prepare_test_df(test_csv: Path) -> tuple[pd.DataFrame, str]:
@@ -145,20 +154,77 @@ def prepare_test_df(test_csv: Path) -> tuple[pd.DataFrame, str]:
 # Prediction
 # =========================================================
 
+class _TestDataset(torch.utils.data.Dataset):
+    """轻量测试 Dataset，直接接受 DataFrame，处理 trial_path 缺失的情况。"""
+
+    def __init__(self, df: pd.DataFrame, root: Path):
+        self.df = df.reset_index(drop=True)
+        self.root = root
+        self._trial_cache: dict[str, np.ndarray | None] = {}
+
+    def _resolve(self, path_val: str) -> Path:
+        p = Path(str(path_val).replace("\\", "/"))
+        return p if p.is_absolute() else self.root / p
+
+    def _load_trial(self, path_val: str) -> np.ndarray | None:
+        if path_val in self._trial_cache:
+            return self._trial_cache[path_val]
+        try:
+            arr = np.load(self._resolve(path_val), mmap_mode="r")
+            self._trial_cache[path_val] = arr
+            return arr
+        except (FileNotFoundError, OSError):
+            self._trial_cache[path_val] = None
+            return None
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx: int):
+        row = self.df.iloc[idx]
+
+        # raw signal
+        if "trial_path" in row.index:
+            trial_arr = self._load_trial(row["trial_path"])
+            if trial_arr is not None:
+                start = int(row.get("start", 0)) if "start" in row.index else 0
+                end = int(row.get("end", trial_arr.shape[-1])) if "end" in row.index else trial_arr.shape[-1]
+                x = trial_arr[:, start:end].astype("float32", copy=False)
+            else:
+                n_ch = 30; t_len = 500
+                x = np.zeros((n_ch, t_len), dtype="float32")
+        else:
+            n_ch = 30; t_len = 500
+            x = np.zeros((n_ch, t_len), dtype="float32")
+
+        # DE features
+        de_path = self._resolve(row["de_path"])
+        de_arr = np.load(de_path)
+        if de_arr.ndim >= 3 and "de_win_id" in row.index:
+            de_feat = de_arr[int(row["de_win_id"])]
+        else:
+            de_feat = de_arr
+        de_feat = de_feat.astype("float32", copy=False)
+
+        return {
+            "x": torch.tensor(x, dtype=torch.float32),
+            "de_feat": torch.tensor(de_feat, dtype=torch.float32),
+            "subject_id": torch.tensor(0, dtype=torch.long),
+            "trial_id": torch.tensor(int(row["trial_id"]), dtype=torch.long),
+            "_uid": str(row.get("user_id", row.get("subject_id", ""))),
+            "_tid": int(row["trial_id"]),
+        }
+
+
 @torch.no_grad()
 def predict_single_model(
     model, test_df: pd.DataFrame, device: torch.device,
     id_col: str, batch_size: int,
 ) -> pd.DataFrame:
-    from dataloader import EEGWindowDataset
-
-    dataset = EEGWindowDataset(
-        test_df.reset_index(drop=True),
-        label_col=None, root=ROOT, return_de=True,
-    )
+    dataset = _TestDataset(test_df, ROOT)
     loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=False,
-        num_workers=NUM_WORKERS, pin_memory=True, collate_fn=_dict_collate,
+        num_workers=0, pin_memory=True, collate_fn=_dict_collate,
     )
 
     user_ids, trial_ids, probs, scores = [], [], [], []
@@ -181,8 +247,8 @@ def predict_single_model(
         else:
             score_pos = prob_pos
 
-        user_ids.extend(batch[id_col].detach().cpu().numpy().tolist())
-        trial_ids.extend(batch["trial_id"].detach().cpu().numpy().tolist())
+        user_ids.extend(batch["_uid"])
+        trial_ids.extend(batch["_tid"])
         probs.extend(prob_pos.detach().cpu().numpy().tolist())
         scores.extend(score_pos.detach().cpu().numpy().tolist())
 
