@@ -298,7 +298,7 @@ def apply_subject_topk(trial_records: list[dict], k_pos: int = 4) -> list[dict]:
     from collections import defaultdict
     by_subject = defaultdict(list)
     for r in trial_records:
-        by_subject[int(r["user_id"])].append(dict(r))
+        by_subject[str(r["user_id"])].append(dict(r))
 
     results = []
     for sid, records in by_subject.items():
