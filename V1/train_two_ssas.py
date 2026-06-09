@@ -478,6 +478,8 @@ class UnlabeledCompetitionTargetDataset(Dataset):
         raw_df = pd.read_csv(index_csv)
         self.id_col = "user_id" if "user_id" in raw_df.columns else "subject_id"
         self.df = expand_window_index(raw_df, root=self.root).reset_index(drop=True)
+        unique_ids = sorted(self.df[self.id_col].astype(str).unique().tolist())
+        self.target_id_to_int = {uid: idx for idx, uid in enumerate(unique_ids)}
         self.normalize = normalize
         if self.df.empty:
             raise ValueError(f"Target test csv is empty after expansion: {index_csv}")
@@ -506,7 +508,11 @@ class UnlabeledCompetitionTargetDataset(Dataset):
             de_feat = de_arr
         de_feat = de_feat.astype("float32", copy=False)
 
-        subject_id = int(row[self.id_col])
+        raw_subject_id = str(row[self.id_col])
+        try:
+            subject_id = int(raw_subject_id)
+        except ValueError:
+            subject_id = self.target_id_to_int[raw_subject_id]
         trial_id = int(row["trial_id"])
         return {
             "x": torch.tensor(x, dtype=torch.float32),
