@@ -2329,6 +2329,12 @@ def ensemble_test_predictions(
 # =========================================================
 
 if __name__ == "__main__":
+    import argparse
+    _parser = argparse.ArgumentParser()
+    _parser.add_argument("--batch_size", type=int, default=32)
+    _args, _ = _parser.parse_known_args()
+    _bs = _args.batch_size
+
     device = "cuda:0"
     version = "two_branch"
     model_params_root = "model_params"
@@ -2383,7 +2389,7 @@ if __name__ == "__main__":
                 dataset="com",
                 n_splits=n_splits,
                 epochs=100,
-                batch_size=32,
+                batch_size=_bs,
                 lr=1e-4,
                 rand=rand,
                 weight_decay=1e-4,
@@ -2651,7 +2657,7 @@ if __name__ == "__main__":
                 test_csv=test_csv,
                 device=torch.device(device),
                 save_dir=version,
-                batch_size=32,
+                batch_size=_bs,
                 num_workers=4,
                 root=ROOT,
             )

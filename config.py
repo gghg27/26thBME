@@ -8,6 +8,11 @@
 # 训练时使用 enumerate(SEEDS) 遍历，repeat 即为列表下标。
 # 推理时通过 --repeat 参数反查对应 seed。
 
+# 测试集模型随机种子
+TEST_SEED = [20,42]
+
+
+
 # 诊断模型（train_diag.py）
 # 可以按需扩展：例如加 123 支持第 3 次五折
 DIAG_REPEAT_SEEDS = [20, 42, 32]
