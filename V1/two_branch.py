@@ -2237,6 +2237,7 @@ class ClassificationHead(nn.Module):
 class SubjectDomainHead(nn.Module):
     def __init__(self, in_dim, num_subjects, hidden_dim=128, dropout=0.3):
         super().__init__()
+        self.num_subjects = num_subjects
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(),
