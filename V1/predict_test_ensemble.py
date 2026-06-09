@@ -21,6 +21,8 @@ V1_ROOT = Path(__file__).resolve().parent
 if str(V1_ROOT) not in sys.path:
     sys.path.insert(0, str(V1_ROOT))
 
+from collections import defaultdict
+
 import numpy as np
 import pandas as pd
 import torch
@@ -151,6 +153,110 @@ def prepare_test_df(test_csv: Path) -> tuple[pd.DataFrame, str]:
 
 
 # =========================================================
+# Subject baseline utilities（被试相对化基线，与训练脚本保持一致）
+# =========================================================
+
+def _compute_test_de_baselines(dataset, eps: float = 1e-6):
+    """遍历 test dataset，按 subject_id 聚合 de_feat 的均值/标准差。"""
+    sums: dict[int, torch.Tensor] = {}
+    sq_sums: dict[int, torch.Tensor] = {}
+    counts: dict[int, int] = defaultdict(int)
+
+    for idx in tqdm(range(len(dataset)), desc="DE baseline", leave=False):
+        item = dataset[idx]
+        sid = int(item["subject_id"].item() if isinstance(item["subject_id"], torch.Tensor) else item["subject_id"])
+        de_feat = torch.as_tensor(item["de_feat"], dtype=torch.float32)
+
+        if sid not in sums:
+            sums[sid] = torch.zeros_like(de_feat)
+            sq_sums[sid] = torch.zeros_like(de_feat)
+        sums[sid] += de_feat
+        sq_sums[sid] += de_feat * de_feat
+        counts[sid] += 1
+
+    subject_de_mu: dict[int, torch.Tensor] = {}
+    subject_de_std: dict[int, torch.Tensor] = {}
+    for sid, total in sums.items():
+        cnt = max(int(counts[sid]), 1)
+        mu = total / cnt
+        var = sq_sums[sid] / cnt - mu * mu
+        std = torch.sqrt(torch.clamp(var, min=0.0) + eps)
+        subject_de_mu[int(sid)] = mu
+        subject_de_std[int(sid)] = std
+    return subject_de_mu, subject_de_std
+
+
+@torch.no_grad()
+def _compute_test_bio_baselines(
+    model, loader, device,
+    subject_de_mu=None, subject_de_std=None,
+    eps: float = 1e-6,
+):
+    """用模型 forward 提取 bio_raw，按 subject_id 聚合 bio baseline。"""
+    model.eval()
+    sums: dict[int, torch.Tensor] = {}
+    sq_sums: dict[int, torch.Tensor] = {}
+    counts: dict[int, int] = defaultdict(int)
+
+    for batch in tqdm(loader, desc="Bio baseline", leave=False):
+        x = batch["x"].to(device)
+        de_feat = batch["de_feat"].to(device)
+        subject_ids = batch["subject_id"]
+
+        de_mu_batch = _gather_baseline(subject_ids, subject_de_mu, device, dtype=de_feat.dtype)
+        de_std_batch = _gather_baseline(subject_ids, subject_de_std, device, dtype=de_feat.dtype)
+
+        out = model(x, de_feat, lambda_dom=0.0, dataset_name="comp4",
+                    subject_de_mu=de_mu_batch, subject_de_std=de_std_batch,
+                    subject_bio_mu=None, subject_bio_std=None)
+        bio_raw = out.get("bio_raw", out.get("bio_raw_features"))
+        if bio_raw is None:
+            raise RuntimeError("模型 forward 未返回 bio_raw / bio_raw_features，无法计算 bio baseline。")
+        bio_raw = bio_raw.detach().cpu().float()
+
+        for i, sid in enumerate(subject_ids.detach().cpu().view(-1).tolist()):
+            key = int(sid)
+            feat = bio_raw[i]
+            if key not in sums:
+                sums[key] = torch.zeros_like(feat)
+                sq_sums[key] = torch.zeros_like(feat)
+            sums[key] += feat
+            sq_sums[key] += feat * feat
+            counts[key] += 1
+
+    subject_bio_mu: dict[int, torch.Tensor] = {}
+    subject_bio_std: dict[int, torch.Tensor] = {}
+    for sid, total in sums.items():
+        cnt = max(int(counts[sid]), 1)
+        mu = total / cnt
+        var = sq_sums[sid] / cnt - mu * mu
+        std = torch.sqrt(torch.clamp(var, min=0.0) + eps)
+        subject_bio_mu[int(sid)] = mu
+        subject_bio_std[int(sid)] = std
+    return subject_bio_mu, subject_bio_std
+
+
+def _gather_baseline(subject_ids, baseline_dict, device, dtype=None):
+    """根据 batch 内 subject_id 取出对应 baseline 并堆叠为 [B, ...]。"""
+    if baseline_dict is None:
+        return None
+    if isinstance(subject_ids, torch.Tensor):
+        ids = subject_ids.detach().cpu().view(-1).tolist()
+    else:
+        ids = list(subject_ids)
+    values = []
+    for sid in ids:
+        key = int(sid)
+        if key not in baseline_dict:
+            return None
+        values.append(torch.as_tensor(baseline_dict[key]))
+    out = torch.stack(values, dim=0).to(device=device)
+    if dtype is not None:
+        out = out.to(dtype=dtype)
+    return out
+
+
+# =========================================================
 # Prediction
 # =========================================================
 
@@ -240,22 +346,34 @@ class _TestDataset(torch.utils.data.Dataset):
             de_feat = de_arr
         de_feat = de_feat.astype("float32", copy=False)
 
+        # 被试 ID：优先用 subject_number，否则从 user_id/subject_id 解析
+        if "subject_number" in row.index:
+            sid = int(row["subject_number"])
+        elif "user_id" in row.index:
+            sid = hash(str(row["user_id"])) % (10 ** 8)
+        else:
+            sid = int(row.get("subject_id", 0))
+        uid_str = str(row.get("user_id", row.get("subject_id", str(sid))))
+
         return {
             "x": torch.tensor(x, dtype=torch.float32),
             "de_feat": torch.tensor(de_feat, dtype=torch.float32),
-            "subject_id": torch.tensor(0, dtype=torch.long),
+            "subject_id": torch.tensor(sid, dtype=torch.long),
             "trial_id": torch.tensor(int(row["trial_id"]), dtype=torch.long),
-            "_uid": str(row.get("user_id", row.get("subject_id", ""))),
+            "_uid": uid_str,
             "_tid": int(row["trial_id"]),
         }
 
 
 @torch.no_grad()
 def predict_single_model(
-    model, test_df: pd.DataFrame, device: torch.device,
+    model, dataset: _TestDataset, device: torch.device,
     id_col: str, batch_size: int,
+    subject_de_mu: dict | None = None,
+    subject_de_std: dict | None = None,
+    subject_bio_mu: dict | None = None,
+    subject_bio_std: dict | None = None,
 ) -> pd.DataFrame:
-    dataset = _TestDataset(test_df, ROOT)
     loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=False,
         num_workers=0, pin_memory=True, collate_fn=_dict_collate,
@@ -265,8 +383,16 @@ def predict_single_model(
     for batch in tqdm(loader, desc="Predict", leave=False):
         x = batch["x"].to(device)
         de_feat = batch["de_feat"].to(device)
+        subject_ids_cpu = batch["subject_id"]
 
-        out = model(x, de_feat, lambda_dom=0.0, dataset_name="comp4")
+        de_mu_batch = _gather_baseline(subject_ids_cpu, subject_de_mu, device, dtype=de_feat.dtype)
+        de_std_batch = _gather_baseline(subject_ids_cpu, subject_de_std, device, dtype=de_feat.dtype)
+        bio_mu_batch = _gather_baseline(subject_ids_cpu, subject_bio_mu, device, dtype=de_feat.dtype)
+        bio_std_batch = _gather_baseline(subject_ids_cpu, subject_bio_std, device, dtype=de_feat.dtype)
+
+        out = model(x, de_feat, lambda_dom=0.0, dataset_name="comp4",
+                    subject_de_mu=de_mu_batch, subject_de_std=de_std_batch,
+                    subject_bio_mu=bio_mu_batch, subject_bio_std=bio_std_batch)
 
         # 情绪分类任务：统一使用四分类情绪头 (logits_4cls)
         # prob_pos: 正性情绪概率 = P(class=1) + P(class=3)
@@ -276,7 +402,7 @@ def predict_single_model(
             prob_pos = p4[:, 1] + p4[:, 3]
             score_pos = prob_pos
         elif "logits_2cls" in out:
-            # 回退：如果没有四分类头，用二分类头
+            # 回退：如果没有四分类头，用二分类头（训练时作为情绪正/负性分类器）
             p = torch.softmax(out["logits_2cls"], dim=1)
             prob_pos = p[:, 1]
             score_pos = prob_pos
@@ -418,12 +544,55 @@ def main():
             raise FileNotFoundError(f"测试 CSV 不存在: {args.test_csv}")
     test_df, id_col = prepare_test_df(test_csv)
 
+    # ── 创建测试 Dataset（只创建一次，所有模型共用）──
+    dataset = _TestDataset(test_df, ROOT)
+    print(f"[data] test dataset size: {len(dataset)} windows")
+
     # ── 逐模型推理 ──
     all_trial = []
+    subject_de_mu: dict | None = None
+    subject_de_std: dict | None = None
+
     for i, ckpt_path in enumerate(ckpt_paths):
         print(f"\n[{i+1}/{len(ckpt_paths)}] {ckpt_path}")
         model = load_model(ckpt_path, device)
-        trial_pred = predict_single_model(model, test_df, device, id_col, args.batch_size)
+
+        # --- 被试相对化基线：DE baseline 只算一次，bio baseline 每个模型各算一次 ---
+        use_de_rel = getattr(model, "use_subject_relative_de", False)
+        use_bio_rel = getattr(model, "use_subject_relative_bio", False)
+
+        if use_de_rel or use_bio_rel:
+            # DE baseline（模型无关，只需算一次）
+            if subject_de_mu is None and use_de_rel:
+                print("[baseline] computing test DE baselines (once for all models)...")
+                subject_de_mu, subject_de_std = _compute_test_de_baselines(dataset, eps=1e-6)
+                print(f"[baseline] DE baselines: {len(subject_de_mu)} subjects")
+
+            # Bio baseline（依赖模型 bio_raw 输出，每个模型各算一次）
+            subject_bio_mu = subject_bio_std = None
+            if use_bio_rel:
+                print("[baseline] computing test bio baselines (model-specific)...")
+                bio_loader = DataLoader(
+                    dataset, batch_size=args.batch_size, shuffle=False,
+                    num_workers=0, pin_memory=True, collate_fn=_dict_collate,
+                )
+                subject_bio_mu, subject_bio_std = _compute_test_bio_baselines(
+                    model, bio_loader, device,
+                    subject_de_mu=subject_de_mu, subject_de_std=subject_de_std,
+                    eps=1e-6,
+                )
+                print(f"[baseline] bio baselines: {len(subject_bio_mu)} subjects")
+        else:
+            subject_de_mu = subject_de_std = None
+            subject_bio_mu = subject_bio_std = None
+
+        trial_pred = predict_single_model(
+            model, dataset, device, id_col, args.batch_size,
+            subject_de_mu=subject_de_mu,
+            subject_de_std=subject_de_std,
+            subject_bio_mu=subject_bio_mu,
+            subject_bio_std=subject_bio_std,
+        )
         trial_pred = trial_pred[["user_id", "trial_id", "prob_pos", "score_pos"]].copy()
         all_trial.append(trial_pred)
 
