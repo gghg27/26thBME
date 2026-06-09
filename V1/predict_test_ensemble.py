@@ -202,6 +202,13 @@ class _TestDataset(torch.utils.data.Dataset):
             self._trial_cache[path_val] = None
             return None
 
+    def _warn_once(self, msg: str) -> None:
+        if not hasattr(self, "_warned"):
+            self._warned: set[str] = set()
+        if msg not in self._warned:
+            print(f"[warn] {msg}")
+            self._warned.add(msg)
+
     def __len__(self):
         return len(self.df)
 
@@ -216,9 +223,11 @@ class _TestDataset(torch.utils.data.Dataset):
                 end = int(row.get("end", trial_arr.shape[-1])) if "end" in row.index else trial_arr.shape[-1]
                 x = trial_arr[:, start:end].astype("float32", copy=False)
             else:
+                self._warn_once(f"trial 文件缺失，使用零张量回退 (trial_path={row['trial_path']})")
                 n_ch = 30; t_len = 500
                 x = np.zeros((n_ch, t_len), dtype="float32")
         else:
+            self._warn_once("测试 CSV 缺少 trial_path 列，使用零张量回退")
             n_ch = 30; t_len = 500
             x = np.zeros((n_ch, t_len), dtype="float32")
 
@@ -259,17 +268,21 @@ def predict_single_model(
 
         out = model(x, de_feat, lambda_dom=0.0, dataset_name="comp4")
 
-        if "logits_2cls" in out:
-            p = torch.softmax(out["logits_2cls"], dim=1)
-        else:
-            p = torch.softmax(out["logits"], dim=1)
-        prob_pos = p[:, 1]
-
-        # score_pos: 四分类头的正性概率 P(class=1)+P(class=3)
+        # 情绪分类任务：统一使用四分类情绪头 (logits_4cls)
+        # prob_pos: 正性情绪概率 = P(class=1) + P(class=3)
+        # score_pos: 与 prob_pos 相同，用于被试内 top-K 排序
         if "logits_4cls" in out:
             p4 = torch.softmax(out["logits_4cls"], dim=1)
-            score_pos = p4[:, 1] + p4[:, 3]
+            prob_pos = p4[:, 1] + p4[:, 3]
+            score_pos = prob_pos
+        elif "logits_2cls" in out:
+            # 回退：如果没有四分类头，用二分类头
+            p = torch.softmax(out["logits_2cls"], dim=1)
+            prob_pos = p[:, 1]
+            score_pos = prob_pos
         else:
+            p = torch.softmax(out["logits"], dim=1)
+            prob_pos = p[:, 1]
             score_pos = prob_pos
 
         user_ids.extend(batch["_uid"])
@@ -412,7 +425,6 @@ def main():
         model = load_model(ckpt_path, device)
         trial_pred = predict_single_model(model, test_df, device, id_col, args.batch_size)
         trial_pred = trial_pred[["user_id", "trial_id", "prob_pos", "score_pos"]].copy()
-        trial_pred.rename(columns={"prob_pos": f"prob_pos", "score_pos": f"score_pos"}, inplace=True)
         all_trial.append(trial_pred)
 
     # ── 集成 ──
