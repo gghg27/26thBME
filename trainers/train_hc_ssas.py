@@ -934,6 +934,12 @@ def train_competition_cross_subject(
 # =========================================================
 
 if __name__ == "__main__":
+    import argparse
+    _parser = argparse.ArgumentParser()
+    _parser.add_argument("--batch_size", type=int, default=64)
+    _args, _ = _parser.parse_known_args()
+    _bs = _args.batch_size
+
     device = "cuda:0"
     train_group = "hc"
     version = f"{train_group}_ssas"
@@ -979,7 +985,7 @@ if __name__ == "__main__":
                 train_group=train_group,
                 n_splits=n_splits,
                 epochs=100,
-                batch_size=64,
+                batch_size=_bs,
                 subjects_per_batch=4,
                 lr=1e-4,
                 rand=rand,

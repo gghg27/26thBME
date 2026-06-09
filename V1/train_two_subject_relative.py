@@ -1,20 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-EEG 抑郁症/正常人跨被试二分类训练脚本。
+EEG 情绪二分类 + 四分类辅助任务跨被试训练脚本。
 
-适用目标：
-    diagnosis_label 二分类：0/1 分别代表你的数据集中定义的两个诊断类别。
-    请确认 com_index_sub_2s.csv 中 diagnosis_label 的编码含义，常见是：
-        0 = HC/正常人，1 = DEP/抑郁症
-    如果你的编码相反，指标含义也相反，但训练逻辑不受影响。
+双任务架构：
+    - 四分类头 (cls4_head)：z_conv → 4 类情绪 (DEP_neu, DEP_pos, HC_neu, HC_pos)
+    - 二分类头 (cls2_head)：z_diag → 2 类情绪 (中性, 正性)
+    - 域对抗头 (domain_head)：z_diag → 被试域分类 (GRL)
 
-主要修正：
-1. 当 nclass=2 时，训练标签统一使用 batch["diagnosis_label"]。
-2. 二分类也使用 diagnosis_label 的类别权重，缓解 DEP/HC 样本不均衡。
-3. lambda_graph=0 或模型不返回 adj_dense 时，不再强制访问 out["adj_dense"]。
-4. trial 级指标改为诊断二分类指标；额外增加 subject 级诊断指标。
-5. 打印、保存和画图命名改为 diagnosis/diag，避免与 emotion 或 4-class 混淆。
-6. 保留 nclass=4 分支兼容性，但本脚本默认 nclass=2。
+Loss:
+    L = L_4cls(z_conv, label4) + λ_diag × L_2cls(z_diag, emotion_binary)
+        + λ_domain × L_domain + λ_center × L_center
+
+注意：
+    二分类头做的是情绪正/负性分类（从 label4 % 2 推算），不是抑郁症诊断。
+    如需做诊断二分类，请使用 batch["diagnosis_label"] 替换 y_2cls。
 """
 
 import os
@@ -23,12 +22,16 @@ import copy
 import random
 import sys
 from collections import defaultdict
-from itertools import cycle
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# V1 模块路径
+V1_ROOT = Path(__file__).resolve().parent
+if str(V1_ROOT) not in sys.path:
+    sys.path.insert(0, str(V1_ROOT))
 
 import config
 import numpy as np
@@ -52,11 +55,7 @@ from dataloader import (
     Competition4ClassDataset,
     comp4_collate_fn,
 )
-from models.diag_model_ssas import (
-    SSASDiagnosisModel,
-    SourceSelectionModel,
-    mmd_loss,
-)
+from two_branch_subject_relative import TwoBranchModel
 from utils.folds import get_unified_subject_split
 
 
@@ -104,238 +103,358 @@ def seed_worker(worker_id: int):
 
 
 # =========================================================
+# Subject-relative baseline utilities
+# =========================================================
+
+def _to_subject_int(subject_id):
+    if isinstance(subject_id, torch.Tensor):
+        return int(subject_id.detach().cpu().item())
+    return int(subject_id)
+
+
+def compute_subject_de_baselines(dataset, eps=1e-6):
+    """
+    遍历 dataset，按 subject_id 聚合 de_feat。
+
+    Returns
+    -------
+    subject_de_mu, subject_de_std:
+        dict[int, torch.Tensor]，每个 tensor 形状为 [C, K]。
+    """
+    sums = {}
+    sq_sums = {}
+    counts = defaultdict(int)
+
+    for idx in tqdm(range(len(dataset)), desc="DE baseline", leave=False):
+        item = dataset[idx]
+        sid = _to_subject_int(item["subject_id"])
+        de_feat = torch.as_tensor(item["de_feat"], dtype=torch.float32)
+
+        if sid not in sums:
+            sums[sid] = torch.zeros_like(de_feat)
+            sq_sums[sid] = torch.zeros_like(de_feat)
+        sums[sid] += de_feat
+        sq_sums[sid] += de_feat * de_feat
+        counts[sid] += 1
+
+    subject_de_mu = {}
+    subject_de_std = {}
+    for sid, total in sums.items():
+        count = max(int(counts[sid]), 1)
+        mu = total / count
+        var = sq_sums[sid] / count - mu * mu
+        std = torch.sqrt(torch.clamp(var, min=0.0) + eps)
+        subject_de_mu[int(sid)] = mu
+        subject_de_std[int(sid)] = std
+
+    return subject_de_mu, subject_de_std
+
+
+def gather_subject_baseline(subject_ids, baseline_dict, device, dtype=None):
+    """
+    根据 batch 内 subject_id 取出对应 baseline，并堆叠为 [B, ...]。
+
+    如果 baseline_dict 为空或任何 subject 缺失，返回 None，让模型自动退化为原始输入。
+    """
+    if baseline_dict is None:
+        return None
+
+    if isinstance(subject_ids, torch.Tensor):
+        ids = subject_ids.detach().cpu().view(-1).tolist()
+    else:
+        ids = list(subject_ids)
+
+    values = []
+    for sid in ids:
+        key = int(sid)
+        if key not in baseline_dict:
+            return None
+        value = torch.as_tensor(baseline_dict[key])
+        values.append(value)
+
+    out = torch.stack(values, dim=0).to(device=device)
+    if dtype is not None:
+        out = out.to(dtype=dtype)
+    return out
+
+
+@torch.no_grad()
+def compute_subject_bio_baselines(
+    model,
+    loader,
+    device,
+    subject_de_mu=None,
+    subject_de_std=None,
+    eps=1e-6,
+):
+    """
+    运行一遍 loader，提取 out["bio_raw"]，按 subject_id 计算 bio baseline。
+
+    这里不传 subject_bio_mu/std，因此即使模型开启了 subject-relative bio，
+    bio 分支也会自动退化到原始 bio_raw projector 路径，避免循环依赖。
+    """
+    model.eval()
+    sums = {}
+    sq_sums = {}
+    counts = defaultdict(int)
+
+    for batch in tqdm(loader, desc="Bio baseline", leave=False):
+        x = batch["x"].to(device)
+        de_feat = batch["de_feat"].to(device)
+        subject_ids = batch["subject_id"]
+        subject_de_mu_batch = gather_subject_baseline(subject_ids, subject_de_mu, device, dtype=de_feat.dtype)
+        subject_de_std_batch = gather_subject_baseline(subject_ids, subject_de_std, device, dtype=de_feat.dtype)
+
+        out = model(
+            x,
+            de_feat=de_feat,
+            lambda_dom=0.0,
+            dataset_name="comp4",
+            subject_de_mu=subject_de_mu_batch,
+            subject_de_std=subject_de_std_batch,
+            subject_bio_mu=None,
+            subject_bio_std=None,
+        )
+        bio_raw = out.get("bio_raw", out.get("bio_raw_features"))
+        if bio_raw is None:
+            raise RuntimeError("模型 forward 未返回 bio_raw / bio_raw_features，无法计算 bio baseline。")
+        bio_raw = bio_raw.detach().cpu().float()
+
+        for i, sid in enumerate(subject_ids.detach().cpu().view(-1).tolist()):
+            key = int(sid)
+            feat = bio_raw[i]
+            if key not in sums:
+                sums[key] = torch.zeros_like(feat)
+                sq_sums[key] = torch.zeros_like(feat)
+            sums[key] += feat
+            sq_sums[key] += feat * feat
+            counts[key] += 1
+
+    subject_bio_mu = {}
+    subject_bio_std = {}
+    for sid, total in sums.items():
+        count = max(int(counts[sid]), 1)
+        mu = total / count
+        var = sq_sums[sid] / count - mu * mu
+        std = torch.sqrt(torch.clamp(var, min=0.0) + eps)
+        subject_bio_mu[int(sid)] = mu
+        subject_bio_std[int(sid)] = std
+
+    return subject_bio_mu, subject_bio_std
+
+
+# =========================================================
 # Validation
 # =========================================================
 
 @torch.no_grad()
-def validate_one_epoch_comp4(
+def validate_one_epoch_two_branch(
     model,
     loader,
-    criterion_ce,
-    contrast_criterion,
+    criterion_4cls,
+    criterion_2cls,
     device,
-    nclass: int = 4,
+    lambda_diag: float = 1.0,
     lambda_graph: float = 0.1,
+    subject_de_mu=None,
+    subject_de_std=None,
+    subject_bio_mu=None,
+    subject_bio_std=None,
 ):
     """
-    验证 / 测试一轮，并返回尽可能完整的指标。
+    验证一轮：双任务评估。
 
-    注意：为加速验证，以下损失仅在对应 lambda > 0 时才计算：
-      - contrast_loss：当前训练配置中未用于验证，已注释
-      - graph_loss：仅当 lambda_graph > 0 时计算
+    输出指标：
+        - 四分类（情绪）：acc, macro_f1, per_class_4
+        - 二分类（情绪）：emotion_acc/emotion_macro_f1（segment 级）、
+          trial_acc/trial_macro_f1（trial 级）
     """
     model.eval()
 
     total_loss = 0.0
-    total_ce = 0.0
-    # total_graph = 0.0   # 当前配置 lambda_graph=0，已注释
-    # total_con = 0.0     # 当前配置验证时不使用 contrast loss
+    total_ce_4cls = 0.0
+    total_ce_2cls = 0.0
 
-    total_correct = 0
+    total_correct_4cls = 0
+    total_correct_2cls = 0
     total_num = 0
-    all_preds = []
-    all_labels = []
 
-    total_emo_correct = 0
-    all_emo_preds = []
-    all_emo_labels = []
+    all_preds_4cls = []
+    all_labels_4cls = []
+    all_preds_2cls = []
+    all_labels_2cls = []
     segment_records = []
 
-    _need_graph = lambda_graph > 0  # 编译期常量折叠
+    _need_graph = lambda_graph > 0
 
     pbar = tqdm(loader, desc="Val", leave=False)
 
     for batch in pbar:
         x = batch["x"].to(device)
+        y_4cls = batch["label4"].to(device).long()
+        y_2cls = (y_4cls % 2).long()                    # 情绪二分类: 0=中性, 1=正性
 
-        if nclass == 4:
-            y = batch["label4"].to(device).long()
-            y_emo = (y % 2).long()
-        else:
-            y = batch["diagnosis_label"].to(device).long()
-            y_emo = y
-
-        # subject_id = batch["subject_id"].to(device).long()  # 当前仅 contrast loss 需要，已注释
         de_feat = batch["de_feat"].to(device)
+        subject_ids_cpu = batch["subject_id"]
+        trial_ids_cpu = batch["trial_id"]
+        subject_de_mu_batch = gather_subject_baseline(subject_ids_cpu, subject_de_mu, device, dtype=de_feat.dtype)
+        subject_de_std_batch = gather_subject_baseline(subject_ids_cpu, subject_de_std, device, dtype=de_feat.dtype)
+        subject_bio_mu_batch = gather_subject_baseline(subject_ids_cpu, subject_bio_mu, device, dtype=de_feat.dtype)
+        subject_bio_std_batch = gather_subject_baseline(subject_ids_cpu, subject_bio_std, device, dtype=de_feat.dtype)
 
-        out = model(x, de_feat, 0, dataset_name="comp4")
-        logits = out["logits"]
-        # adj_dense = out.get("adj_dense", None)      # 当前配置 lambda_graph=0，已注释
-        # contrast_feat = out.get("node_contrast_feat", None)  # 验证时不使用
+        out = model(
+            x,
+            de_feat,
+            lambda_dom=0.0,
+            dataset_name="comp4",
+            subject_de_mu=subject_de_mu_batch,
+            subject_de_std=subject_de_std_batch,
+            subject_bio_mu=subject_bio_mu_batch,
+            subject_bio_std=subject_bio_std_batch,
+        )
+        logits_4cls = out["logits_4cls"]
+        logits_2cls = out["logits_2cls"]
 
-        # ── contrast loss：当前验证 loss 中不使用，注释以加速 ──
-        # if contrast_feat is not None:
-        #     loss_con = contrast_criterion(
-        #         features=contrast_feat,
-        #         labels=y,
-        #         subjects=subject_id,
-        #     )
-        # else:
-        #     loss_con = logits.new_tensor(0.0)
+        loss_4cls = criterion_4cls(logits_4cls, y_4cls)
+        loss_2cls = criterion_2cls(logits_2cls, y_2cls)
 
-        loss_ce = criterion_ce(logits, y)
         if _need_graph:
             adj_dense = out.get("adj_dense", None)
             if adj_dense is not None:
-                loss_graph = intra_class_graph_loss(adj_dense, y)
+                loss_graph = intra_class_graph_loss(adj_dense, y_4cls)
             else:
-                loss_graph = logits.new_tensor(0.0)
-            loss = loss_ce + lambda_graph * loss_graph
+                loss_graph = logits_4cls.new_tensor(0.0)
+            loss = loss_4cls + lambda_diag * loss_2cls + lambda_graph * loss_graph
         else:
-            # loss_graph = logits.new_tensor(0.0)   # 不再需要
-            loss = loss_ce
+            loss = loss_4cls + lambda_diag * loss_2cls
 
-        pred = logits.argmax(dim=1)
-        pred_emo = (pred % 2).long() if nclass == 4 else pred
+        pred_4cls = logits_4cls.argmax(dim=1)
+        pred_2cls = logits_2cls.argmax(dim=1)
 
-        prob = torch.softmax(logits, dim=1)
-        if nclass == 4:
-            prob_pos = prob[:, 1] + prob[:, 3]
-        else:
-            prob_pos = prob[:, 1]
+        # 四分类概率：情绪正性概率 = P(class=1) + P(class=3)
+        prob_4 = torch.softmax(logits_4cls, dim=1)
+        prob_pos_emo = prob_4[:, 1] + prob_4[:, 3]
 
-        subject_ids_cpu = batch["subject_id"]
-        trial_ids_cpu = batch["trial_id"]
+        # 二分类概率：情绪正性概率 = P(class=1)
+        prob_2 = torch.softmax(logits_2cls, dim=1)
+        prob_pos_2 = prob_2[:, 1]
+        score_pos = logits_2cls[:, 1] - logits_2cls[:, 0]
 
         for i in range(x.size(0)):
             segment_records.append({
                 "subject_id": int(subject_ids_cpu[i]),
                 "trial_id": int(trial_ids_cpu[i]),
-                "prob_pos": float(prob_pos[i].detach().cpu()),  # 兼容原二分类 trial 聚合；nclass=2 时表示类别1概率
-                "prob_diag1": float(prob_pos[i].detach().cpu()),
-                "pred_emo": int(pred_emo[i].detach().cpu()),
-                "pred_diag": int(pred_emo[i].detach().cpu()),
-                "label_emo": int(y_emo[i].detach().cpu()),
-                "label_diag": int(y_emo[i].detach().cpu()),
-                "pred_cls": int(pred[i].detach().cpu()),
-                "label_cls": int(y[i].detach().cpu()),
-                "pred4": int(pred[i].detach().cpu()),  # 兼容旧字段；nclass=2 时不是四分类
-                "label4": int(y[i].detach().cpu()),  # 兼容旧字段；nclass=2 时不是四分类
+                "prob_emo4": float(prob_pos_emo[i].detach().cpu()),   # 四分类头正性概率 P(class=1)+P(class=3)
+                "prob_emo2": float(prob_pos_2[i].detach().cpu()),    # 二分类头正性概率 P(class=1)
+                "prob_pos": float(prob_pos_2[i].detach().cpu()),
+                "score_pos": float(score_pos[i].detach().cpu()),
+                "pred_emo": int(pred_2cls[i].detach().cpu()),
+                "label_emo": int(y_2cls[i].detach().cpu()),
+                "pred_cls": int(pred_4cls[i].detach().cpu()),
+                "label_cls": int(y_4cls[i].detach().cpu()),
+                "pred4": int(pred_4cls[i].detach().cpu()),
+                "label4": int(y_4cls[i].detach().cpu()),
             })
 
-        correct = (pred == y).sum().item()
-        emo_correct = (pred_emo == y_emo).sum().item()
+        correct_4cls = (pred_4cls == y_4cls).sum().item()
+        correct_2cls = (pred_2cls == y_2cls).sum().item()
         bsz = x.size(0)
 
         total_loss += loss.item() * bsz
-        total_ce += loss_ce.item() * bsz
-        # total_graph += loss_graph.item() * bsz   # 已注释
-        # total_con += loss_con.item() * bsz       # 已注释
-        total_correct += correct
-        total_emo_correct += emo_correct
+        total_ce_4cls += loss_4cls.item() * bsz
+        total_ce_2cls += loss_2cls.item() * bsz
+        total_correct_4cls += correct_4cls
+        total_correct_2cls += correct_2cls
         total_num += bsz
 
-        all_preds.extend(pred.detach().cpu().numpy().tolist())
-        all_labels.extend(y.detach().cpu().numpy().tolist())
-        all_emo_preds.extend(pred_emo.detach().cpu().numpy().tolist())
-        all_emo_labels.extend(y_emo.detach().cpu().numpy().tolist())
+        all_preds_4cls.extend(pred_4cls.detach().cpu().numpy().tolist())
+        all_labels_4cls.extend(y_4cls.detach().cpu().numpy().tolist())
+        all_preds_2cls.extend(pred_2cls.detach().cpu().numpy().tolist())
+        all_labels_2cls.extend(y_2cls.detach().cpu().numpy().tolist())
 
         pbar.set_postfix({
             "loss": f"{total_loss / max(total_num, 1):.4f}",
-            "ce": f"{total_ce / max(total_num, 1):.4f}",
-            # "graph": f"{total_graph / max(total_num, 1):.4f}",       # 已注释
-            # "contrast_loss": f"{total_con / max(total_num, 1):.4f}",  # 已注释
-            "acc": f"{total_correct / max(total_num, 1):.4f}",
-            "emo_acc": f"{total_emo_correct / max(total_num, 1):.4f}",
+            "acc4": f"{total_correct_4cls / max(total_num, 1):.4f}",
+            "acc2": f"{total_correct_2cls / max(total_num, 1):.4f}",
         })
 
     if total_num == 0:
         raise RuntimeError("验证集为空：total_num == 0，请检查 val_dataset / val_loader。")
 
-    cls_labels = list(range(nclass))
-    acc = total_correct / total_num
-    macro_f1 = f1_score(all_labels, all_preds, average="macro", labels=cls_labels, zero_division=0)
-    cm = confusion_matrix(all_labels, all_preds, labels=cls_labels)
+    # ── 四分类指标 ──
+    cls4_labels = [0, 1, 2, 3]
+    acc_4cls = total_correct_4cls / total_num
+    macro_f1_4cls = f1_score(all_labels_4cls, all_preds_4cls, average="macro", labels=cls4_labels, zero_division=0)
+    cm_4cls = confusion_matrix(all_labels_4cls, all_preds_4cls, labels=cls4_labels)
 
     p4, r4, f14, s4 = precision_recall_fscore_support(
-        all_labels,
-        all_preds,
-        labels=cls_labels,
-        zero_division=0,
+        all_labels_4cls, all_preds_4cls, labels=cls4_labels, zero_division=0,
     )
     per_class_4 = {
-        int(c): {
-            "precision": float(p4[i]),
-            "recall": float(r4[i]),
-            "f1": float(f14[i]),
-            "support": int(s4[i]),
-        }
-        for i, c in enumerate(cls_labels)
+        int(c): {"precision": float(p4[i]), "recall": float(r4[i]), "f1": float(f14[i]), "support": int(s4[i])}
+        for i, c in enumerate(cls4_labels)
     }
 
-    emotion_acc = total_emo_correct / total_num
-    emotion_macro_f1 = f1_score(
-        all_emo_labels,
-        all_emo_preds,
-        average="macro",
-        labels=[0, 1],
-        zero_division=0,
-    )
-    emotion_cm = confusion_matrix(all_emo_labels, all_emo_preds, labels=[0, 1])
+    # ── 二分类情绪指标（segment 级）──
+    emotion_acc = total_correct_2cls / total_num
+    emotion_macro_f1 = f1_score(all_labels_2cls, all_preds_2cls, average="macro", labels=[0, 1], zero_division=0)
+    emotion_cm = confusion_matrix(all_labels_2cls, all_preds_2cls, labels=[0, 1])
 
     pe, re, f1e, se = precision_recall_fscore_support(
-        all_emo_labels,
-        all_emo_preds,
-        labels=[0, 1],
-        zero_division=0,
+        all_labels_2cls, all_preds_2cls, labels=[0, 1], zero_division=0,
     )
     per_class_emo = {
-        int(c): {
-            "precision": float(pe[i]),
-            "recall": float(re[i]),
-            "f1": float(f1e[i]),
-            "support": int(se[i]),
-        }
+        int(c): {"precision": float(pe[i]), "recall": float(re[i]), "f1": float(f1e[i]), "support": int(se[i])}
         for i, c in enumerate([0, 1])
     }
 
-    trial_metrics = compute_trial_level_metrics(
+    # ── trial / subject 级聚合 ──
+    trial_metrics = compute_trial_level_metrics(segment_records, threshold=0.5, vote_method="hard")
+    topk_trial_metrics = compute_subject_topk_trial_metrics(
         segment_records,
-        threshold=0.5,
-        vote_method="hard",
+        k_pos=4,
+        score_key="score_pos",
     )
-    subject_metrics = compute_subject_level_metrics(
-        segment_records,
-        threshold=0.5,
-        vote_method="trial_hard",
-    )
+    subject_metrics = compute_subject_level_metrics(segment_records, threshold=0.5, vote_method="trial_hard")
 
     pt, rt, f1t, st = precision_recall_fscore_support(
-        trial_metrics["trial_labels"],
-        trial_metrics["trial_preds"],
-        labels=[0, 1],
-        zero_division=0,
+        trial_metrics["trial_labels"], trial_metrics["trial_preds"], labels=[0, 1], zero_division=0,
     )
     trial_per_class_emo = {
-        int(c): {
-            "precision": float(pt[i]),
-            "recall": float(rt[i]),
-            "f1": float(f1t[i]),
-            "support": int(st[i]),
-        }
+        int(c): {"precision": float(pt[i]), "recall": float(rt[i]), "f1": float(f1t[i]), "support": int(st[i])}
         for i, c in enumerate([0, 1])
     }
 
     metrics = {
         "loss": total_loss / total_num,
-        "ce_loss": total_ce / total_num,
-        "graph_loss": 0.0,       # 当前配置 lambda_graph=0，验证时不计算
-        "contrast_loss": 0.0,    # 当前验证 loss 中不使用 contrast loss
+        "ce_loss_4cls": total_ce_4cls / total_num,
+        "ce_loss_2cls": total_ce_2cls / total_num,
+        "ce_loss": (total_ce_4cls + lambda_diag * total_ce_2cls) / total_num,
+        "graph_loss": 0.0,
+        "contrast_loss": 0.0,
 
-        "acc": acc,
-        "macro_f1": macro_f1,
-        "confusion_matrix": cm,
+        # 四分类
+        "acc_4cls": acc_4cls,
+        "macro_f1_4cls": macro_f1_4cls,
+        "confusion_matrix_4cls": cm_4cls,
         "per_class_4": per_class_4,
-        "segment_preds_4": all_preds,
-        "segment_labels_4": all_labels,
+        "segment_preds_4": all_preds_4cls,
+        "segment_labels_4": all_labels_4cls,
 
+        # 兼容旧 key
+        "acc": acc_4cls,
+        "macro_f1": macro_f1_4cls,
+        "confusion_matrix": cm_4cls,
+
+        # 二分类情绪
         "emotion_acc": emotion_acc,
         "emotion_macro_f1": emotion_macro_f1,
         "emotion_confusion_matrix": emotion_cm,
         "per_class_emo": per_class_emo,
-        "segment_preds_emo": all_emo_preds,
-        "segment_labels_emo": all_emo_labels,
+        "segment_preds_emo": all_preds_2cls,
+        "segment_labels_emo": all_labels_2cls,
 
+        # trial 级
         "trial_acc": trial_metrics["trial_acc"],
         "trial_macro_f1": trial_metrics["trial_macro_f1"],
         "trial_confusion_matrix": trial_metrics["trial_confusion_matrix"],
@@ -345,6 +464,20 @@ def validate_one_epoch_comp4(
         "trial_preds": trial_metrics["trial_preds"],
         "trial_labels": trial_metrics["trial_labels"],
 
+        # subject 内 top-4 trial 级
+        "topk_trial_acc": topk_trial_metrics["topk_trial_acc"],
+        "topk_trial_macro_f1": topk_trial_metrics["topk_trial_macro_f1"],
+        "topk_trial_confusion_matrix": topk_trial_metrics["topk_trial_confusion_matrix"],
+        "topk_trial_per_class": topk_trial_metrics["topk_trial_per_class"],
+        "topk_trial_keys": topk_trial_metrics["topk_trial_keys"],
+        "topk_trial_scores": topk_trial_metrics["topk_trial_scores"],
+        "topk_trial_probs": topk_trial_metrics["topk_trial_probs"],
+        "topk_trial_preds": topk_trial_metrics["topk_trial_preds"],
+        "topk_trial_labels": topk_trial_metrics["topk_trial_labels"],
+        "topk_subject_gap_mean": topk_trial_metrics["topk_subject_gap_mean"],
+        "topk_subject_gap_std": topk_trial_metrics["topk_subject_gap_std"],
+
+        # subject 级
         "subject_acc": subject_metrics["subject_acc"],
         "subject_macro_f1": subject_metrics["subject_macro_f1"],
         "subject_confusion_matrix": subject_metrics["subject_confusion_matrix"],
@@ -353,14 +486,11 @@ def validate_one_epoch_comp4(
         "subject_preds": subject_metrics["subject_preds"],
         "subject_labels": subject_metrics["subject_labels"],
 
-        # 诊断二分类别名：nclass=2 时，这些与 acc/macro_f1、emotion_acc/emotion_macro_f1 等价。
-        "diagnosis_acc": acc,
-        "diagnosis_macro_f1": macro_f1,
-        "diagnosis_confusion_matrix": cm,
-        "trial_diagnosis_acc": trial_metrics["trial_acc"],
-        "trial_diagnosis_macro_f1": trial_metrics["trial_macro_f1"],
-        "subject_diagnosis_acc": subject_metrics["subject_acc"],
-        "subject_diagnosis_macro_f1": subject_metrics["subject_macro_f1"],
+        # 情绪二分类别名（subject / trial 级）
+        "subject_emotion_acc": subject_metrics["subject_acc"],
+        "subject_emotion_macro_f1": subject_metrics["subject_macro_f1"],
+        "trial_emotion_acc": trial_metrics["trial_acc"],
+        "trial_emotion_macro_f1": trial_metrics["trial_macro_f1"],
 
         "segment_records": segment_records,
     }
@@ -372,118 +502,132 @@ def validate_one_epoch_comp4(
 # Train one epoch
 # =========================================================
 
-def train_one_epoch_comp4(
+def train_one_epoch_two_branch(
     model,
     loader,
     optimizer,
-    criterion_ce,
+    criterion_4cls,
+    criterion_2cls,
     dom_criterion,
     device,
-    nclass: int = 4,
-    lambdad_domain: float = 1.0,
+    lambda_diag: float = 1.0,
+    lambda_domain: float = 0.0,
     grl_domain: float = 0.1,
-    lambda_graph: float = 0.6,
-    lambda_con: float = 0.05,
-
-    # 新增
+    # 类中心损失（作用于 z_diag）
     center_criterion=None,
     lambda_center: float = 0.0,
     center_warmup_epochs: int = 10,
     current_epoch: int = 1,
+    subject_de_mu=None,
+    subject_de_std=None,
+    subject_bio_mu=None,
+    subject_bio_std=None,
 ):
     """
-    单次训练。
+    双任务训练：四分类情绪 + 二分类情绪。
+
+    L = L_4cls(z_conv, label4) + λ_diag × L_2cls(z_diag, emotion_binary)
+        + λ_domain × L_domain + λ_center × L_center
     """
     model.train()
 
     total_loss = 0.0
-    total_ce = 0.0
-    total_graph = 0.0
-    total_correct = 0
-    total_num = 0
-    total_dom_loss = 0.0
-    total_con_loss = 0.0
+    total_loss_4cls = 0.0
+    total_loss_2cls = 0.0
+    total_loss_dom = 0.0
     total_loss_center = 0.0
+    total_correct_4cls = 0
+    total_correct_2cls = 0
+    total_num = 0
 
     pbar = tqdm(loader, desc="Train", leave=False)
 
     for batch in pbar:
         x = batch["x"].to(device)
-        if nclass == 4:
-            y = batch["label4"].to(device).long()
-        else:
-            y = batch["diagnosis_label"].to(device).long()
-
+        y_4cls = batch["label4"].to(device).long()                       # 四分类标签
+        y_2cls = (y_4cls % 2).long()                                     # 情绪二分类: 0=中性, 1=正性
         subject_id = batch["domain_id"].to(device).long()
+        subject_ids_cpu = batch["subject_id"]
         de_feat = batch["de_feat"].to(device)
+        subject_de_mu_batch = gather_subject_baseline(subject_ids_cpu, subject_de_mu, device, dtype=de_feat.dtype)
+        subject_de_std_batch = gather_subject_baseline(subject_ids_cpu, subject_de_std, device, dtype=de_feat.dtype)
+        subject_bio_mu_batch = gather_subject_baseline(subject_ids_cpu, subject_bio_mu, device, dtype=de_feat.dtype)
+        subject_bio_std_batch = gather_subject_baseline(subject_ids_cpu, subject_bio_std, device, dtype=de_feat.dtype)
 
         optimizer.zero_grad(set_to_none=True)
 
         out = model(
-                    x,
-                    de_feat=de_feat,
-                    lambda_emo=0.0,
-                    lambda_subject=0.0,
-                    dataset_name="comp4",
-                )
-        #诊断logits
-        logits = out["logits"]
+            x,
+            de_feat=de_feat,
+            lambda_dom=grl_domain,
+            dataset_name="comp4",
+            subject_de_mu=subject_de_mu_batch,
+            subject_de_std=subject_de_std_batch,
+            subject_bio_mu=subject_bio_mu_batch,
+            subject_bio_std=subject_bio_std_batch,
+        )
+
+        logits_4cls = out["logits_4cls"]
+        logits_2cls = out["logits_2cls"]
         domain_logits = out.get("domain_logits", None)
-        #图读出feat
-        graph_feat = out.get("graph_feat", None)
+        graph_feat = out.get("graph_feat", None)  # z_diag
 
-        #类中心损失
+        # ── 四分类情绪 loss ──
+        loss_4cls = criterion_4cls(logits_4cls, y_4cls)
+
+        # ── 二分类情绪 loss（中性 vs 正性）──
+        loss_2cls = criterion_2cls(logits_2cls, y_2cls)
+
+        # ── 类中心损失（作用于 z_diag）──
         if center_criterion is not None and lambda_center > 0 and graph_feat is not None:
-            loss_center, center_info = center_criterion(graph_feat, y)
-
+            loss_center, center_info = center_criterion(graph_feat, y_2cls)
             if current_epoch <= center_warmup_epochs:
                 center_weight = 0.0
             else:
                 center_weight = float(lambda_center)
         else:
-            loss_center = logits.new_tensor(0.0)
+            loss_center = logits_4cls.new_tensor(0.0)
             center_weight = 0.0
             center_info = {"center_acc": 0.0}
 
-        #域损失
-        if domain_logits is not None and lambdad_domain > 0:
+        # ── 域对抗 loss ──
+        if domain_logits is not None and lambda_domain > 0:
             loss_dom = dom_criterion(domain_logits, subject_id)
         else:
-            loss_dom = logits.new_tensor(0.0)
+            loss_dom = logits_4cls.new_tensor(0.0)
 
-        #分类损失
-        loss_ce = criterion_ce(logits, y)
-
-
+        # ── 总 loss ──
         loss = (
-            loss_ce
+            loss_4cls
+            + lambda_diag * loss_2cls
             + center_weight * loss_center
-            + lambdad_domain * loss_dom
-
+            + lambda_domain * loss_dom
         )
 
         loss.backward()
         optimizer.step()
 
-        pred = logits.argmax(dim=1)
-        correct = (pred == y).sum().item()
+        pred_4cls = logits_4cls.argmax(dim=1)
+        pred_2cls = logits_2cls.argmax(dim=1)
         bsz = x.size(0)
 
         total_loss += loss.item() * bsz
+        total_loss_4cls += loss_4cls.item() * bsz
+        total_loss_2cls += loss_2cls.item() * bsz
+        total_loss_dom += loss_dom.item() * bsz
         total_loss_center += loss_center.item() * bsz
-        total_ce += loss_ce.item() * bsz
-  
-        total_dom_loss += loss_dom.item() * bsz
-        total_correct += correct
+        total_correct_4cls += (pred_4cls == y_4cls).sum().item()
+        total_correct_2cls += (pred_2cls == y_2cls).sum().item()
         total_num += bsz
 
         pbar.set_postfix({
             "loss": f"{total_loss / max(total_num, 1):.4f}",
-            "ce": f"{total_ce / max(total_num, 1):.4f}",
-            # "graph": f"{total_graph / max(total_num, 1):.4f}",
-            "loss_dom": f"{total_dom_loss / max(total_num, 1):.4f}",
-            "total_loss_center": f"{total_loss_center / max(total_num, 1):.4f}",
-            "acc": f"{total_correct / max(total_num, 1):.4f}",
+            "L4": f"{total_loss_4cls / max(total_num, 1):.4f}",
+            "L2": f"{total_loss_2cls / max(total_num, 1):.4f}",
+            "dom": f"{total_loss_dom / max(total_num, 1):.4f}",
+            "ctr": f"{total_loss_center / max(total_num, 1):.4f}",
+            "acc4": f"{total_correct_4cls / max(total_num, 1):.4f}",
+            "acc2": f"{total_correct_2cls / max(total_num, 1):.4f}",
         })
 
     if total_num == 0:
@@ -491,11 +635,13 @@ def train_one_epoch_comp4(
 
     metrics = {
         "loss": total_loss / total_num,
-        "ce_loss": total_ce / total_num,
-        # "graph_loss": total_graph / total_num,
-        "loss_dom": total_dom_loss / total_num,
+        "loss_4cls": total_loss_4cls / total_num,
+        "loss_2cls": total_loss_2cls / total_num,
+        "loss_dom": total_loss_dom / total_num,
         "loss_center": total_loss_center / total_num,
-        "acc": total_correct / total_num,
+        "acc_4cls": total_correct_4cls / total_num,
+        "acc_2cls": total_correct_2cls / total_num,
+        "acc": total_correct_4cls / total_num,  # 兼容旧接口：acc = 四分类
     }
     return metrics
 
@@ -600,7 +746,8 @@ def intra_class_graph_loss(
 
 def build_class_weights(index_csv: str, subject_ids):
     df = pd.read_csv(index_csv)
-    df = df[df["subject_id"].isin(subject_ids)].reset_index(drop=True)
+    subject_set = {str(s) for s in subject_ids}
+    df = df[df["subject_id"].astype(str).isin(subject_set)].reset_index(drop=True)
 
     counts = df["label4"].value_counts().sort_index()
     counts = counts.reindex([0, 1, 2, 3], fill_value=1)
@@ -619,7 +766,8 @@ def build_diagnosis_class_weights(index_csv: str, subject_ids):
     返回顺序固定为 [class0_weight, class1_weight]。
     """
     df = pd.read_csv(index_csv)
-    df = df[df["subject_id"].isin(subject_ids)].reset_index(drop=True)
+    subject_set = {str(s) for s in subject_ids}
+    df = df[df["subject_id"].astype(str).isin(subject_set)].reset_index(drop=True)
 
     if "diagnosis_label" not in df.columns:
         raise KeyError("index_csv 中缺少 diagnosis_label，无法进行抑郁症/正常人二分类。")
@@ -631,279 +779,6 @@ def build_diagnosis_class_weights(index_csv: str, subject_ids):
     weights = weights / weights.mean()
 
     return torch.tensor(weights.values, dtype=torch.float32)
-
-
-def _move_batch_to_device(batch: dict, device: torch.device) -> dict:
-    return {key: value.to(device) for key, value in batch.items()}
-
-
-def _subject_weight_tensor(subject_ids: torch.Tensor, source_weights: dict[str, float], device) -> torch.Tensor:
-    values = [float(source_weights.get(str(int(s)), 1.0)) for s in subject_ids.detach().cpu()]
-    return torch.tensor(values, dtype=torch.float32, device=device)
-
-
-def build_target_train_loader(
-    target_dataset,
-    batch_size: int,
-    num_workers: int,
-    collate_fn,
-    generator: torch.Generator,
-):
-    """给 SSAS 使用的 target unlabeled loader；验证 loader 仍沿用原 val_loader。"""
-    return DataLoader(
-        target_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        drop_last=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
-        worker_init_fn=seed_worker,
-        generator=generator,
-    )
-
-
-def train_stage1_source_selection(
-    *,
-    index_csv: str,
-    source_dataset,
-    source_loader,
-    target_loader,
-    train_subjects,
-    repeat: int,
-    fold: int,
-    rand: int,
-    save_dir: str,
-    device: torch.device,
-    batch_size: int,
-    num_workers: int,
-    stage1_epochs: int,
-    lr: float,
-    weight_decay: float,
-    topk: int,
-    dropout: float,
-    lambda_dss: float,
-    source_weight_temperature: float,
-):
-    """
-    Stage 1: 训练 F_ss + C_ss + D_ss，并输出 subject-level source_weights。
-
-    这是独立预训练阶段，不改变原来的 final model / best 保存逻辑。
-    """
-    model = SourceSelectionModel(
-        num_source_domains=len(source_dataset.subject_to_domain),
-        topk=topk,
-        dropout=dropout,
-    ).to(device)
-    class_weights = build_diagnosis_class_weights(index_csv, train_subjects).to(device)
-    criterion_cls = torch.nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
-    criterion_domain = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(stage1_epochs, 1))
-
-    target_iter = cycle(target_loader)
-    history = []
-    for epoch in range(1, stage1_epochs + 1):
-        model.train()
-        total = 0
-        total_cls = 0.0
-        total_dom = 0.0
-        correct = 0
-        pbar = tqdm(source_loader, desc=f"SSAS-Stage1 fold{fold} epoch{epoch}", leave=False)
-
-        for source_batch in pbar:
-            target_batch = next(target_iter)
-            source_batch = _move_batch_to_device(source_batch, device)
-            target_batch = _move_batch_to_device(target_batch, device)
-
-            optimizer.zero_grad(set_to_none=True)
-            source_out = model(source_batch["x"], source_batch["de_feat"], lambda_domain=0.0)
-            target_out = model(target_batch["x"], target_batch["de_feat"], lambda_domain=0.0)
-
-            y = source_batch["diagnosis_label"].long()
-            loss_cls = criterion_cls(source_out["diagnosis_logits"], y)
-
-            source_domain = source_batch["domain_id"].long()
-            target_domain = torch.full(
-                (target_batch["x"].size(0),),
-                fill_value=model.target_domain_id,
-                dtype=torch.long,
-                device=device,
-            )
-            domain_logits = torch.cat([source_out["domain_logits"], target_out["domain_logits"]], dim=0)
-            domain_labels = torch.cat([source_domain, target_domain], dim=0)
-            loss_domain = criterion_domain(domain_logits, domain_labels)
-            loss = loss_cls + lambda_dss * loss_domain
-            loss.backward()
-            optimizer.step()
-
-            bsz = y.size(0)
-            total += bsz
-            total_cls += float(loss_cls.item()) * bsz
-            total_dom += float(loss_domain.item()) * bsz
-            correct += int((source_out["diagnosis_logits"].argmax(dim=1) == y).sum().item())
-            pbar.set_postfix({
-                "cls": f"{total_cls / max(total, 1):.4f}",
-                "dom": f"{total_dom / max(total, 1):.4f}",
-            })
-
-        scheduler.step()
-        row = {
-            "epoch": epoch,
-            "cls_loss": total_cls / max(total, 1),
-            "domain_loss": total_dom / max(total, 1),
-            "source_acc": correct / max(total, 1),
-            "lr": optimizer.param_groups[0]["lr"],
-        }
-        history.append(row)
-        print(f"[SSAS Stage1] fold={fold} epoch={epoch}: {row}")
-
-    stage1_path = os.path.join(save_dir, "stage1_source_selection.pt")
-    torch.save({
-        "stage": "stage1_source_selection",
-        "repeat": repeat,
-        "fold": fold,
-        "rand": rand,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "train_subjects": train_subjects,
-        "subject_to_domain": {str(k): int(v) for k, v in source_dataset.subject_to_domain.items()},
-        "config": {
-            "stage1_epochs": stage1_epochs,
-            "lambda_dss": lambda_dss,
-            "source_weight_temperature": source_weight_temperature,
-        },
-    }, stage1_path)
-    pd.DataFrame(history).to_csv(
-        os.path.join(save_dir, "history_stage1.csv"),
-        index=False,
-        encoding="utf-8-sig",
-    )
-
-    source_weights = compute_source_weights(
-        model=model,
-        source_dataset=source_dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        device=device,
-        temperature=source_weight_temperature,
-    )
-    source_weights_path = os.path.join(save_dir, "source_weights.json")
-    save_json(source_weights_path, source_weights)
-    print(f"[SSAS Stage1] saved source weights: {source_weights_path}")
-    return source_weights["weights_mean_one"]
-
-
-@torch.no_grad()
-def compute_source_weights(
-    *,
-    model: SourceSelectionModel,
-    source_dataset,
-    batch_size: int,
-    num_workers: int,
-    device: torch.device,
-    temperature: float,
-) -> dict:
-    model.eval()
-    loader = DataLoader(
-        source_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=comp4_collate_fn,
-    )
-    sums: dict[str, float] = {}
-    counts: dict[str, int] = {}
-    for batch in loader:
-        batch = _move_batch_to_device(batch, device)
-        out = model(batch["x"], batch["de_feat"], lambda_domain=0.0)
-        target_probs = torch.softmax(out["domain_logits"], dim=1)[:, model.target_domain_id]
-        for subject_id, prob in zip(batch["subject_id"].detach().cpu().tolist(), target_probs.detach().cpu().tolist()):
-            key = str(int(subject_id))
-            sums[key] = sums.get(key, 0.0) + float(prob)
-            counts[key] = counts.get(key, 0) + 1
-
-    subjects = sorted(sums.keys(), key=lambda x: int(x))
-    raw_scores = np.array([sums[s] / max(counts[s], 1) for s in subjects], dtype=np.float64)
-    tau = max(float(temperature), 1e-6)
-    logits = raw_scores / tau
-    logits = logits - logits.max()
-    weights = np.exp(logits)
-    weights = weights / max(weights.sum(), 1e-12)
-    weights_mean_one = {s: float(w * len(subjects)) for s, w in zip(subjects, weights)}
-    return {
-        "type": "subject_level_target_probability_softmax",
-        "temperature": float(temperature),
-        "raw_target_scores": {s: float(v) for s, v in zip(subjects, raw_scores)},
-        "weights_mean_one": weights_mean_one,
-    }
-
-
-def train_one_epoch_ssas(
-    model,
-    source_loader,
-    target_loader,
-    optimizer,
-    criterion_ce,
-    domain_criterion,
-    device,
-    source_weights: dict[str, float],
-    lambda_adv: float = 0.1,
-    grl_domain: float = 0.1,
-    lambda_mmd: float = 0.0,
-):
-    """Stage 2/3: weighted source CE + GRL adversarial (+ optional MMD)."""
-    model.train()
-    target_iter = cycle(target_loader)
-    total = 0
-    sums = {
-        "loss": 0.0,
-        "ce_loss": 0.0,
-        "loss_dom": 0.0,
-        "mmd_loss": 0.0,
-        "acc": 0.0,
-    }
-    pbar = tqdm(source_loader, desc="Train-SSAS", leave=False)
-
-    for source_batch in pbar:
-        target_batch = next(target_iter)
-        source_batch = _move_batch_to_device(source_batch, device)
-        target_batch = _move_batch_to_device(target_batch, device)
-
-        optimizer.zero_grad(set_to_none=True)
-        source_out = model(source_batch["x"], source_batch["de_feat"], lambda_domain=grl_domain)
-        target_out = model(target_batch["x"], target_batch["de_feat"], lambda_domain=grl_domain)
-
-        y = source_batch["diagnosis_label"].long()
-        sample_ce = criterion_ce(source_out["diagnosis_logits"], y)
-        sample_weights = _subject_weight_tensor(source_batch["subject_id"], source_weights, device)
-        loss_ce = (sample_ce * sample_weights).mean()
-
-        source_domain = torch.zeros(source_batch["x"].size(0), dtype=torch.long, device=device)
-        target_domain = torch.ones(target_batch["x"].size(0), dtype=torch.long, device=device)
-        domain_logits = torch.cat([source_out["domain_logits"], target_out["domain_logits"]], dim=0)
-        domain_labels = torch.cat([source_domain, target_domain], dim=0)
-        loss_dom = domain_criterion(domain_logits, domain_labels)
-
-        loss_mmd = mmd_loss(source_out["z"], target_out["z"]) if lambda_mmd > 0 else source_out["z"].new_tensor(0.0)
-        loss = loss_ce + lambda_adv * loss_dom + lambda_mmd * loss_mmd
-        loss.backward()
-        optimizer.step()
-
-        bsz = y.size(0)
-        total += bsz
-        sums["loss"] += float(loss.item()) * bsz
-        sums["ce_loss"] += float(loss_ce.item()) * bsz
-        sums["loss_dom"] += float(loss_dom.item()) * bsz
-        sums["mmd_loss"] += float(loss_mmd.item()) * bsz
-        sums["acc"] += int((source_out["diagnosis_logits"].argmax(dim=1) == y).sum().item())
-        pbar.set_postfix({
-            "loss": f"{sums['loss'] / max(total, 1):.4f}",
-            "mmd": f"{sums['mmd_loss'] / max(total, 1):.4f}",
-        })
-
-    return {key: value / max(total, 1) for key, value in sums.items()}
 
 
 class RelationCosineContrastLoss(torch.nn.Module):
@@ -1000,14 +875,14 @@ class ClassCenterContrastLoss(torch.nn.Module):
     类中心对比 CE / Prototype CE。
 
     作用：
-        1. 将融合特征 z 投影到对比空间；
+        1. 将特征 z 投影到对比空间；
         2. 维护 num_classes 个可学习类中心；
         3. 用 cosine(z, center) / tau 得到 center_logits；
-        4. 对 center_logits 和 diagnosis_label 做 CE。
+        4. 对 center_logits 和 labels 做 CE。
 
-    对二分类诊断：
-        center_0: 诊断类别0中心
-        center_1: 诊断类别1中心
+    对情绪二分类：
+        center_0: 中性情绪中心
+        center_1: 正性情绪中心
     """
 
     def __init__(
@@ -1040,7 +915,7 @@ class ClassCenterContrastLoss(torch.nn.Module):
     def forward(self, features, labels):
         """
         features: [B, in_dim]，建议传 out["graph_feat"]
-        labels:   [B]，diagnosis_label
+        labels:   [B]，情绪二分类标签 (0=中性, 1=正性)
         """
         z = self.projector(features)
         z = F.normalize(z, dim=1)
@@ -1072,11 +947,10 @@ class ClassCenterContrastLoss(torch.nn.Module):
 
 def compute_trial_level_metrics(segment_records, threshold=0.5, vote_method="hard"):
     """
-    根据 segment 级预测结果聚合成 trial 级二分类结果。
+    将 segment 级预测聚合成 trial 级情绪二分类结果。
 
-    对 nclass=2 的诊断任务：
-        pred_emo / label_emo 实际表示 pred_diag / label_diag。
-        prob_pos 实际表示类别 1 的概率，比如 P(DEP) 或 P(HC)，取决于你的 diagnosis_label 编码。
+    情绪二分类: 0=中性, 1=正性。
+    使用二分类头概率 prob_emo2 和预测 pred_emo。
     """
     trial_dict = defaultdict(list)
 
@@ -1090,7 +964,7 @@ def compute_trial_level_metrics(segment_records, threshold=0.5, vote_method="har
     trial_keys = []
 
     for key, records in trial_dict.items():
-        probs = [float(r["prob_pos"]) for r in records]
+        probs = [float(r["prob_emo2"]) for r in records]    # 二分类头正性概率
         preds = [int(r["pred_emo"]) for r in records]
         labels = [int(r["label_emo"]) for r in records]
 
@@ -1137,12 +1011,169 @@ def compute_trial_level_metrics(segment_records, threshold=0.5, vote_method="har
     }
 
 
+def apply_subject_topk_prediction(trial_score_records, k_pos=4):
+    """
+    输入每个 trial 的 subject_id、trial_id、score_pos、prob_pos。
+    对每个 subject 内部按 score_pos 排序，top k_pos 判为 1，其余判为 0。
+
+    Returns
+    -------
+    list[dict]，每条记录包含 Emotion_label，可直接供测试集提交逻辑复用。
+    """
+    subject_trials = defaultdict(list)
+    for r in trial_score_records:
+        rec = dict(r)
+        rec["subject_id"] = int(rec.get("subject_id", rec.get("user_id")))
+        rec["trial_id"] = int(rec["trial_id"])
+        rec["score_pos"] = float(rec.get("score_pos", rec.get("prob_pos", 0.0)))
+        if "prob_pos" in rec:
+            rec["prob_pos"] = float(rec["prob_pos"])
+        subject_trials[rec["subject_id"]].append(rec)
+
+    results = []
+    for subject_id, records in subject_trials.items():
+        records = sorted(records, key=lambda x: x["score_pos"], reverse=True)
+        cur_k = int(k_pos) if len(records) == 8 else int(round(len(records) * 0.5))
+        cur_k = max(0, min(cur_k, len(records)))
+        positive_keys = {(r["subject_id"], r["trial_id"]) for r in records[:cur_k]}
+
+        for r in records:
+            out = dict(r)
+            out["Emotion_label"] = 1 if (r["subject_id"], r["trial_id"]) in positive_keys else 0
+            results.append(out)
+
+    return sorted(results, key=lambda x: (x["subject_id"], x["trial_id"]))
+
+
+def compute_subject_topk_trial_metrics(
+    segment_records,
+    k_pos=4,
+    score_key="score_pos",
+    fallback_prob_key="prob_pos",
+):
+    """
+    先 window -> trial 聚合，再在每个 subject 内做 top-k。
+
+    每个 subject 的 trial_score 最高的 k_pos 个 trial 判为 positive，其余为 neutral。
+    若某个 subject 的 trial 数不是 8，则 cur_k = round(num_trials * 0.5)。
+    """
+    trial_dict = defaultdict(list)
+    for r in segment_records:
+        key = (int(r["subject_id"]), int(r["trial_id"]))
+        trial_dict[key].append(r)
+
+    trial_score_records = []
+    for (subject_id, trial_id), records in trial_dict.items():
+        scores = [
+            float(r[score_key] if score_key in r else r.get(fallback_prob_key, r.get("prob_emo2", 0.0)))
+            for r in records
+        ]
+        probs = [float(r.get(fallback_prob_key, r.get("prob_emo2", 0.0))) for r in records]
+        labels = [int(r["label_emo"]) for r in records]
+        trial_score_records.append({
+            "subject_id": int(subject_id),
+            "trial_id": int(trial_id),
+            "score_pos": float(np.mean(scores)),
+            "prob_pos": float(np.mean(probs)),
+            "label_emo": int(round(float(np.mean(labels)))),
+        })
+
+    topk_records = apply_subject_topk_prediction(trial_score_records, k_pos=k_pos)
+    label_map = {
+        (int(r["subject_id"]), int(r["trial_id"])): int(r["label_emo"])
+        for r in trial_score_records
+    }
+    score_map = {
+        (int(r["subject_id"]), int(r["trial_id"])): float(r["score_pos"])
+        for r in trial_score_records
+    }
+    prob_map = {
+        (int(r["subject_id"]), int(r["trial_id"])): float(r["prob_pos"])
+        for r in trial_score_records
+    }
+
+    topk_trial_keys = []
+    topk_trial_scores = []
+    topk_trial_probs = []
+    topk_trial_preds = []
+    topk_trial_labels = []
+
+    for r in topk_records:
+        key = (int(r["subject_id"]), int(r["trial_id"]))
+        topk_trial_keys.append(key)
+        topk_trial_scores.append(score_map[key])
+        topk_trial_probs.append(prob_map[key])
+        topk_trial_preds.append(int(r["Emotion_label"]))
+        topk_trial_labels.append(label_map[key])
+
+    if len(topk_trial_labels) == 0:
+        return {
+            "topk_trial_acc": 0.0,
+            "topk_trial_macro_f1": 0.0,
+            "topk_trial_confusion_matrix": np.zeros((2, 2), dtype=int),
+            "topk_trial_per_class": {},
+            "topk_trial_keys": [],
+            "topk_trial_scores": [],
+            "topk_trial_probs": [],
+            "topk_trial_preds": [],
+            "topk_trial_labels": [],
+            "topk_subject_gap_mean": 0.0,
+            "topk_subject_gap_std": 0.0,
+        }
+
+    topk_trial_acc = accuracy_score(topk_trial_labels, topk_trial_preds)
+    topk_trial_macro_f1 = f1_score(
+        topk_trial_labels,
+        topk_trial_preds,
+        average="macro",
+        labels=[0, 1],
+        zero_division=0,
+    )
+    topk_trial_cm = confusion_matrix(topk_trial_labels, topk_trial_preds, labels=[0, 1])
+    p, r, f1, s = precision_recall_fscore_support(
+        topk_trial_labels,
+        topk_trial_preds,
+        labels=[0, 1],
+        zero_division=0,
+    )
+    topk_trial_per_class = {
+        int(c): {"precision": float(p[i]), "recall": float(r[i]), "f1": float(f1[i]), "support": int(s[i])}
+        for i, c in enumerate([0, 1])
+    }
+
+    gaps = []
+    by_subject = defaultdict(list)
+    for key, score, pred in zip(topk_trial_keys, topk_trial_scores, topk_trial_preds):
+        subject_id, trial_id = key
+        by_subject[int(subject_id)].append((int(trial_id), float(score), int(pred)))
+
+    for records in by_subject.values():
+        pos_scores = [score for _tid, score, pred in records if pred == 1]
+        neg_scores = [score for _tid, score, pred in records if pred == 0]
+        if len(pos_scores) > 0 and len(neg_scores) > 0:
+            gaps.append(float(np.mean(pos_scores) - np.mean(neg_scores)))
+
+    return {
+        "topk_trial_acc": topk_trial_acc,
+        "topk_trial_macro_f1": topk_trial_macro_f1,
+        "topk_trial_confusion_matrix": topk_trial_cm,
+        "topk_trial_per_class": topk_trial_per_class,
+        "topk_trial_keys": topk_trial_keys,
+        "topk_trial_scores": topk_trial_scores,
+        "topk_trial_probs": topk_trial_probs,
+        "topk_trial_preds": topk_trial_preds,
+        "topk_trial_labels": topk_trial_labels,
+        "topk_subject_gap_mean": float(np.mean(gaps)) if len(gaps) > 0 else 0.0,
+        "topk_subject_gap_std": float(np.std(gaps)) if len(gaps) > 0 else 0.0,
+    }
+
+
 def compute_subject_level_metrics(segment_records, threshold=0.5, vote_method="trial_hard"):
     """
-    将 segment 预测进一步聚合到 subject 级。
+    将 segment 预测进一步聚合到 subject 级情绪二分类。
 
-    诊断二分类本质上是被试级任务，因此 subject_acc / subject_macro_f1
-    比 segment_acc 或 trial_acc 更接近最终任务目标。
+    subject_acc / subject_macro_f1 比 segment 或 trial 级指标
+    更能反映模型在被试层面的泛化能力。
 
     聚合方式：
         1. 先按 trial 聚合 segment。
@@ -1426,7 +1457,7 @@ def save_best_checkpoint(
     """
     os.makedirs(save_dir, exist_ok=True)
 
-    model_file = "diag_best.pt" if best_name == "combined" else f"best_{best_name}_fold{fold}.pt"
+    model_file = "best.pt" if best_name in ["combined", "trial_f1"] else f"best_{best_name}_fold{fold}.pt"
     ckpt_path = os.path.join(save_dir, model_file)
     json_path = os.path.join(save_dir, f"best_{best_name}_fold{fold}_metrics.json")
     csv_path = os.path.join(save_dir, f"best_{best_name}_fold{fold}_summary.csv")
@@ -1483,16 +1514,15 @@ def train_competition_cross_subject(
     save_dir: str,
     dataset,
     rand,
-    repeat_index: int | None = None,
-    nclass: int = 4,
     n_splits: int = 5,
     epochs: int = 50,
     batch_size: int = 256,
     lr: float = 1e-4,
     weight_decay: float = 1e-4,
     num_workers: int = 4,
+    lambda_diag: float = 1.0,
     lambda_graph: float = 0.1,
-    lambda_dom: float = 1.0,
+    lambda_domain: float = 0.0,
     grl_domain: float = 0.1,
     lambda_con: float = 0.05,
     device: str = "cuda",
@@ -1501,24 +1531,22 @@ def train_competition_cross_subject(
     early_stop_patience: int = 20,
     early_stop_warmup: int = 15,
     early_stop_min_delta: float = 1e-6,
-    early_stop_track: str = "combined",
-
-        # 新增
+    early_stop_track: str = "trial_f1",
+    # 类中心损失
     lambda_center: float = 0.0,
     center_tau: float = 0.1,
     center_dim: int = 64,
     center_warmup_epochs: int = 10,
-
-    # SSAS 新增参数：尽量只改变训练 epoch，不改变验证/保存/early stopping 框架
-    ssas_stage1_epochs: int = 20,
-    ssas_lambda_dss: float = 0.2,
-    ssas_lambda_adv: float = 0.1,
-    ssas_grl_domain: float = 0.1,
-    ssas_lambda_mmd: float = 0.0,
-    ssas_source_weight_temperature: float = 0.05,
+    use_subject_relative_de: bool = True,
+    use_subject_relative_bio: bool = True,
+    bio_abs_scale: float = 0.3,
+    relative_eps: float = 1e-6,
 ):
     """
-    跨被试训练。
+    双任务跨被试训练（TwoBranchModel）。
+
+    L = L_4cls(z_conv, label4) + λ_diag × L_2cls(z_diag, emotion_binary)
+        + λ_domain × L_domain + λ_center × L_center
     """
     os.makedirs(save_dir, exist_ok=True)
 
@@ -1615,37 +1643,88 @@ def train_competition_cross_subject(
         generator=loader_generator,
     )
 
-    # SSAS target unlabeled loader：只用于 Stage1/Stage2/Stage3 训练，不改变原 val_loader。
-    target_train_loader = build_target_train_loader(
-        target_dataset=val_dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        collate_fn=collate_fn,
-        generator=loader_generator,
+    use_subject_relative_de = bool(use_subject_relative_de and getattr(model, "use_subject_relative_de", False))
+    use_subject_relative_bio = bool(use_subject_relative_bio and getattr(model, "use_subject_relative_bio", False))
+    print(
+        f"[Subject Relative] DE={use_subject_relative_de}, "
+        f"bio={use_subject_relative_bio}, bio_abs_scale={bio_abs_scale}, eps={relative_eps}"
     )
+
+    subject_de_mu = subject_de_std = None
+    subject_bio_mu = subject_bio_std = None
+    val_subject_de_mu = val_subject_de_std = None
+    val_subject_bio_mu = val_subject_bio_std = None
+
+    if use_subject_relative_de or use_subject_relative_bio:
+        train_baseline_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False,
+            collate_fn=collate_fn,
+            worker_init_fn=seed_worker,
+        )
+        val_baseline_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False,
+            collate_fn=collate_fn,
+            worker_init_fn=seed_worker,
+        )
+    else:
+        train_baseline_loader = val_baseline_loader = None
+
+    if use_subject_relative_de:
+        print("[Subject Relative] computing train/val DE baselines from each split itself...")
+        subject_de_mu, subject_de_std = compute_subject_de_baselines(train_dataset, eps=relative_eps)
+        val_subject_de_mu, val_subject_de_std = compute_subject_de_baselines(val_dataset, eps=relative_eps)
+
+    if use_subject_relative_bio:
+        print("[Subject Relative] computing train/val bio baselines with model forward, labels are not used...")
+        subject_bio_mu, subject_bio_std = compute_subject_bio_baselines(
+            model,
+            train_baseline_loader,
+            device,
+            subject_de_mu=subject_de_mu,
+            subject_de_std=subject_de_std,
+            eps=relative_eps,
+        )
+        val_subject_bio_mu, val_subject_bio_std = compute_subject_bio_baselines(
+            model,
+            val_baseline_loader,
+            device,
+            subject_de_mu=val_subject_de_mu,
+            subject_de_std=val_subject_de_std,
+            eps=relative_eps,
+        )
 
     # -------- loss --------
-    if nclass == 4:
-        class_weights = build_class_weights(index_csv, train_subjects).to(device)
-    else:
-        class_weights = build_diagnosis_class_weights(index_csv, train_subjects).to(device)
-
-    print(f"[Class weights] nclass={nclass}, weights={class_weights.detach().cpu().numpy().tolist()}")
-    criterion_ce = torch.nn.CrossEntropyLoss(
-        weight=class_weights,
+    # 四分类情绪 loss（带类别权重）
+    class_weights_4cls = build_class_weights(index_csv, train_subjects).to(device)
+    print(f"[Class weights 4cls] weights={class_weights_4cls.detach().cpu().numpy().tolist()}")
+    criterion_4cls = torch.nn.CrossEntropyLoss(
+        weight=class_weights_4cls,
         label_smoothing=0.05,
     )
-    criterion_ce_train = torch.nn.CrossEntropyLoss(
-        weight=class_weights,
+
+    # 二分类情绪 loss（带类别权重：0=中性, 1=正性）
+    class_weights_2cls = build_emotion_class_weights(index_csv, train_subjects).to(device)
+    print(f"[Class weights 2cls (emotion)] weights={class_weights_2cls.detach().cpu().numpy().tolist()}")
+    criterion_2cls = torch.nn.CrossEntropyLoss(
+        weight=class_weights_2cls,
         label_smoothing=0.05,
-        reduction="none",
     )
 
     dom_criterion = torch.nn.CrossEntropyLoss()
     center_criterion = ClassCenterContrastLoss(
-        in_dim=model.in_dim if hasattr(model, "in_dim") else 192,
+        in_dim=model.diag_dim if hasattr(model, "diag_dim") else 128,
         proj_dim=64,
-        num_classes=nclass,
+        num_classes=2,
         tau=center_tau,
         dropout=0.2,
         label_smoothing=0.0,
@@ -1668,20 +1747,20 @@ def train_competition_cross_subject(
         T_max=epochs,
     )
 
-    config = {
+    config_dict = {
         "index_csv": index_csv,
         "fold": fold,
         "rand": rand,
         "run_seed": run_seed,
         "deterministic": deterministic,
-        "nclass": nclass,
         "n_splits": n_splits,
         "epochs": epochs,
         "batch_size": batch_size,
         "lr": lr,
         "weight_decay": weight_decay,
+        "lambda_diag": lambda_diag,
         "lambda_graph": lambda_graph,
-        "lambda_dom": lambda_dom,
+        "lambda_domain": lambda_domain,
         "grl_domain": grl_domain,
         "lambda_con": lambda_con,
         "dataset": dataset,
@@ -1693,46 +1772,53 @@ def train_competition_cross_subject(
         "center_tau": center_tau,
         "center_dim": center_dim,
         "center_warmup_epochs": center_warmup_epochs,
-        "ssas_stage1_epochs": ssas_stage1_epochs,
-        "ssas_lambda_dss": ssas_lambda_dss,
-        "ssas_lambda_adv": ssas_lambda_adv,
-        "ssas_grl_domain": ssas_grl_domain,
-        "ssas_lambda_mmd": ssas_lambda_mmd,
-        "ssas_source_weight_temperature": ssas_source_weight_temperature,
+        "use_subject_relative_de": use_subject_relative_de,
+        "use_subject_relative_bio": use_subject_relative_bio,
+        "bio_abs_scale": bio_abs_scale,
+        "relative_eps": relative_eps,
+        "num_subjects": model.domain_head.num_subjects if hasattr(model, "domain_head") else 48,
     }
-
-    print("\n" + "=" * 60)
-    print("[SSAS] Stage 1: source selection")
-    print("=" * 60)
-    source_weights = train_stage1_source_selection(
-        index_csv=index_csv,
-        source_dataset=train_dataset,
-        source_loader=train_loader,
-        target_loader=target_train_loader,
-        train_subjects=train_subjects,
-        repeat=-1 if repeat_index is None else int(repeat_index),
-        fold=fold,
-        rand=rand,
-        save_dir=save_dir,
-        device=device,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        stage1_epochs=ssas_stage1_epochs,
-        lr=lr,
-        weight_decay=weight_decay,
-        topk=6,
-        dropout=0.2,
-        lambda_dss=ssas_lambda_dss,
-        source_weight_temperature=ssas_source_weight_temperature,
-    )
-    print("[SSAS] source_weights preview:", list(source_weights.items())[:8])
 
     # -------- 并列保存多个最优模型 --------
     best_trackers = {
         "combined": {
             "criteria": [
-                ("subject_macro_f1", "max"),
-                ("subject_acc", "max"),
+                ("topk_trial_macro_f1", "max"),
+                ("topk_trial_acc", "max"),
+                ("trial_macro_f1", "max"),
+                ("trial_acc", "max"),
+                ("emotion_macro_f1", "max"),
+                ("emotion_acc", "max"),
+                ("loss", "min"),
+            ],
+            "best_metrics": None,
+            "best_epoch": None,
+            "checkpoint_path": None,
+        },
+        "topk_trial_f1": {
+            "criteria": [
+                ("topk_trial_macro_f1", "max"),
+                ("topk_trial_acc", "max"),
+                ("topk_subject_gap_mean", "max"),
+                ("loss", "min"),
+            ],
+            "best_metrics": None,
+            "best_epoch": None,
+            "checkpoint_path": None,
+        },
+        "topk_trial_acc": {
+            "criteria": [
+                ("topk_trial_acc", "max"),
+                ("topk_trial_macro_f1", "max"),
+                ("topk_subject_gap_mean", "max"),
+                ("loss", "min"),
+            ],
+            "best_metrics": None,
+            "best_epoch": None,
+            "checkpoint_path": None,
+        },
+        "trial_f1": {
+            "criteria": [
                 ("trial_macro_f1", "max"),
                 ("trial_acc", "max"),
                 ("emotion_macro_f1", "max"),
@@ -1745,26 +1831,13 @@ def train_competition_cross_subject(
             "best_epoch": None,
             "checkpoint_path": None,
         },
-        "trial_f1": {
-            "criteria": [
-                ("trial_macro_f1", "max"),
-                ("trial_acc", "max"),
-                ("subject_macro_f1", "max"),
-                ("subject_acc", "max"),
-                ("emotion_macro_f1", "max"),
-                ("loss", "min"),
-            ],
-            "best_metrics": None,
-            "best_epoch": None,
-            "checkpoint_path": None,
-        },
         "trial_acc": {
             "criteria": [
                 ("trial_acc", "max"),
                 ("trial_macro_f1", "max"),
-                ("subject_acc", "max"),
-                ("subject_macro_f1", "max"),
                 ("emotion_acc", "max"),
+                ("emotion_macro_f1", "max"),
+                ("acc", "max"),
                 ("loss", "min"),
             ],
             "best_metrics": None,
@@ -1823,28 +1896,39 @@ def train_competition_cross_subject(
     for epoch in range(1, epochs + 1):
         print(f"\n===== Epoch {epoch}/{epochs} =====")
 
-        train_metrics = train_one_epoch_ssas(
+        train_metrics = train_one_epoch_two_branch(
             model=model,
-            source_loader=train_loader,
-            target_loader=target_train_loader,
+            loader=train_loader,
             optimizer=optimizer,
-            criterion_ce=criterion_ce_train,
-            domain_criterion=dom_criterion,
+            criterion_4cls=criterion_4cls,
+            criterion_2cls=criterion_2cls,
+            dom_criterion=dom_criterion,
             device=device,
-            source_weights=source_weights,
-            lambda_adv=ssas_lambda_adv,
-            grl_domain=ssas_grl_domain,
-            lambda_mmd=ssas_lambda_mmd,
+            lambda_diag=lambda_diag,
+            lambda_domain=lambda_domain,
+            grl_domain=grl_domain,
+            center_criterion=center_criterion,
+            lambda_center=lambda_center,
+            center_warmup_epochs=center_warmup_epochs,
+            current_epoch=epoch,
+            subject_de_mu=subject_de_mu,
+            subject_de_std=subject_de_std,
+            subject_bio_mu=subject_bio_mu,
+            subject_bio_std=subject_bio_std,
         )
 
-        val_metrics = validate_one_epoch_comp4(
+        val_metrics = validate_one_epoch_two_branch(
             model=model,
             loader=val_loader,
-            nclass=nclass,
-            criterion_ce=criterion_ce,
-            contrast_criterion=None,   # 当前验证 loss 中不使用
+            criterion_4cls=criterion_4cls,
+            criterion_2cls=criterion_2cls,
             device=device,
+            lambda_diag=lambda_diag,
             lambda_graph=lambda_graph,
+            subject_de_mu=val_subject_de_mu,
+            subject_de_std=val_subject_de_std,
+            subject_bio_mu=val_subject_bio_mu,
+            subject_bio_std=val_subject_bio_std,
         )
 
         scheduler.step()
@@ -1852,24 +1936,26 @@ def train_competition_cross_subject(
 
         print(
             f"[Train] loss={train_metrics['loss']:.4f} "
-            f"ce={train_metrics['ce_loss']:.4f} "
-            f"loss_dom={train_metrics['loss_dom']:.4f} "
-            f"mmd={train_metrics['mmd_loss']:.4f} "
-            f"acc={train_metrics['acc']:.4f}"
+            f"L4={train_metrics['loss_4cls']:.4f} "
+            f"L2={train_metrics['loss_2cls']:.4f} "
+            f"dom={train_metrics['loss_dom']:.4f} "
+            f"ctr={train_metrics['loss_center']:.4f} "
+            f"acc4={train_metrics['acc_4cls']:.4f} "
+            f"acc2={train_metrics['acc_2cls']:.4f}"
         )
         print(
             f"[Val]   loss={val_metrics['loss']:.4f} "
-            f"ce={val_metrics['ce_loss']:.4f} "
-            f"graph={val_metrics['graph_loss']:.4f} "
-            f"contrast_loss={val_metrics['contrast_loss']:.4f} "
-            f"acc4={val_metrics['acc']:.4f} "
-            f"macro_f1_4={val_metrics['macro_f1']:.4f} "
-            f"seg_diag_acc={val_metrics['emotion_acc']:.4f} "
-            f"seg_diag_f1={val_metrics['emotion_macro_f1']:.4f} "
-            f"trial_diag_acc={val_metrics['trial_acc']:.4f} "
-            f"trial_diag_f1={val_metrics['trial_macro_f1']:.4f} "
-            f"subject_diag_acc={val_metrics['subject_acc']:.4f} "
-            f"subject_diag_f1={val_metrics['subject_macro_f1']:.4f}"
+            f"L4={val_metrics['ce_loss_4cls']:.4f} "
+            f"L2={val_metrics['ce_loss_2cls']:.4f} "
+            f"acc4={val_metrics['acc_4cls']:.4f} "
+            f"f1_4={val_metrics['macro_f1_4cls']:.4f} "
+            f"seg_emo_acc={val_metrics['emotion_acc']:.4f} "
+            f"seg_emo_f1={val_metrics['emotion_macro_f1']:.4f} "
+            f"trial_emo_acc={val_metrics['trial_acc']:.4f} "
+            f"trial_emo_f1={val_metrics['trial_macro_f1']:.4f} "
+            f"topk_trial_acc={val_metrics['topk_trial_acc']:.4f} "
+            f"topk_trial_f1={val_metrics['topk_trial_macro_f1']:.4f} "
+            f"topk_gap={val_metrics['topk_subject_gap_mean']:.4f}"
         )
 
         hist_row = {
@@ -1904,7 +1990,7 @@ def train_competition_cross_subject(
                     train_subjects=train_subjects,
                     val_subjects=val_subjects,
                     criteria=criteria,
-                    config=config,
+                    config=config_dict,
                 )
 
                 tracker["best_metrics"] = copy.deepcopy(val_metrics)
@@ -1940,7 +2026,7 @@ def train_competition_cross_subject(
                 "stop_epoch": epoch,
                 "early_stop_track": early_stop_track,
                 "early_stopper": early_stopper.state_dict(),
-                "config": config,
+                "config": config_dict,
             })
             print(f"早停信息已保存到: {early_stop_json}")
             break
@@ -1949,7 +2035,7 @@ def train_competition_cross_subject(
     save_json(early_stop_state_json, {
         "early_stop_track": early_stop_track,
         "early_stopper": early_stopper.state_dict(),
-        "config": config,
+        "config": config_dict,
     })
     print(f"Early stopping 状态已保存到: {early_stop_state_json}")
 
@@ -1989,32 +2075,275 @@ def train_competition_cross_subject(
 
 
 # =========================================================
+# Emotion class weights（从 label4 推算情绪二分类权重）
+# =========================================================
+
+def build_emotion_class_weights(index_csv: str, subject_ids):
+    """
+    从 label4 列推算情绪二分类 (0=中性, 1=正性) 的类别权重。
+
+    label4: 0=DEP_neu, 1=DEP_pos, 2=HC_neu, 3=HC_pos
+    emotion = label4 % 2: 0=中性, 1=正性
+    """
+    df = pd.read_csv(index_csv)
+    subject_set = {str(s) for s in subject_ids}
+    df = df[df["subject_id"].astype(str).isin(subject_set)].reset_index(drop=True)
+
+    if "label4" not in df.columns:
+        raise KeyError("index_csv 中缺少 label4 列。")
+
+    emotion_labels = df["label4"].astype(int) % 2
+    counts = emotion_labels.value_counts().sort_index()
+    counts = counts.reindex([0, 1], fill_value=1)
+
+    weights = counts.sum() / counts
+    weights = weights / weights.mean()
+
+    return torch.tensor(weights.values, dtype=torch.float32)
+
+
+# =========================================================
+# Test prediction
+# =========================================================
+
+@torch.no_grad()
+def predict_test_trial(
+    model,
+    test_csv: str,
+    device: torch.device,
+    batch_size: int = 128,
+    num_workers: int = 4,
+    root: Path = ROOT,
+) -> pd.DataFrame:
+    """
+    用单个 model 对测试集做 trial 级情绪二分类预测。
+
+    Returns
+    -------
+    pd.DataFrame with columns: [user_id, trial_id, prob_pos, pred_emotion]
+    """
+    from utils.data import expand_window_index
+
+    model.eval()
+
+    # 加载测试 CSV，展开窗口索引
+    test_df = pd.read_csv(test_csv)
+    id_col = "user_id" if "user_id" in test_df.columns else "subject_id"
+    print(f"[predict_test] test samples: {len(test_df)}, id_col={id_col}")
+
+    test_df = expand_window_index(test_df, root=root)
+    print(f"[predict_test] expanded windows: {len(test_df)}")
+
+    # 构造无标签 dataset
+    dataset = EEGWindowDataset(
+        test_df.reset_index(drop=True),
+        label_col=None,
+        root=root,
+        return_de=True,
+    )
+
+    # 简易 dict collate：EEGWindowDataset 返回 dict，需要自定义 collate
+    from torch.utils.data._utils.collate import default_collate
+
+    def _dict_collate(batch_list):
+        keys = list(batch_list[0].keys())
+        return {k: default_collate([b[k] for b in batch_list]) for k in keys}
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=_dict_collate,
+    )
+
+    subject_de_mu = subject_de_std = None
+    subject_bio_mu = subject_bio_std = None
+    if getattr(model, "use_subject_relative_de", False) or getattr(model, "use_subject_relative_bio", False):
+        print("[predict_test] computing test subject baselines from test windows only...")
+        if getattr(model, "use_subject_relative_de", False):
+            subject_de_mu, subject_de_std = compute_subject_de_baselines(dataset)
+        if getattr(model, "use_subject_relative_bio", False):
+            subject_bio_mu, subject_bio_std = compute_subject_bio_baselines(
+                model,
+                loader,
+                device,
+                subject_de_mu=subject_de_mu,
+                subject_de_std=subject_de_std,
+            )
+
+    all_user_ids = []
+    all_trial_ids = []
+    all_probs = []
+    all_scores = []
+
+    for batch in tqdm(loader, desc="Test-Pred", leave=False):
+        x = batch["x"].to(device)
+        de_feat = batch["de_feat"].to(device)
+        subject_ids_cpu = batch["subject_id"]
+        subject_de_mu_batch = gather_subject_baseline(subject_ids_cpu, subject_de_mu, device, dtype=de_feat.dtype)
+        subject_de_std_batch = gather_subject_baseline(subject_ids_cpu, subject_de_std, device, dtype=de_feat.dtype)
+        subject_bio_mu_batch = gather_subject_baseline(subject_ids_cpu, subject_bio_mu, device, dtype=de_feat.dtype)
+        subject_bio_std_batch = gather_subject_baseline(subject_ids_cpu, subject_bio_std, device, dtype=de_feat.dtype)
+
+        out = model(
+            x,
+            de_feat,
+            lambda_dom=0.0,
+            dataset_name="comp4",
+            subject_de_mu=subject_de_mu_batch,
+            subject_de_std=subject_de_std_batch,
+            subject_bio_mu=subject_bio_mu_batch,
+            subject_bio_std=subject_bio_std_batch,
+        )
+        logits_2cls = out["logits_2cls"]                          # [B, 2]
+        prob_pos = torch.softmax(logits_2cls, dim=1)[:, 1]        # P(正性情绪)
+        score_pos = logits_2cls[:, 1] - logits_2cls[:, 0]
+
+        user_key = id_col if id_col in batch else "subject_id"
+        user_ids = batch[user_key].detach().cpu().numpy()
+        trial_ids = batch["trial_id"].detach().cpu().numpy()
+        probs = prob_pos.detach().cpu().numpy()
+        scores = score_pos.detach().cpu().numpy()
+
+        all_user_ids.extend(user_ids.tolist())
+        all_trial_ids.extend(trial_ids.tolist())
+        all_probs.extend(probs.tolist())
+        all_scores.extend(scores.tolist())
+
+    # 聚合到 trial 级（同 trial 内窗口取均值）
+    pred_df = pd.DataFrame({
+        "user_id": all_user_ids,
+        "trial_id": all_trial_ids,
+        "prob_window": all_probs,
+        "score_window": all_scores,
+    })
+
+    trial_pred = (
+        pred_df.groupby(["user_id", "trial_id"], as_index=False)
+        .agg(prob_pos=("prob_window", "mean"), score_pos=("score_window", "mean"), n_windows=("prob_window", "count"))
+    )
+    trial_pred["pred_emotion"] = (trial_pred["prob_pos"] >= 0.5).astype(int)
+
+    print(f"[predict_test] trial predictions: {len(trial_pred)}")
+    return trial_pred
+
+
+def ensemble_test_predictions(
+    model_paths: list[Path],
+    test_csv: str,
+    device: torch.device,
+    save_dir: str,
+    batch_size: int = 128,
+    num_workers: int = 4,
+    root: Path = ROOT,
+) -> pd.DataFrame:
+    """
+    加载所有 fold 模型，逐模型推理，soft voting 集成。
+
+    Returns
+    -------
+    pd.DataFrame with columns: [user_id, trial_id, prob_pos_ensemble, pred_emotion, n_models]
+    """
+    all_trial_probs = []
+
+    for i, ckpt_path in enumerate(model_paths):
+        print(f"\n[ensemble] 模型 {i + 1}/{len(model_paths)}: {ckpt_path}")
+
+        # 从 checkpoint 中读取 num_subjects
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        config_ckpt = ckpt.get("config", {})
+        num_subjects = int(config_ckpt.get("num_subjects", 48))
+
+        model = TwoBranchModel(
+            sfreq=250.0,
+            prior_matrix=None,
+            topk=6,
+            dropout=0.2,
+            num_subjects=num_subjects,
+            num_classes_4=4,
+            num_classes_2=2,
+            use_subject_relative_de=bool(config_ckpt.get("use_subject_relative_de", False)),
+            use_subject_relative_bio=bool(config_ckpt.get("use_subject_relative_bio", False)),
+            bio_abs_scale=float(config_ckpt.get("bio_abs_scale", 0.3)),
+            relative_eps=float(config_ckpt.get("relative_eps", 1e-6)),
+        ).to(device)
+        model.load_state_dict(ckpt["model_state_dict"])
+
+        trial_pred = predict_test_trial(
+            model=model,
+            test_csv=test_csv,
+            device=device,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            root=root,
+        )
+        trial_pred = trial_pred[["user_id", "trial_id", "prob_pos", "score_pos"]].copy()
+        trial_pred.rename(columns={"prob_pos": f"prob_fold_{i}"}, inplace=True)
+        trial_pred.rename(columns={"score_pos": f"score_fold_{i}"}, inplace=True)
+        all_trial_probs.append(trial_pred)
+
+    # ── Soft voting：所有 fold 概率取均值 ──
+    merged = all_trial_probs[0]
+    for df in all_trial_probs[1:]:
+        merged = merged.merge(df, on=["user_id", "trial_id"], how="inner")
+
+    prob_cols = [c for c in merged.columns if c.startswith("prob_fold_")]
+    score_cols = [c for c in merged.columns if c.startswith("score_fold_")]
+    merged["prob_pos_ensemble"] = merged[prob_cols].mean(axis=1)
+    merged["score_pos_ensemble"] = merged[score_cols].mean(axis=1)
+    merged["n_models"] = len(prob_cols)
+    merged["pred_emotion"] = (merged["prob_pos_ensemble"] >= 0.5).astype(int)
+    topk_records = apply_subject_topk_prediction(
+        merged[["user_id", "trial_id", "score_pos_ensemble", "prob_pos_ensemble"]]
+        .rename(columns={"score_pos_ensemble": "score_pos", "prob_pos_ensemble": "prob_pos"})
+        .to_dict("records"),
+        k_pos=4,
+    )
+    topk_pred = pd.DataFrame(topk_records)
+    topk_pred = topk_pred[["user_id", "trial_id", "Emotion_label"]]
+
+    # ── 保存 ──
+    os.makedirs(save_dir, exist_ok=True)
+    probs_path = os.path.join(save_dir, "test_ensemble_probs.csv")
+    merged.to_csv(probs_path, index=False, encoding="utf-8-sig")
+    print(f"\n[ensemble] 集成概率已保存: {probs_path}")
+
+    # 提交格式：user_id, trial_id, Emotion_label
+    submission = topk_pred.copy()
+    submission_path = os.path.join(save_dir, "submission_test_ensemble.csv")
+    submission.to_csv(submission_path, index=False, encoding="utf-8-sig")
+    print(f"[ensemble] top-4 提交文件已保存: {submission_path}")
+
+    # 打印分布统计
+    n_total = len(submission)
+    n_pos = int(submission["Emotion_label"].sum())
+    print(f"[ensemble] 预测分布: {n_pos}/{n_total} 正性 ({100 * n_pos / max(n_total, 1):.1f}%)")
+
+    return merged
+
+
+# =========================================================
 # Main
 # =========================================================
 
 if __name__ == "__main__":
-    import argparse
-    _parser = argparse.ArgumentParser()
-    _parser.add_argument("--batch_size", type=int, default=16)
-    _args, _ = _parser.parse_known_args()
-    _bs = _args.batch_size
-
     device = "cuda:0"
-    nclass = 2  # 抑郁症/正常人二分类；训练标签来自 diagnosis_label
-    version = "diag_ssas"
+    version = "two_branch"
     model_params_root = "model_params"
     os.makedirs(version, exist_ok=True)
     os.makedirs(model_params_root, exist_ok=True)
 
     all_fold_rows = []
     all_best_rows_long = []
-    combined_diagnosis_confusions = []
-    combined_segment_diag_confusions = []
-    combined_trial_diag_confusions = []
-    combined_subject_diag_confusions = []
+    all_ckpt_paths: list[Path] = []
+    combined_4cls_confusions = []
+    combined_segment_emo_confusions = []
+    combined_trial_emo_confusions = []
 
     # 多随机种子 × 五折交叉验证
-    for repeat, rand in enumerate(config.DIAG_REPEAT_SEEDS[:2]):
+    for repeat, rand in enumerate(config.TEST_SEED):
         print(f"\n{'#' * 70}")
         print(f"开始 random seed = {rand} 的 {5} 折交叉验证")
         print(f"{'#' * 70}")
@@ -2032,31 +2361,37 @@ if __name__ == "__main__":
             set_global_seed(run_seed, deterministic=False)
             print(f"[Main Seed] rand={rand}, fold={fold}, run_seed={run_seed}")
 
-            model = SSASDiagnosisModel(
+            model = TwoBranchModel(
                 sfreq=250.0,
                 prior_matrix=None,
                 topk=6,
                 dropout=0.2,
+                num_subjects=48,
+                num_classes_4=4,
+                num_classes_2=2,
+                use_subject_relative_de=True,
+                use_subject_relative_bio=True,
+                bio_abs_scale=0.3,
+                relative_eps=1e-6,
             )
 
             result = train_competition_cross_subject(
                 model=model,
-                index_csv="com_index_sub_10s.csv",
+                index_csv="com_index_sub_2s.csv",
                 fold=fold,
-                save_dir=os.path.join(model_params_root, f"diag_ssas_reapt{repeat}_fold{fold}"),
+                save_dir=os.path.join(model_params_root, f"two_branch_reapt{repeat}_fold{fold}"),
                 dataset="com",
-                repeat_index=repeat,
                 n_splits=n_splits,
                 epochs=100,
-                batch_size=_bs,
-                nclass=nclass,
+                batch_size=32,
                 lr=1e-4,
                 rand=rand,
                 weight_decay=1e-4,
                 num_workers=4,
-                grl_domain=0.0,
+                lambda_diag=1.0,
                 lambda_graph=0.0,
-                lambda_dom=0.0,
+                lambda_domain=0.0,
+                grl_domain=0.0,
                 lambda_con=0.0,
                 device=device,
                 run_seed=run_seed,
@@ -2065,12 +2400,10 @@ if __name__ == "__main__":
                 early_stop_patience=25,
                 early_stop_warmup=15,
                 early_stop_min_delta=1e-6,
-                ssas_stage1_epochs=20,
-                ssas_lambda_dss=0.2,
-                ssas_lambda_adv=0.1,
-                ssas_grl_domain=0.1,
-                ssas_lambda_mmd=0.0,  # 先跑 Stage2；改成 0.1 即 Stage3 加 MMD
-                ssas_source_weight_temperature=0.05,
+                use_subject_relative_de=True,
+                use_subject_relative_bio=True,
+                bio_abs_scale=0.3,
+                relative_eps=1e-6,
             )
 
             combined_tracker = result["best_models"]["combined"]
@@ -2088,6 +2421,9 @@ if __name__ == "__main__":
             all_fold_rows.append(fold_row)
             seed_combined_rows.append(fold_row)
 
+            if combined_tracker["checkpoint_path"]:
+                all_ckpt_paths.append(Path(combined_tracker["checkpoint_path"]))
+
             for best_name, tracker in result["best_models"].items():
                 row = {
                     "rand": rand,
@@ -2103,40 +2439,45 @@ if __name__ == "__main__":
                 all_best_rows_long.append(row)
 
             if combined_metrics is not None:
-                combined_diagnosis_confusions.append(combined_metrics["confusion_matrix"])
-                combined_segment_diag_confusions.append(combined_metrics["emotion_confusion_matrix"])
-                combined_trial_diag_confusions.append(combined_metrics["trial_confusion_matrix"])
-                combined_subject_diag_confusions.append(combined_metrics["subject_confusion_matrix"])
+                combined_4cls_confusions.append(combined_metrics["confusion_matrix"])
+                combined_segment_emo_confusions.append(combined_metrics["emotion_confusion_matrix"])
+                combined_trial_emo_confusions.append(combined_metrics["trial_confusion_matrix"])
 
-            print(f"第 {fold + 1} 折 combined 最优结果:")
+            print(f"第 {fold + 1} 折 optimal 最优结果:")
             print(f"best_epoch = {combined_tracker['best_epoch']}")
-            print(f"val_segment_diag_acc = {combined_metrics['acc']:.4f}")
-            print(f"val_segment_diag_macro_f1 = {combined_metrics['macro_f1']:.4f}")
-            print(f"val_trial_diag_acc = {combined_metrics['trial_acc']:.4f}")
-            print(f"val_trial_diag_f1 = {combined_metrics['trial_macro_f1']:.4f}")
-            print(f"val_subject_diag_acc = {combined_metrics['subject_acc']:.4f}")
-            print(f"val_subject_diag_f1 = {combined_metrics['subject_macro_f1']:.4f}")
+            print(f"val_acc_4cls = {combined_metrics['acc_4cls']:.4f}")
+            print(f"val_macro_f1_4cls = {combined_metrics['macro_f1_4cls']:.4f}")
+            print(f"val_segment_emo_acc = {combined_metrics['emotion_acc']:.4f}")
+            print(f"val_segment_emo_f1 = {combined_metrics['emotion_macro_f1']:.4f}")
+            print(f"val_trial_emo_acc = {combined_metrics['trial_acc']:.4f}")
+            print(f"val_trial_emo_f1 = {combined_metrics['trial_macro_f1']:.4f}")
+            print(f"val_topk_trial_acc = {combined_metrics['topk_trial_acc']:.4f}")
+            print(f"val_topk_trial_f1 = {combined_metrics['topk_trial_macro_f1']:.4f}")
+            print(f"val_topk_subject_gap = {combined_metrics['topk_subject_gap_mean']:.4f}")
 
         seed_df = pd.DataFrame(seed_combined_rows)
         seed_csv = os.path.join(version, f"seed{rand}_combined_5fold_results.csv")
         seed_df.to_csv(seed_csv, index=False, encoding="utf-8-sig")
 
         metric_cols = [
+            "val_loss",
+            "val_acc_4cls",
+            "val_macro_f1_4cls",
             "val_acc",
             "val_macro_f1",
             "val_emotion_acc",
             "val_emotion_macro_f1",
             "val_trial_acc",
             "val_trial_macro_f1",
-            "val_subject_acc",
-            "val_subject_macro_f1",
-            "val_diagnosis_acc",
-            "val_diagnosis_macro_f1",
-            "val_loss",
+            "val_trial_emotion_acc",
+            "val_trial_emotion_macro_f1",
+            "val_topk_trial_acc",
+            "val_topk_trial_macro_f1",
+            "val_topk_subject_gap_mean",
         ]
         summary_lines = []
         print(f"\n{'=' * 50}")
-        print(f"Random seed {rand} 的 5 折 combined 平均结果:")
+        print(f"Random seed {rand} 的 5 折 optimal 平均结果:")
         print(f"{'=' * 50}")
         for col in metric_cols:
             if col in seed_df.columns:
@@ -2160,28 +2501,29 @@ if __name__ == "__main__":
     all_best_df.to_csv(all_best_csv, index=False, encoding="utf-8-sig")
     print(f"全部并列 best 指标已保存到: {all_best_csv}")
 
-    np.save(os.path.join(version, "combined_diagnosis_confusions.npy"), np.array(combined_diagnosis_confusions, dtype=object))
-    np.save(os.path.join(version, "combined_segment_diag_confusions.npy"), np.array(combined_segment_diag_confusions, dtype=object))
-    np.save(os.path.join(version, "combined_trial_diag_confusions.npy"), np.array(combined_trial_diag_confusions, dtype=object))
-    np.save(os.path.join(version, "combined_subject_diag_confusions.npy"), np.array(combined_subject_diag_confusions, dtype=object))
-
+    np.save(os.path.join(version, "combined_4cls_confusions.npy"), np.array(combined_4cls_confusions, dtype=object))
+    np.save(os.path.join(version, "combined_segment_emo_confusions.npy"), np.array(combined_segment_emo_confusions, dtype=object))
+    np.save(os.path.join(version, "combined_trial_emo_confusions.npy"), np.array(combined_trial_emo_confusions, dtype=object))
     if len(all_fold_df) > 0:
         metric_cols = [
+            "val_loss",
+            "val_acc_4cls",
+            "val_macro_f1_4cls",
             "val_acc",
             "val_macro_f1",
             "val_emotion_acc",
             "val_emotion_macro_f1",
             "val_trial_acc",
             "val_trial_macro_f1",
-            "val_subject_acc",
-            "val_subject_macro_f1",
-            "val_diagnosis_acc",
-            "val_diagnosis_macro_f1",
-            "val_loss",
+            "val_trial_emotion_acc",
+            "val_trial_emotion_macro_f1",
+            "val_topk_trial_acc",
+            "val_topk_trial_macro_f1",
+            "val_topk_subject_gap_mean",
         ]
 
         print(f"\n{'=' * 50}")
-        print("所有 seed × fold 的 combined 总体结果:")
+        print("所有 seed × fold 的 optimal 总体结果:")
         print(f"{'=' * 50}")
 
         overall_summary = []
@@ -2207,8 +2549,8 @@ if __name__ == "__main__":
             f.write(f"\n全部详细指标 CSV: {all_fold_csv}\n")
             f.write(f"全部并列 best 指标 CSV: {all_best_csv}\n")
 
-        # 平均 segment 级诊断二分类混淆矩阵
-        valid_confs = [np.array(c, dtype=np.float32) for c in combined_diagnosis_confusions if c is not None]
+        # 平均 segment 级情绪二分类混淆矩阵（四分类头视角: acc=四分类）
+        valid_confs = [np.array(c, dtype=np.float32) for c in combined_4cls_confusions if c is not None]
         if len(valid_confs) > 0:
             conf_stack = np.stack(valid_confs, axis=0)
             avg_conf = conf_stack.mean(axis=0)
@@ -2217,16 +2559,16 @@ if __name__ == "__main__":
 
             import matplotlib.pyplot as plt
 
-            labels = ["Diag_0", "Diag_1"]
-            fig, ax = plt.subplots(figsize=(6, 5))
+            labels_4cls = ["DEP_neu", "DEP_pos", "HC_neu", "HC_pos"]
+            fig, ax = plt.subplots(figsize=(7, 6))
             im = ax.imshow(avg_conf_norm, interpolation="nearest", cmap="Blues")
-            ax.set_xticks(np.arange(len(labels)))
-            ax.set_yticks(np.arange(len(labels)))
-            ax.set_xticklabels(labels, rotation=45, ha="right")
-            ax.set_yticklabels(labels)
+            ax.set_xticks(np.arange(len(labels_4cls)))
+            ax.set_yticks(np.arange(len(labels_4cls)))
+            ax.set_xticklabels(labels_4cls, rotation=45, ha="right")
+            ax.set_yticklabels(labels_4cls)
             ax.set_xlabel("Predicted")
             ax.set_ylabel("True")
-            ax.set_title("Average Segment-level Diagnosis Confusion Matrix")
+            ax.set_title("Average 4-Class Emotion Confusion Matrix")
 
             thresh = avg_conf_norm.max() / 2.0 if avg_conf_norm.max() != 0 else 0.5
             for i in range(avg_conf_norm.shape[0]):
@@ -2243,13 +2585,13 @@ if __name__ == "__main__":
 
             fig.colorbar(im, ax=ax)
             fig.tight_layout()
-            fig_path = os.path.join(version, "avg_segment_diagnosis_confusion.png")
+            fig_path = os.path.join(version, "avg_4cls_confusion.png")
             fig.savefig(fig_path, dpi=200)
             plt.close(fig)
-            print(f"平均 segment 级诊断二分类混淆矩阵图已保存到: {fig_path}")
+            print(f"平均四分类混淆矩阵图已保存到: {fig_path}")
 
-        # 平均 trial 级诊断二分类混淆矩阵
-        valid_trial_confs = [np.array(c, dtype=np.float32) for c in combined_trial_diag_confusions if c is not None]
+        # 平均 trial 级情绪二分类混淆矩阵
+        valid_trial_confs = [np.array(c, dtype=np.float32) for c in combined_trial_emo_confusions if c is not None]
         if len(valid_trial_confs) > 0:
             trial_conf_stack = np.stack(valid_trial_confs, axis=0)
             avg_trial_conf = trial_conf_stack.mean(axis=0)
@@ -2258,16 +2600,16 @@ if __name__ == "__main__":
 
             import matplotlib.pyplot as plt
 
-            labels = ["Diag_0", "Diag_1"]
+            labels_emo = ["Neutral", "Positive"]
             fig, ax = plt.subplots(figsize=(5, 4))
             im = ax.imshow(avg_trial_conf_norm, interpolation="nearest", cmap="Blues")
-            ax.set_xticks(np.arange(len(labels)))
-            ax.set_yticks(np.arange(len(labels)))
-            ax.set_xticklabels(labels)
-            ax.set_yticklabels(labels)
+            ax.set_xticks(np.arange(len(labels_emo)))
+            ax.set_yticks(np.arange(len(labels_emo)))
+            ax.set_xticklabels(labels_emo)
+            ax.set_yticklabels(labels_emo)
             ax.set_xlabel("Predicted")
             ax.set_ylabel("True")
-            ax.set_title("Average Trial-level Diagnosis Confusion Matrix")
+            ax.set_title("Average Trial-level Emotion Confusion Matrix")
 
             thresh = avg_trial_conf_norm.max() / 2.0 if avg_trial_conf_norm.max() != 0 else 0.5
             for i in range(avg_trial_conf_norm.shape[0]):
@@ -2284,51 +2626,36 @@ if __name__ == "__main__":
 
             fig.colorbar(im, ax=ax)
             fig.tight_layout()
-            fig_path = os.path.join(version, "avg_trial_diagnosis_confusion.png")
+            fig_path = os.path.join(version, "avg_trial_emotion_confusion.png")
             fig.savefig(fig_path, dpi=200)
             plt.close(fig)
-            print(f"平均 trial 级诊断二分类混淆矩阵图已保存到: {fig_path}")
-
-
-        # 平均 subject 级诊断二分类混淆矩阵
-        valid_subject_confs = [np.array(c, dtype=np.float32) for c in combined_subject_diag_confusions if c is not None]
-        if len(valid_subject_confs) > 0:
-            subject_conf_stack = np.stack(valid_subject_confs, axis=0)
-            avg_subject_conf = subject_conf_stack.mean(axis=0)
-            row_sum = avg_subject_conf.sum(axis=1, keepdims=True)
-            avg_subject_conf_norm = avg_subject_conf / np.maximum(row_sum, 1e-12)
-
-            import matplotlib.pyplot as plt
-
-            labels = ["Diag_0", "Diag_1"]
-            fig, ax = plt.subplots(figsize=(5, 4))
-            im = ax.imshow(avg_subject_conf_norm, interpolation="nearest", cmap="Blues")
-            ax.set_xticks(np.arange(len(labels)))
-            ax.set_yticks(np.arange(len(labels)))
-            ax.set_xticklabels(labels)
-            ax.set_yticklabels(labels)
-            ax.set_xlabel("Predicted")
-            ax.set_ylabel("True")
-            ax.set_title("Average Subject-level Diagnosis Confusion Matrix")
-
-            thresh = avg_subject_conf_norm.max() / 2.0 if avg_subject_conf_norm.max() != 0 else 0.5
-            for i in range(avg_subject_conf_norm.shape[0]):
-                for j in range(avg_subject_conf_norm.shape[1]):
-                    val = avg_subject_conf_norm[i, j]
-                    ax.text(
-                        j,
-                        i,
-                        f"{val:.2f}",
-                        ha="center",
-                        va="center",
-                        color="white" if val > thresh else "black",
-                    )
-
-            fig.colorbar(im, ax=ax)
-            fig.tight_layout()
-            fig_path = os.path.join(version, "avg_subject_diagnosis_confusion.png")
-            fig.savefig(fig_path, dpi=200)
-            plt.close(fig)
-            print(f"平均 subject 级诊断二分类混淆矩阵图已保存到: {fig_path}")
+            print(f"平均 trial 级情绪二分类混淆矩阵图已保存到: {fig_path}")
     else:
         print("没有收集到任何 fold 结果，无法计算总体统计与混淆矩阵。")
+
+    # =========================================================
+    # Test 集成预测
+    # =========================================================
+    if len(all_ckpt_paths) > 0:
+        test_csv = os.path.join(ROOT, "com_test_trial_index_2s.csv")
+        if not os.path.exists(test_csv):
+            test_csv = os.path.join(ROOT, "com_test_trial_index_10s.csv")
+        if os.path.exists(test_csv):
+            print(f"\n{'=' * 50}")
+            print(f"Test 集成预测: {len(all_ckpt_paths)} 个模型")
+            print(f"Test CSV: {test_csv}")
+            print(f"{'=' * 50}")
+
+            ensemble_test_predictions(
+                model_paths=all_ckpt_paths,
+                test_csv=test_csv,
+                device=torch.device(device),
+                save_dir=version,
+                batch_size=32,
+                num_workers=4,
+                root=ROOT,
+            )
+        else:
+            print(f"\n[WARNING] 测试 CSV 不存在: {test_csv}，跳过 test 预测。")
+    else:
+        print("没有收集到任何模型 checkpoint，跳过 test 预测。")

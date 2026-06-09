@@ -1664,6 +1664,12 @@ def train_competition_cross_subject(
 # =========================================================
 
 if __name__ == "__main__":
+    import argparse
+    _parser = argparse.ArgumentParser()
+    _parser.add_argument("--batch_size", type=int, default=32)
+    _args, _ = _parser.parse_known_args()
+    _bs = _args.batch_size
+
     device = "cuda:0"
     nclass = 2  # 抑郁症/正常人二分类；训练标签来自 diagnosis_label
     version = "diagnoise_cls"
@@ -1714,7 +1720,7 @@ if __name__ == "__main__":
                 dataset="com",
                 n_splits=n_splits,
                 epochs=100,
-                batch_size=32,
+                batch_size=_bs,
                 nclass=nclass,
                 lr=1e-4,
                 rand=rand,

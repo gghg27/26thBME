@@ -1826,7 +1826,7 @@ if __name__ == "__main__":
     combined_trial_emo_confusions = []
 
     # 多随机种子 × 五折交叉验证
-    for repeat, rand in enumerate(config.DIAG_REPEAT_SEEDS):
+    for repeat, rand in enumerate(config.TEST_SEED):
         print(f"\n{'#' * 70}")
         print(f"开始 random seed = {rand} 的 {5} 折交叉验证")
         print(f"{'#' * 70}")
