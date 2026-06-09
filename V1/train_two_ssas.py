@@ -23,6 +23,7 @@ import copy
 import random
 import sys
 from collections import defaultdict
+from itertools import cycle
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,7 +40,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, WeightedRandomSampler, ConcatDataset, Dataset
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.metrics import (
     f1_score,
@@ -56,7 +57,7 @@ from dataloader import (
     Competition4ClassDataset,
     comp4_collate_fn,
 )
-from two_branch import TwoBranchModel
+from two_branch_ssas import TwoBranchModel, SourceSelectionModel, mmd_loss
 from utils.folds import get_unified_subject_split
 
 
@@ -455,6 +456,342 @@ def train_one_epoch_two_branch(
     return metrics
 
 
+class UnlabeledCompetitionTargetDataset(Dataset):
+    """Unlabeled val/test target windows with the same batch keys as Competition4ClassDataset."""
+
+    def __init__(self, index_csv: str | Path, root: Path = ROOT, normalize: bool = False):
+        from utils.data import expand_window_index
+
+        self.root = Path(root)
+        raw_df = pd.read_csv(index_csv)
+        self.id_col = "user_id" if "user_id" in raw_df.columns else "subject_id"
+        self.df = expand_window_index(raw_df, root=self.root).reset_index(drop=True)
+        self.normalize = normalize
+        if self.df.empty:
+            raise ValueError(f"Target test csv is empty after expansion: {index_csv}")
+
+    def _resolve_path(self, path_value) -> Path:
+        path = Path(str(path_value).replace("\\", "/"))
+        if not path.is_absolute():
+            path = self.root / path
+        if not path.exists():
+            raise FileNotFoundError(f"Data file not found: {path}")
+        return path
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx: int) -> dict:
+        row = self.df.iloc[idx]
+        trial = np.load(self._resolve_path(row["trial_path"]))
+        start = int(row["start"]) if "start" in row.index else 0
+        end = int(row["end"]) if "end" in row.index else trial.shape[-1]
+        x = trial[:, start:end].astype("float32", copy=False)
+        if self.normalize:
+            mean = x.mean(axis=-1, keepdims=True)
+            std = x.std(axis=-1, keepdims=True) + 1e-6
+            x = (x - mean) / std
+
+        de_arr = np.load(self._resolve_path(row["de_path"]))
+        if de_arr.ndim >= 3 and "de_win_id" in row.index:
+            de_feat = de_arr[int(row["de_win_id"])]
+        else:
+            de_feat = de_arr
+        de_feat = de_feat.astype("float32", copy=False)
+
+        subject_id = int(row[self.id_col])
+        trial_id = int(row["trial_id"])
+        return {
+            "x": torch.tensor(x, dtype=torch.float32),
+            "de_feat": torch.tensor(de_feat, dtype=torch.float32),
+            "label4": torch.tensor(0, dtype=torch.long),
+            "emotion_label": torch.tensor(0, dtype=torch.long),
+            "diagnosis_label": torch.tensor(0, dtype=torch.long),
+            "subject_id": torch.tensor(subject_id, dtype=torch.long),
+            "domain_id": torch.tensor(0, dtype=torch.long),
+            "trial_id": torch.tensor(trial_id, dtype=torch.long),
+        }
+
+
+def find_default_test_csv() -> str | None:
+    candidates = [
+        ROOT / "com_test_trial_index_2s.csv",
+        ROOT / "com_test_trial_index_10s.csv",
+    ]
+    for path in candidates:
+        if path.exists():
+            return str(path)
+    return None
+
+
+def build_ssas_target_loader(
+    val_dataset,
+    batch_size: int,
+    num_workers: int,
+    collate_fn,
+    loader_generator,
+    test_csv: str | None = None,
+):
+    target_datasets = [val_dataset]
+    if test_csv is not None and os.path.exists(test_csv):
+        test_target = UnlabeledCompetitionTargetDataset(test_csv, root=ROOT, normalize=False)
+        target_datasets.append(test_target)
+        print(f"[SSAS target] using val + test target, test windows={len(test_target)}")
+    else:
+        print(f"[SSAS target] test_csv not found, using val target only: {test_csv}")
+
+    target_dataset = ConcatDataset(target_datasets) if len(target_datasets) > 1 else val_dataset
+    return DataLoader(
+        target_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+        collate_fn=collate_fn,
+        worker_init_fn=seed_worker,
+        generator=loader_generator,
+    )
+
+
+def _subject_weight_tensor(subject_ids: torch.Tensor, source_weights: dict[str, float], device) -> torch.Tensor:
+    values = [float(source_weights.get(str(int(s)), 1.0)) for s in subject_ids.detach().cpu()]
+    return torch.tensor(values, dtype=torch.float32, device=device)
+
+
+def _weighted_mean(loss_each: torch.Tensor, sample_weights: torch.Tensor) -> torch.Tensor:
+    return (loss_each * sample_weights).sum() / sample_weights.sum().clamp_min(1e-6)
+
+
+def compute_source_weights_from_stage1(
+    stage1_model,
+    source_loader,
+    device,
+    temperature: float = 0.05,
+) -> dict:
+    stage1_model.eval()
+    subject_scores = defaultdict(list)
+    with torch.no_grad():
+        for batch in tqdm(source_loader, desc="SSAS-Weight", leave=False):
+            x = batch["x"].to(device)
+            de_feat = batch["de_feat"].to(device)
+            out = stage1_model(x, de_feat=de_feat, lambda_dom=0.0, dataset_name="comp4")
+            p_target = torch.softmax(out["ss_domain_logits"], dim=1)[:, 1]
+            for sid, score in zip(batch["subject_id"], p_target.detach().cpu()):
+                subject_scores[str(int(sid))].append(float(score))
+
+    raw_scores = {sid: float(np.mean(scores)) for sid, scores in subject_scores.items()}
+    if len(raw_scores) == 0:
+        return {"raw_scores": {}, "weights_mean_one": {}}
+
+    subjects = list(raw_scores.keys())
+    score_arr = np.array([raw_scores[s] for s in subjects], dtype=np.float64)
+    temp = max(float(temperature), 1e-6)
+    weights = np.exp((score_arr - score_arr.mean()) / temp)
+    weights = weights / max(weights.mean(), 1e-12)
+    weight_dict = {s: float(w) for s, w in zip(subjects, weights)}
+    return {"raw_scores": raw_scores, "weights_mean_one": weight_dict}
+
+
+def train_stage1_source_selection(
+    source_loader,
+    target_loader,
+    save_dir: str,
+    device,
+    model_kwargs: dict,
+    criterion_4cls,
+    criterion_2cls,
+    epochs: int = 20,
+    lr: float = 1e-4,
+    weight_decay: float = 1e-4,
+    lambda_emo2: float = 1.0,
+    lambda_dss: float = 0.2,
+    source_weight_temperature: float = 0.05,
+):
+    stage1_model = SourceSelectionModel(**model_kwargs).to(device)
+    optimizer = torch.optim.AdamW(stage1_model.parameters(), lr=lr, weight_decay=weight_decay)
+    domain_criterion = torch.nn.CrossEntropyLoss()
+    history = []
+
+    target_iter = cycle(target_loader)
+    for epoch in range(1, epochs + 1):
+        stage1_model.train()
+        total_loss = total_l4 = total_l2 = total_dom = total_num = 0.0
+        pbar = tqdm(source_loader, desc=f"SSAS-Stage1 {epoch}/{epochs}", leave=False)
+        for source_batch in pbar:
+            target_batch = next(target_iter)
+            sx = source_batch["x"].to(device)
+            sde = source_batch["de_feat"].to(device)
+            sy4 = source_batch["label4"].to(device).long()
+            sy2 = (sy4 % 2).long()
+            tx = target_batch["x"].to(device)
+            tde = target_batch["de_feat"].to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+            source_out = stage1_model(sx, de_feat=sde, lambda_dom=0.0, dataset_name="comp4")
+            target_out = stage1_model(tx, de_feat=tde, lambda_dom=0.0, dataset_name="comp4")
+
+            loss_4cls = criterion_4cls(source_out["logits_4cls"], sy4)
+            loss_2cls = criterion_2cls(source_out["logits_2cls"], sy2)
+            domain_logits = torch.cat([source_out["ss_domain_logits"], target_out["ss_domain_logits"]], dim=0)
+            domain_labels = torch.cat([
+                torch.zeros(source_out["ss_domain_logits"].size(0), dtype=torch.long, device=device),
+                torch.ones(target_out["ss_domain_logits"].size(0), dtype=torch.long, device=device),
+            ], dim=0)
+            loss_dom = domain_criterion(domain_logits, domain_labels)
+            loss = loss_4cls + lambda_emo2 * loss_2cls + lambda_dss * loss_dom
+            loss.backward()
+            optimizer.step()
+
+            bsz = sx.size(0)
+            total_loss += float(loss.item()) * bsz
+            total_l4 += float(loss_4cls.item()) * bsz
+            total_l2 += float(loss_2cls.item()) * bsz
+            total_dom += float(loss_dom.item()) * bsz
+            total_num += bsz
+            pbar.set_postfix({
+                "loss": f"{total_loss / max(total_num, 1):.4f}",
+                "dom": f"{total_dom / max(total_num, 1):.4f}",
+            })
+
+        row = {
+            "epoch": epoch,
+            "loss": total_loss / max(total_num, 1),
+            "loss_4cls": total_l4 / max(total_num, 1),
+            "loss_2cls": total_l2 / max(total_num, 1),
+            "loss_domain": total_dom / max(total_num, 1),
+        }
+        history.append(row)
+        print(
+            f"[SSAS Stage1] epoch={epoch} loss={row['loss']:.4f} "
+            f"L4={row['loss_4cls']:.4f} L2={row['loss_2cls']:.4f} dom={row['loss_domain']:.4f}"
+        )
+
+    source_weights = compute_source_weights_from_stage1(
+        stage1_model,
+        source_loader,
+        device=device,
+        temperature=source_weight_temperature,
+    )
+    torch.save({"model_state_dict": stage1_model.state_dict()}, os.path.join(save_dir, "stage1_source_selection.pt"))
+    pd.DataFrame(history).to_csv(os.path.join(save_dir, "history_stage1.csv"), index=False, encoding="utf-8-sig")
+    save_json(os.path.join(save_dir, "source_weights.json"), source_weights)
+    print("[SSAS Stage1] source weight preview:", list(source_weights["weights_mean_one"].items())[:8])
+    return source_weights["weights_mean_one"]
+
+
+def train_one_epoch_ssas(
+    model,
+    source_loader,
+    target_loader,
+    optimizer,
+    criterion_4cls_each,
+    criterion_2cls_each,
+    dom_criterion,
+    device,
+    source_weights: dict[str, float],
+    lambda_diag: float = 1.0,
+    lambda_domain: float = 0.1,
+    grl_domain: float = 0.1,
+    lambda_mmd: float = 0.0,
+    center_criterion=None,
+    lambda_center: float = 0.0,
+    center_warmup_epochs: int = 10,
+    current_epoch: int = 1,
+):
+    model.train()
+
+    total_loss = total_loss_4cls = total_loss_2cls = 0.0
+    total_loss_dom = total_loss_mmd = total_loss_center = 0.0
+    total_correct_4cls = total_correct_2cls = total_num = 0
+    target_iter = cycle(target_loader)
+
+    pbar = tqdm(source_loader, desc="Train-SSAS", leave=False)
+    for source_batch in pbar:
+        target_batch = next(target_iter)
+        sx = source_batch["x"].to(device)
+        sde = source_batch["de_feat"].to(device)
+        sy4 = source_batch["label4"].to(device).long()
+        sy2 = (sy4 % 2).long()
+        tx = target_batch["x"].to(device)
+        tde = target_batch["de_feat"].to(device)
+        sample_weights = _subject_weight_tensor(source_batch["subject_id"], source_weights, device)
+
+        optimizer.zero_grad(set_to_none=True)
+        source_out = model(sx, de_feat=sde, lambda_dom=grl_domain, dataset_name="comp4")
+        target_out = model(tx, de_feat=tde, lambda_dom=grl_domain, dataset_name="comp4")
+
+        logits_4cls = source_out["logits_4cls"]
+        logits_2cls = source_out["logits_2cls"]
+        graph_feat = source_out.get("graph_feat", None)
+
+        loss_4cls = _weighted_mean(criterion_4cls_each(logits_4cls, sy4), sample_weights)
+        loss_2cls = _weighted_mean(criterion_2cls_each(logits_2cls, sy2), sample_weights)
+
+        source_dom = source_out["ssas_domain_logits"]
+        target_dom = target_out["ssas_domain_logits"]
+        domain_logits = torch.cat([source_dom, target_dom], dim=0)
+        domain_labels = torch.cat([
+            torch.zeros(source_dom.size(0), dtype=torch.long, device=device),
+            torch.ones(target_dom.size(0), dtype=torch.long, device=device),
+        ], dim=0)
+        loss_dom = dom_criterion(domain_logits, domain_labels) if lambda_domain > 0 else logits_4cls.new_tensor(0.0)
+        loss_mmd = mmd_loss(source_out["z_diag"], target_out["z_diag"]) if lambda_mmd > 0 else logits_4cls.new_tensor(0.0)
+
+        if center_criterion is not None and lambda_center > 0 and graph_feat is not None:
+            loss_center, _center_info = center_criterion(graph_feat, sy2)
+            center_weight = 0.0 if current_epoch <= center_warmup_epochs else float(lambda_center)
+        else:
+            loss_center = logits_4cls.new_tensor(0.0)
+            center_weight = 0.0
+
+        loss = (
+            loss_4cls
+            + lambda_diag * loss_2cls
+            + lambda_domain * loss_dom
+            + lambda_mmd * loss_mmd
+            + center_weight * loss_center
+        )
+        loss.backward()
+        optimizer.step()
+
+        pred_4cls = logits_4cls.argmax(dim=1)
+        pred_2cls = logits_2cls.argmax(dim=1)
+        bsz = sx.size(0)
+        total_loss += float(loss.item()) * bsz
+        total_loss_4cls += float(loss_4cls.item()) * bsz
+        total_loss_2cls += float(loss_2cls.item()) * bsz
+        total_loss_dom += float(loss_dom.item()) * bsz
+        total_loss_mmd += float(loss_mmd.item()) * bsz
+        total_loss_center += float(loss_center.item()) * bsz
+        total_correct_4cls += (pred_4cls == sy4).sum().item()
+        total_correct_2cls += (pred_2cls == sy2).sum().item()
+        total_num += bsz
+
+        pbar.set_postfix({
+            "loss": f"{total_loss / max(total_num, 1):.4f}",
+            "L4": f"{total_loss_4cls / max(total_num, 1):.4f}",
+            "L2": f"{total_loss_2cls / max(total_num, 1):.4f}",
+            "dom": f"{total_loss_dom / max(total_num, 1):.4f}",
+            "mmd": f"{total_loss_mmd / max(total_num, 1):.4f}",
+        })
+
+    if total_num == 0:
+        raise RuntimeError("SSAS 训练集为空：total_num == 0。")
+
+    return {
+        "loss": total_loss / total_num,
+        "loss_4cls": total_loss_4cls / total_num,
+        "loss_2cls": total_loss_2cls / total_num,
+        "loss_dom": total_loss_dom / total_num,
+        "loss_mmd": total_loss_mmd / total_num,
+        "loss_center": total_loss_center / total_num,
+        "acc_4cls": total_correct_4cls / total_num,
+        "acc_2cls": total_correct_2cls / total_num,
+        "acc": total_correct_2cls / total_num,
+    }
+
+
 # =========================================================
 # Dataset / sampler / split utilities
 # =========================================================
@@ -555,7 +892,8 @@ def intra_class_graph_loss(
 
 def build_class_weights(index_csv: str, subject_ids):
     df = pd.read_csv(index_csv)
-    df = df[df["subject_id"].isin(subject_ids)].reset_index(drop=True)
+    subject_set = {str(s) for s in subject_ids}
+    df = df[df["subject_id"].astype(str).isin(subject_set)].reset_index(drop=True)
 
     counts = df["label4"].value_counts().sort_index()
     counts = counts.reindex([0, 1, 2, 3], fill_value=1)
@@ -574,7 +912,8 @@ def build_diagnosis_class_weights(index_csv: str, subject_ids):
     返回顺序固定为 [class0_weight, class1_weight]。
     """
     df = pd.read_csv(index_csv)
-    df = df[df["subject_id"].isin(subject_ids)].reset_index(drop=True)
+    subject_set = {str(s) for s in subject_ids}
+    df = df[df["subject_id"].astype(str).isin(subject_set)].reset_index(drop=True)
 
     if "diagnosis_label" not in df.columns:
         raise KeyError("index_csv 中缺少 diagnosis_label，无法进行抑郁症/正常人二分类。")
@@ -1188,6 +1527,16 @@ def train_competition_cross_subject(
     center_tau: float = 0.1,
     center_dim: int = 64,
     center_warmup_epochs: int = 10,
+    # SSAS
+    ssas_stage1_epochs: int = 20,
+    ssas_lambda_dss: float = 0.2,
+    ssas_lambda_domain: float = 0.1,
+    ssas_grl_domain: float = 0.1,
+    ssas_lambda_mmd: float = 0.0,
+    ssas_source_weight_temperature: float = 0.05,
+    ssas_test_csv: str | None = None,
+    ssas_topk: int = 6,
+    ssas_dropout: float = 0.2,
 ):
     """
     双任务跨被试训练（TwoBranchModel）。
@@ -1290,6 +1639,18 @@ def train_competition_cross_subject(
         generator=loader_generator,
     )
 
+    if ssas_test_csv is None:
+        ssas_test_csv = find_default_test_csv()
+
+    target_loader = build_ssas_target_loader(
+        val_dataset=val_dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        loader_generator=loader_generator,
+        test_csv=ssas_test_csv,
+    )
+
     # -------- loss --------
     # 四分类情绪 loss（带类别权重）
     class_weights_4cls = build_class_weights(index_csv, train_subjects).to(device)
@@ -1298,6 +1659,11 @@ def train_competition_cross_subject(
         weight=class_weights_4cls,
         label_smoothing=0.05,
     )
+    criterion_4cls_each = torch.nn.CrossEntropyLoss(
+        weight=class_weights_4cls,
+        label_smoothing=0.05,
+        reduction="none",
+    )
 
     # 二分类情绪 loss（带类别权重：0=中性, 1=正性）
     class_weights_2cls = build_emotion_class_weights(index_csv, train_subjects).to(device)
@@ -1305,6 +1671,11 @@ def train_competition_cross_subject(
     criterion_2cls = torch.nn.CrossEntropyLoss(
         weight=class_weights_2cls,
         label_smoothing=0.05,
+    )
+    criterion_2cls_each = torch.nn.CrossEntropyLoss(
+        weight=class_weights_2cls,
+        label_smoothing=0.05,
+        reduction="none",
     )
 
     dom_criterion = torch.nn.CrossEntropyLoss()
@@ -1359,8 +1730,40 @@ def train_competition_cross_subject(
         "center_tau": center_tau,
         "center_dim": center_dim,
         "center_warmup_epochs": center_warmup_epochs,
+        "ssas_stage1_epochs": ssas_stage1_epochs,
+        "ssas_lambda_dss": ssas_lambda_dss,
+        "ssas_lambda_domain": ssas_lambda_domain,
+        "ssas_grl_domain": ssas_grl_domain,
+        "ssas_lambda_mmd": ssas_lambda_mmd,
+        "ssas_source_weight_temperature": ssas_source_weight_temperature,
+        "ssas_test_csv": ssas_test_csv,
         "num_subjects": model.domain_head.num_subjects if hasattr(model, "domain_head") else 48,
     }
+
+    ssas_model_kwargs = {
+        "sfreq": 250.0,
+        "prior_matrix": None,
+        "topk": ssas_topk,
+        "dropout": ssas_dropout,
+        "num_subjects": model.domain_head.num_subjects if hasattr(model, "domain_head") else 48,
+        "num_classes_4": 4,
+        "num_classes_2": 2,
+    }
+    source_weights = train_stage1_source_selection(
+        source_loader=train_loader,
+        target_loader=target_loader,
+        save_dir=save_dir,
+        device=device,
+        model_kwargs=ssas_model_kwargs,
+        criterion_4cls=criterion_4cls,
+        criterion_2cls=criterion_2cls,
+        epochs=ssas_stage1_epochs,
+        lr=lr,
+        weight_decay=weight_decay,
+        lambda_emo2=lambda_diag,
+        lambda_dss=ssas_lambda_dss,
+        source_weight_temperature=ssas_source_weight_temperature,
+    )
 
     # -------- 并列保存多个最优模型 --------
     best_trackers = {
@@ -1458,17 +1861,20 @@ def train_competition_cross_subject(
     for epoch in range(1, epochs + 1):
         print(f"\n===== Epoch {epoch}/{epochs} =====")
 
-        train_metrics = train_one_epoch_two_branch(
+        train_metrics = train_one_epoch_ssas(
             model=model,
-            loader=train_loader,
+            source_loader=train_loader,
+            target_loader=target_loader,
             optimizer=optimizer,
-            criterion_4cls=criterion_4cls,
-            criterion_2cls=criterion_2cls,
+            criterion_4cls_each=criterion_4cls_each,
+            criterion_2cls_each=criterion_2cls_each,
             dom_criterion=dom_criterion,
             device=device,
+            source_weights=source_weights,
             lambda_diag=lambda_diag,
-            lambda_domain=lambda_domain,
-            grl_domain=grl_domain,
+            lambda_domain=ssas_lambda_domain,
+            grl_domain=ssas_grl_domain,
+            lambda_mmd=ssas_lambda_mmd,
             center_criterion=center_criterion,
             lambda_center=lambda_center,
             center_warmup_epochs=center_warmup_epochs,
@@ -1492,6 +1898,7 @@ def train_competition_cross_subject(
             f"L4={train_metrics['loss_4cls']:.4f} "
             f"L2={train_metrics['loss_2cls']:.4f} "
             f"dom={train_metrics['loss_dom']:.4f} "
+            f"mmd={train_metrics['loss_mmd']:.4f} "
             f"ctr={train_metrics['loss_center']:.4f} "
             f"acc4={train_metrics['acc_4cls']:.4f} "
             f"acc2={train_metrics['acc_2cls']:.4f}"
@@ -1638,7 +2045,8 @@ def build_emotion_class_weights(index_csv: str, subject_ids):
     emotion = label4 % 2: 0=中性, 1=正性
     """
     df = pd.read_csv(index_csv)
-    df = df[df["subject_id"].isin(subject_ids)].reset_index(drop=True)
+    subject_set = {str(s) for s in subject_ids}
+    df = df[df["subject_id"].astype(str).isin(subject_set)].reset_index(drop=True)
 
     if "label4" not in df.columns:
         raise KeyError("index_csv 中缺少 label4 列。")
@@ -1832,7 +2240,7 @@ def ensemble_test_predictions(
 
 if __name__ == "__main__":
     device = "cuda:0"
-    version = "two_branch"
+    version = "two_branch_ssas"
     model_params_root = "model_params"
     os.makedirs(version, exist_ok=True)
     os.makedirs(model_params_root, exist_ok=True)
@@ -1878,7 +2286,7 @@ if __name__ == "__main__":
                 model=model,
                 index_csv="com_index_sub_2s.csv",
                 fold=fold,
-                save_dir=os.path.join(model_params_root, f"two_branch_reapt{repeat}_fold{fold}"),
+                save_dir=os.path.join(model_params_root, f"two_branch_ssas_reapt{repeat}_fold{fold}"),
                 dataset="com",
                 n_splits=n_splits,
                 epochs=100,
@@ -1899,6 +2307,15 @@ if __name__ == "__main__":
                 early_stop_patience=25,
                 early_stop_warmup=15,
                 early_stop_min_delta=1e-6,
+                ssas_stage1_epochs=20,
+                ssas_lambda_dss=0.2,
+                ssas_lambda_domain=0.1,
+                ssas_grl_domain=0.1,
+                ssas_lambda_mmd=0.0,  # 跑通后可改为 0.1
+                ssas_source_weight_temperature=0.05,
+                ssas_test_csv=None,
+                ssas_topk=6,
+                ssas_dropout=0.2,
             )
 
             combined_tracker = result["best_models"]["combined"]
