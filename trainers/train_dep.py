@@ -1569,12 +1569,13 @@ def train_competition_cross_subject(
     best_trackers = {
         "combined": {
             "criteria": [
-                ("topk_trial_macro_f1", "max"),
-                ("topk_trial_acc", "max"),
                 ("trial_macro_f1", "max"),
                 ("trial_acc", "max"),
                 ("emotion_macro_f1", "max"),
                 ("emotion_acc", "max"),
+                ("topk_trial_macro_f1", "max"),
+                ("topk_trial_acc", "max"),
+                ("topk_subject_gap_mean", "max"),
                 ("loss", "min"),
             ],
             "best_metrics": None,
