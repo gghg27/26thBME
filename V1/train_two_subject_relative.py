@@ -1,19 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-EEG 情绪二分类 + 四分类辅助任务跨被试训练脚本。
+EEG 情绪二分类 + 四分类跨被试训练脚本。
 
-双任务架构：
-    - 四分类头 (cls4_head)：z_conv → 4 类情绪 (DEP_neu, DEP_pos, HC_neu, HC_pos)
-    - 二分类头 (cls2_head)：z_diag → 2 类情绪 (中性, 正性)
-    - 域对抗头 (domain_head)：z_diag → 被试域分类 (GRL)
+双任务架构（所有头共享 encoder 全量特征 z = z_conv ⊕ z_plv ⊕ z_bio）：
+    - 四分类头 (cls4_head)：z [B, 185] → 4 类情绪 (DEP_neu, DEP_pos, HC_neu, HC_pos)
+    - 二分类头 (cls2_head)：z [B, 185] → 2 类情绪 (中性, 正性)
+    - 域对抗头 (domain_head)：z [B, 185] → 被试域分类 (GRL)
 
 Loss:
-    L = L_4cls(z_conv, label4) + λ_diag × L_2cls(z_diag, emotion_binary)
+    L = L_4cls(z, label4) + λ_diag × L_2cls(z, emotion_binary)
         + λ_domain × L_domain + λ_center × L_center
+
+数据划分：
+    90% 训练 / 10% 验证，按诊断标签分层随机划分。
 
 注意：
     二分类头做的是情绪正/负性分类（从 label4 % 2 推算），不是抑郁症诊断。
-    如需做诊断二分类，请使用 batch["diagnosis_label"] 替换 y_2cls。
 """
 
 import os
@@ -536,9 +538,9 @@ def train_one_epoch_two_branch(
     subject_bio_std=None,
 ):
     """
-    双任务训练：四分类情绪 + 二分类情绪。
+    双任务训练：四分类情绪 + 二分类情绪（所有头共享全量特征 z）。
 
-    L = L_4cls(z_conv, label4) + λ_diag × L_2cls(z_diag, emotion_binary)
+    L = L_4cls(z, label4) + λ_diag × L_2cls(z, emotion_binary)
         + λ_domain × L_domain + λ_center × L_center
     """
     model.train()
@@ -676,36 +678,6 @@ def build_weighted_sampler_from_dataset(dataset):
         replacement=True,
     )
     return sampler
-
-
-def get_competition_subject_split(
-    index_csv: str,
-    fold: int = 0,
-    n_splits: int = 5,
-    seed: int = 42,
-):
-    df = pd.read_csv(index_csv)
-    subject_df = df[["subject_id", "diagnosis_label"]].drop_duplicates().reset_index(drop=True)
-
-    sgkf = StratifiedGroupKFold(
-        n_splits=n_splits,
-        shuffle=True,
-        random_state=seed,
-    )
-
-    splits = list(
-        sgkf.split(
-            X=subject_df["subject_id"],
-            y=subject_df["diagnosis_label"],
-            groups=subject_df["subject_id"],
-        )
-    )
-
-    train_idx, val_idx = splits[fold]
-    train_subjects = subject_df.iloc[train_idx]["subject_id"].tolist()
-    val_subjects = subject_df.iloc[val_idx]["subject_id"].tolist()
-
-    return train_subjects, val_subjects
 
 
 # =========================================================
@@ -1556,10 +1528,12 @@ def train_competition_cross_subject(
     save_warmup_epochs: int = 10,
 ):
     """
-    双任务跨被试训练（TwoBranchModel）。
+    双任务训练（TwoBranchModel），90/10 随机划分。
 
-    L = L_4cls(z_conv, label4) + λ_diag × L_2cls(z_diag, emotion_binary)
+    L = L_4cls(z, label4) + λ_diag × L_2cls(z, emotion_binary)
         + λ_domain × L_domain + λ_center × L_center
+
+    所有分类头共享 encoder 全量特征 z = z_conv ⊕ z_plv ⊕ z_bio [B, 185]。
     """
     os.makedirs(save_dir, exist_ok=True)
 
@@ -2406,10 +2380,10 @@ if __name__ == "__main__":
     combined_segment_emo_confusions = []
     combined_trial_emo_confusions = []
 
-    # 多随机种子 × 五折交叉验证
+    # 多随机种子 × 多次 90/10 随机划分
     for repeat, rand in enumerate(config.TEST_SEED):
         print(f"\n{'#' * 70}")
-        print(f"开始 random seed = {rand} 的 {5} 折交叉验证")
+        print(f"开始 random seed = {rand} 的 {5} 次 90/10 随机划分训练")
         print(f"{'#' * 70}")
 
         seed_combined_rows = []
@@ -2417,7 +2391,7 @@ if __name__ == "__main__":
 
         for fold in range(n_splits):
             print(f"\n{'=' * 50}")
-            print(f"开始训练第 {fold + 1}/{n_splits} 折 | seed={rand}")
+            print(f"开始训练第 {fold + 1}/{n_splits} 次划分 | seed={rand}")
             print(f"{'=' * 50}")
 
             # 关键：模型初始化前设置 seed
