@@ -1781,7 +1781,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_root", type=str, default="model_params/V2_expert_ssas")
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--all_folds", action="store_true")
-    parser.add_argument("--n_splits", type=int, default=5)
+    parser.add_argument("--n_splits", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=0)
     parser.add_argument("--all_repeats", action="store_true")
     parser.add_argument("--stage1_epochs", type=int, default=20)
@@ -1871,3 +1871,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    #训练
+    # python3 V2/train_expert_ssas_emotion.py --all_folds --all_repeats --stage1_epochs 20 --stage2_epochs 100 --batch_size 128 --predict_test --test_vote_method soft_topk --k_pos 4
