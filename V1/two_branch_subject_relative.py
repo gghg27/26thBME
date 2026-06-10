@@ -23,6 +23,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 from models.diag_model_ssas import DepressionBiomarkerExtractor, _safe_std
+from models.dep_contrast_bio import BiologicalMarkerExtractor
 
 
 # =========================================================
@@ -2202,20 +2203,14 @@ class BrainGraphBackbone(nn.Module):
         )
 
         # =====================================================
-        # 分支 3：显式抑郁 EEG biomarker 分支（新增）
-        # 频带统计 + 左右不对称 + Hjorth + PLV 图指标 + 非线性复杂度
-        # 输出 z_bio: [B, 64]
+        # 分支 3：显式抑郁 EEG biomarker 分支（替换为 57 维精简版）
+        # 频带能量(33) + 左右不对称(3) + Hjorth(10) + PLV图指标(5) + 非线性(6)
+        # 输出 z_bio: [B, 57]（无投影层，直接拼接）
         # =====================================================
-        self.biomarker_extractor = SubjectRelativeBiomarkerExtractor(
+        self.biomarker_extractor = BiologicalMarkerExtractor(
             sfreq=sfreq,
             num_channels=30,
-            num_de_bands=4,
-            use_sampen_from_de_feat=True,
-            sampen_index=-1,
-            out_dim=64,
-            hidden_dim=128,
-            dropout=dropout,
-            detach_biomarkers=True,
+            eps=relative_eps,
             use_subject_relative_bio=self.use_subject_relative_bio,
             bio_abs_scale=self.bio_abs_scale,
             relative_eps=self.relative_eps,
@@ -2223,10 +2218,10 @@ class BrainGraphBackbone(nn.Module):
 
         # ── 输出维度说明 ──
         # z_conv:  [B, 64]   → 四分类情绪头
-        # z_diag:  [B, 128]  → z_plv ⊕ z_bio → 二分类诊断头
+        # z_diag:  [B, 121]  → z_plv (64) ⊕ z_bio (57) → 二分类诊断头
         self.conv_dim = 64          # z_conv 维度
-        self.diag_dim = 64 + 64     # z_plv (64) + z_bio (64) = 128
-        self.out_dim = self.conv_dim + self.diag_dim  # 兼容旧接口
+        self.diag_dim = 64 + 57     # z_plv (64) + z_bio (57) = 121
+        self.out_dim = self.conv_dim + self.diag_dim  # 64 + 121 = 185，兼容旧接口
 
         # 保留原来的 Hjorth projector 定义，避免外部加载旧代码时报属性缺失。
         self.h_projector = nn.Sequential(
@@ -2253,9 +2248,9 @@ class BrainGraphBackbone(nn.Module):
             dict:
                 z_conv:  [B, 64]   多尺度卷积特征（→ 四分类头）
                 z_plv:   [B, 64]   PLV 图读出特征
-                z_bio:   [B, 64]   biomarker 特征
-                z_diag:  [B, 128]  z_plv ⊕ z_bio（→ 二分类诊断头）
-                z:       [B, 192]  三路拼接（兼容旧接口）
+                z_bio:   [B, 57]   biomarker 特征（精简版）
+                z_diag:  [B, 121]  z_plv ⊕ z_bio（→ 二分类诊断头）
+                z:       [B, 185]  三路拼接（兼容旧接口）
                 ...
         """
         # =====================================================
@@ -2326,33 +2321,34 @@ class BrainGraphBackbone(nn.Module):
         z_plv, _ = self.plv_readout(plv_node_embeddings)  # [B, 64]
 
         # =====================================================
-        # 5. 分支 3：显式 biomarker 特征（新增） → z_bio
+        # 5. 分支 3：显式 biomarker 特征（57 维精简版） → z_bio
         # =====================================================
-        z_bio, bio_raw, bio_aux = self.biomarker_extractor(
+        bio_dict = self.biomarker_extractor(
             x=x,
             de_feat=de_for_model,
-            plv_matrix=plv_graph_dict["plv_matrix"],
             hjorth=hjorth,
-            return_raw=True,
+            plv_matrix=plv_graph_dict["plv_matrix"],
             subject_bio_mu=subject_bio_mu,
             subject_bio_std=subject_bio_std,
-        )  # z_bio: [B, 64]
+        )
+        z_bio = bio_dict["bio_feat"]    # [B, 57]
+        bio_raw = bio_dict["bio_raw"]   # [B, 57]
 
         # =====================================================
         # 6. 重组输出
         # =====================================================
-        z_diag = torch.cat([z_plv, z_bio], dim=-1)   # [B, 128] → 二分类诊断头
-        z = torch.cat([z_conv, z_plv, z_bio], dim=-1)  # [B, 192] → 兼容旧接口
+        z_diag = torch.cat([z_plv, z_bio], dim=-1)   # [B, 121] → 二分类诊断头
+        z = torch.cat([z_conv, z_plv, z_bio], dim=-1)  # [B, 185] → 兼容旧接口
 
         return {
             # ── 新结构：按用途分离 ──
             "z_conv": z_conv,            # [B, 64]   → 四分类情绪头
             "z_plv": z_plv,              # [B, 64]   PLV 分支出
-            "z_bio": z_bio,              # [B, 64]   biomarker 分支
-            "z_diag": z_diag,            # [B, 128]  → 二分类诊断头
+            "z_bio": z_bio,              # [B, 57]   biomarker 分支
+            "z_diag": z_diag,            # [B, 121]  → 二分类诊断头
 
             # ── 兼容旧接口 ──
-            "z": z,                      # [B, 192]  三路全拼接
+            "z": z,                      # [B, 185]  三路全拼接
             "z_or": z_plv,
             "graph_feat": z_diag,        # 二分类头用的特征，兼容 center loss 等
 
@@ -2381,9 +2377,9 @@ class BrainGraphBackbone(nn.Module):
             "de_z": de_z,
             "de_input": de_input,
             "de_for_model": de_for_model,
-            "bio_raw_rel": bio_aux.get("bio_raw_rel"),
-            "bio_raw_z": bio_aux.get("bio_raw_z"),
-            "bio_input": bio_aux.get("bio_input"),
+            "bio_raw_rel": bio_dict.get("bio_raw_rel"),
+            "bio_raw_z": bio_dict.get("bio_raw_z"),
+            "bio_input": bio_dict.get("bio_input"),
         }
 
 
@@ -2475,7 +2471,7 @@ class EmotionPretrainModel(nn.Module):
             bio_abs_scale=bio_abs_scale,
             relative_eps=relative_eps,
         )
-        self.in_dim = 128
+        self.in_dim = self.backbone.out_dim  # 动态读取，当前为 185
         self.seed_head = ClassificationHead(in_dim=self.in_dim, num_classes=2, hidden_dim=64, dropout=dropout)
         self.seed4_head = ClassificationHead(in_dim=self.in_dim, num_classes=4, hidden_dim=64, dropout=dropout)
         self.com4_head = ClassificationHead(in_dim=self.in_dim, num_classes=nclass, hidden_dim=64, dropout=dropout)
@@ -2533,8 +2529,8 @@ class TwoBranchModel(nn.Module):
         EEG x + de_feat
         -> BrainGraphBackbone (3 branches)
         -> z_conv  [B, 64]  ──→ cls4_head  ──→ 四分类情绪 logits
-        -> z_diag  [B, 128] ──→ cls2_head  ──→ 二分类诊断 logits
-        -> z_diag  [B, 128] ──→ domain_head (GRL) ──→ 被试域 logits
+        -> z_diag  [B, 121] ──→ cls2_head  ──→ 二分类诊断 logits
+        -> z_diag  [B, 121] ──→ domain_head (GRL) ──→ 被试域 logits
 
     两个 loss：
         L = L_4cls(z_conv, label4) + λ_diag × L_2cls(z_diag, diagnosis_label) + λ_dom × L_domain
@@ -2765,7 +2761,7 @@ if __name__ == "__main__":
 
     out_seed = pretrain_model(x,de_feat=de_feat, lambda_dom=0.1, dataset_name="comp4")
     print("SEED logits:", out_seed["logits"].shape)  # [B, 3]
-    print("Graph embedding:", out_seed["z"].shape)  # [B, 128]
+    print("Graph embedding:", out_seed["z"].shape)  # [B, 185]
     print("Adjacency:", out_seed["adj_norm"].shape)  # [B, 30, 30]
     print("Power diag:", out_seed["power_diag_values"].shape)  # [B, 30]
 

@@ -790,7 +790,7 @@ class BiologicalMarkerExtractor(nn.Module):
         r = torch.tensor(rows, device=A.device, dtype=torch.long)
         c = torch.tensor(cols, device=A.device, dtype=torch.long)
         sub = A.index_select(1, r).index_select(2, c)
-        return sub.mean(dim=(1, 2), keepdim=True)
+        return sub.mean(dim=(1, 2), keepdim=False).unsqueeze(-1)
 
     def _match_num_bands(self, feat: torch.Tensor) -> torch.Tensor:
         if feat.size(-1) == self.num_bands:

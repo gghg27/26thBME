@@ -612,7 +612,7 @@ def train_one_epoch_two_branch(
 
         # ── 总 loss ──
         loss = (
-            loss_4cls
+            0.5*loss_4cls
             + lambda_diag * loss_2cls
             + center_weight * loss_center
             + lambda_domain * loss_dom
