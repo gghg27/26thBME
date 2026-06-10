@@ -1776,8 +1776,8 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--index_csv", type=str, default="com_index_sub_10s.csv")
-    parser.add_argument("--test_csv", type=str, default="com_test_trial_index_10s.csv")
+    parser.add_argument("--index_csv", type=str, default="com_index_sub_2s.csv")
+    parser.add_argument("--test_csv", type=str, default="com_test_trial_index_2s.csv")
     parser.add_argument("--save_root", type=str, default="model_params/V2_expert_ssas")
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--all_folds", action="store_true")
