@@ -476,7 +476,18 @@ def apply_subject_topk(trial_records: list[dict], k_pos: int = 4) -> list[dict]:
 
 
 def ensemble_and_save(all_probs: list[pd.DataFrame], output_dir: Path):
-    # soft voting
+    """
+    集成多个模型的预测结果。
+
+    同时输出：
+      - soft voting（均值概率）：threshold 版本 + topk 版本
+      - hard voting（多数投票）：threshold 版本 + topk 版本
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ============================================================
+    # 1. 合并所有模型
+    # ============================================================
     merged = all_probs[0]
     for i, df in enumerate(all_probs[1:]):
         merged = merged.merge(df, on=["user_id", "trial_id"], how="inner",
@@ -484,40 +495,112 @@ def ensemble_and_save(all_probs: list[pd.DataFrame], output_dir: Path):
 
     prob_cols = [c for c in merged.columns if c.startswith("prob_pos")]
     score_cols = [c for c in merged.columns if c.startswith("score_pos")]
+    n_models = len(prob_cols)
 
-    merged["prob_pos_ensemble"] = merged[prob_cols].mean(axis=1)
-    merged["score_pos_ensemble"] = merged[score_cols].mean(axis=1)
-    merged["n_models"] = len(prob_cols)
-    merged["pred_threshold"] = (merged["prob_pos_ensemble"] >= 0.5).astype(int)
+    # ============================================================
+    # 2. Soft Voting：均值概率
+    # ============================================================
+    merged["prob_pos_soft"] = merged[prob_cols].mean(axis=1)
+    merged["score_pos_soft"] = merged[score_cols].mean(axis=1)
+    merged["n_models"] = n_models
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # ============================================================
+    # 3. Hard Voting：每个模型投 0/1，多数胜出
+    # ============================================================
+    # 3a. Threshold 硬投票：每个模型按 prob_pos >= 0.5 判 0/1
+    for col in prob_cols:
+        model_idx = col.replace("prob_pos", "").replace("_", "")
+        vote_col = f"vote{model_idx}"
+        merged[vote_col] = (merged[col] >= 0.5).astype(int)
+    vote_cols = [c for c in merged.columns if c.startswith("vote")]
+    merged["hard_vote_sum"] = merged[vote_cols].sum(axis=1)
+    merged["pred_hard_threshold"] = (merged["hard_vote_sum"] > n_models / 2).astype(int)
 
-    # 完整结果（threshold 版本）
+    # 3b. TopK 硬投票：每个模型独立对被试内 trial 按 score_pos 排序取 topk，再投票
+    merged["pred_hard_topk"] = 0  # 占位
+    if USE_TOPK:
+        # 为每个模型构建 trial 记录，独立做 topk
+        per_model_votes = []
+        for pcol, scol in zip(prob_cols, score_cols):
+            model_records = []
+            for _, row in merged.iterrows():
+                model_records.append({
+                    "user_id": row["user_id"],
+                    "trial_id": row["trial_id"],
+                    "prob_pos": row[pcol],
+                    "score_pos": row[scol],
+                })
+            topk_records = apply_subject_topk(model_records, k_pos=K_POS)
+            # 构建 (user_id, trial_id) -> label 的映射
+            vote_map = {
+                (r["user_id"], r["trial_id"]): r["Emotion_label"]
+                for r in topk_records
+            }
+            per_model_votes.append(vote_map)
+
+        # 对每个 trial 统计各模型投票结果
+        topk_vote_sums = []
+        for _, row in merged.iterrows():
+            key = (row["user_id"], row["trial_id"])
+            votes = [vm.get(key, 0) for vm in per_model_votes]
+            topk_vote_sums.append(sum(votes))
+        merged["topk_vote_sum"] = topk_vote_sums
+        merged["pred_hard_topk"] = (merged["topk_vote_sum"] > n_models / 2).astype(int)
+
+    # ============================================================
+    # 4. 保存完整结果
+    # ============================================================
     merged.to_csv(output_dir / "test_ensemble_probs.csv", index=False, encoding="utf-8-sig")
     print(f"[save] 完整概率: {output_dir / 'test_ensemble_probs.csv'}")
 
-    # threshold 提交
-    sub_th = merged[["user_id", "trial_id", "pred_threshold"]].copy()
-    sub_th.rename(columns={"pred_threshold": "Emotion_label"}, inplace=True)
-    sub_th.to_csv(output_dir / "submission_threshold.csv", index=False, encoding="utf-8-sig")
-    n_pos = int(sub_th["Emotion_label"].sum())
-    print(f"[save] submission (threshold): {output_dir / 'submission_threshold.csv'}")
-    print(f"       正性: {n_pos}/{len(sub_th)} ({100*n_pos/max(len(sub_th),1):.1f}%)")
+    # ============================================================
+    # 5. 输出 4 份提交文件
+    # ============================================================
+    submissions = []
 
-    # top-K 提交
+    # --- Soft Voting + Threshold ---
+    sub_soft_th = merged[["user_id", "trial_id"]].copy()
+    sub_soft_th["Emotion_label"] = (merged["prob_pos_soft"] >= 0.5).astype(int)
+    sub_soft_th.to_csv(output_dir / "submission_soft_threshold.csv", index=False, encoding="utf-8-sig")
+    n_pos = int(sub_soft_th["Emotion_label"].sum())
+    print(f"[save] submission (soft+threshold): {output_dir / 'submission_soft_threshold.csv'}")
+    print(f"       正性: {n_pos}/{len(sub_soft_th)} ({100*n_pos/max(len(sub_soft_th),1):.1f}%)")
+    submissions.append(sub_soft_th)
+
+    # --- Soft Voting + TopK ---
     if USE_TOPK:
         trial_records = []
         for _, row in merged.iterrows():
             trial_records.append({
                 "user_id": row["user_id"], "trial_id": row["trial_id"],
-                "prob_pos": row["prob_pos_ensemble"], "score_pos": row["score_pos_ensemble"],
+                "prob_pos": row["prob_pos_soft"], "score_pos": row["score_pos_soft"],
             })
         topk_results = apply_subject_topk(trial_records, k_pos=K_POS)
-        sub_topk = pd.DataFrame(topk_results)[["user_id", "trial_id", "Emotion_label"]]
-        sub_topk.to_csv(output_dir / "submission_topk.csv", index=False, encoding="utf-8-sig")
-        n_pos_tk = int(sub_topk["Emotion_label"].sum())
-        print(f"[save] submission (topk={K_POS}): {output_dir / 'submission_topk.csv'}")
-        print(f"       正性: {n_pos_tk}/{len(sub_topk)} ({100*n_pos_tk/max(len(sub_topk),1):.1f}%)")
+        sub_soft_tk = pd.DataFrame(topk_results)[["user_id", "trial_id", "Emotion_label"]]
+        sub_soft_tk.to_csv(output_dir / "submission_soft_topk.csv", index=False, encoding="utf-8-sig")
+        n_pos_tk = int(sub_soft_tk["Emotion_label"].sum())
+        print(f"[save] submission (soft+topk={K_POS}): {output_dir / 'submission_soft_topk.csv'}")
+        print(f"       正性: {n_pos_tk}/{len(sub_soft_tk)} ({100*n_pos_tk/max(len(sub_soft_tk),1):.1f}%)")
+        submissions.append(sub_soft_tk)
+
+    # --- Hard Voting + Threshold ---
+    sub_hard_th = merged[["user_id", "trial_id"]].copy()
+    sub_hard_th["Emotion_label"] = merged["pred_hard_threshold"]
+    sub_hard_th.to_csv(output_dir / "submission_hard_threshold.csv", index=False, encoding="utf-8-sig")
+    n_pos_ht = int(sub_hard_th["Emotion_label"].sum())
+    print(f"[save] submission (hard+threshold): {output_dir / 'submission_hard_threshold.csv'}")
+    print(f"       正性: {n_pos_ht}/{len(sub_hard_th)} ({100*n_pos_ht/max(len(sub_hard_th),1):.1f}%)")
+    submissions.append(sub_hard_th)
+
+    # --- Hard Voting + TopK ---
+    if USE_TOPK:
+        sub_hard_tk = merged[["user_id", "trial_id"]].copy()
+        sub_hard_tk["Emotion_label"] = merged["pred_hard_topk"]
+        sub_hard_tk.to_csv(output_dir / "submission_hard_topk.csv", index=False, encoding="utf-8-sig")
+        n_pos_htk = int(sub_hard_tk["Emotion_label"].sum())
+        print(f"[save] submission (hard+topk={K_POS}): {output_dir / 'submission_hard_topk.csv'}")
+        print(f"       正性: {n_pos_htk}/{len(sub_hard_tk)} ({100*n_pos_htk/max(len(sub_hard_tk),1):.1f}%)")
+        submissions.append(sub_hard_tk)
 
     return merged
 

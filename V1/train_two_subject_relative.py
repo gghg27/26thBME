@@ -1799,14 +1799,22 @@ def train_competition_cross_subject(
     best_trackers = {
         "combined": {
             "criteria": [
-                ("topk_trial_macro_f1", "max"),
-                ("topk_trial_acc", "max"),
-                ("trial_prob_macro_f1", "max"),
+                # 第一优先级：trial_prob（与测试提交口径完全一致）
                 ("trial_prob_acc", "max"),
-                ("trial_macro_f1", "max"),
+                ("trial_prob_macro_f1", "max"),
+                # 第二优先级：四分类情绪指标
+                ("macro_f1", "max"),
+                ("acc", "max"),
+                # 第三优先级：trial/segment 级情绪二分类
                 ("trial_acc", "max"),
-                ("emotion_macro_f1", "max"),
+                ("trial_macro_f1", "max"),
                 ("emotion_acc", "max"),
+                ("emotion_macro_f1", "max"),
+                # 第四优先级：topk 指标
+                ("topk_trial_acc", "max"),
+                ("topk_trial_macro_f1", "max"),
+                ("topk_subject_gap_mean", "max"),
+                # 最后：loss 兜底
                 ("loss", "min"),
             ],
             "best_metrics": None,
