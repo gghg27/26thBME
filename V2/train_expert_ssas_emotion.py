@@ -79,6 +79,8 @@ def to_jsonable(obj: Any):
         return obj.detach().cpu().tolist()
     if isinstance(obj, np.ndarray):
         return obj.tolist()
+    if isinstance(obj, Path):
+        return str(obj)
     if isinstance(obj, (np.integer,)):
         return int(obj)
     if isinstance(obj, (np.floating,)):
@@ -633,6 +635,13 @@ def train_stage2_one_epoch(
     target_iter = cycle(target_loader)
     totals = defaultdict(float)
     total_n = 0
+    all_mix_preds = []
+    all_expert_preds = []
+    all_emo_labels = []
+    all_diag_preds = []
+    all_diag_labels = []
+    all_domain_preds = []
+    all_domain_labels = []
 
     pbar = tqdm(source_loader, desc="Stage2-Train", leave=False)
     for source_batch in pbar:
@@ -685,6 +694,19 @@ def train_stage2_one_epoch(
         loss.backward()
         optimizer.step()
 
+        with torch.no_grad():
+            mix_pred = source_out["mix_prob"].argmax(dim=1)
+            diag_pred = source_out["diag_logits"].argmax(dim=1)
+
+            selected_logits = torch.empty_like(source_out["hc_logits"])
+            hc_mask = y_diag == 1
+            dep_mask = y_diag == 0
+            selected_logits[hc_mask] = source_out["hc_logits"][hc_mask]
+            selected_logits[dep_mask] = source_out["dep_logits"][dep_mask]
+            expert_pred = selected_logits.argmax(dim=1)
+
+            domain_pred = domain_logits.argmax(dim=1)
+
         bsz = source_batch["x"].size(0)
         total_n += bsz
         totals["loss"] += float(loss.item()) * bsz
@@ -694,17 +716,140 @@ def train_stage2_one_epoch(
         totals["loss_mmd"] += float(loss_mmd.item()) * bsz
         totals["loss_subject_domain"] += float(loss_subject_domain.item()) * bsz
         totals["loss_ent"] += float(loss_ent.item()) * bsz
-        totals["segment_acc"] += int((source_out["mix_prob"].argmax(dim=1) == y_emo).sum().item())
-        totals["diag_acc"] += int((source_out["diag_logits"].argmax(dim=1) == y_diag).sum().item())
+        totals["loss_mdc"] += float(loss_mdc.item()) * bsz
+        totals["mix_correct"] += int((mix_pred == y_emo).sum().item())
+        totals["expert_correct"] += int((expert_pred == y_emo).sum().item())
+        totals["diag_correct"] += int((diag_pred == y_diag).sum().item())
+        totals["domain_correct"] += int((domain_pred == domain_labels).sum().item())
+        totals["domain_n"] += int(domain_labels.numel())
+        totals["hc_n"] += int(hc_mask.sum().item())
+        totals["dep_n"] += int(dep_mask.sum().item())
+        if hc_mask.any():
+            totals["hc_expert_correct"] += int(
+                (source_out["hc_logits"][hc_mask].argmax(dim=1) == y_emo[hc_mask]).sum().item()
+            )
+        if dep_mask.any():
+            totals["dep_expert_correct"] += int(
+                (source_out["dep_logits"][dep_mask].argmax(dim=1) == y_emo[dep_mask]).sum().item()
+            )
+        totals["pred_pos_mix"] += int((mix_pred == 1).sum().item())
+        totals["true_pos_emo"] += int((y_emo == 1).sum().item())
+        totals["pred_hc_diag"] += int((diag_pred == 1).sum().item())
+        totals["true_hc_diag"] += int((y_diag == 1).sum().item())
+        totals["sample_weight_sum"] += float(sample_weight.sum().item())
+
+        all_mix_preds.extend(mix_pred.detach().cpu().tolist())
+        all_expert_preds.extend(expert_pred.detach().cpu().tolist())
+        all_emo_labels.extend(y_emo.detach().cpu().tolist())
+        all_diag_preds.extend(diag_pred.detach().cpu().tolist())
+        all_diag_labels.extend(y_diag.detach().cpu().tolist())
+        all_domain_preds.extend(domain_pred.detach().cpu().tolist())
+        all_domain_labels.extend(domain_labels.detach().cpu().tolist())
+
         pbar.set_postfix(
             {
                 "loss": f"{totals['loss'] / max(total_n, 1):.4f}",
+                "exp": f"{totals['loss_expert'] / max(total_n, 1):.4f}",
                 "mix": f"{totals['loss_mix'] / max(total_n, 1):.4f}",
                 "mmd": f"{totals['loss_mmd'] / max(total_n, 1):.4f}",
+                "acc": f"{totals['mix_correct'] / max(total_n, 1):.4f}",
+                "diag": f"{totals['diag_correct'] / max(total_n, 1):.4f}",
             }
         )
 
-    metrics = {k: v / max(total_n, 1) for k, v in totals.items()}
+    if total_n == 0:
+        raise RuntimeError("Stage2 source loader is empty: total_n == 0.")
+
+    emotion_labels = [0, 1]
+    metrics = {
+        "loss": totals["loss"] / total_n,
+        "loss_expert": totals["loss_expert"] / total_n,
+        "loss_mix": totals["loss_mix"] / total_n,
+        "loss_diag": totals["loss_diag"] / total_n,
+        "loss_mmd": totals["loss_mmd"] / total_n,
+        "loss_subject_domain": totals["loss_subject_domain"] / total_n,
+        "loss_ent": totals["loss_ent"] / total_n,
+        "loss_mdc": totals["loss_mdc"] / total_n,
+        "segment_acc": totals["mix_correct"] / total_n,
+        "expert_acc": totals["expert_correct"] / total_n,
+        "diag_acc": totals["diag_correct"] / total_n,
+        "subject_domain_acc": totals["domain_correct"] / max(totals["domain_n"], 1),
+        "hc_expert_acc": totals["hc_expert_correct"] / max(totals["hc_n"], 1),
+        "dep_expert_acc": totals["dep_expert_correct"] / max(totals["dep_n"], 1),
+        "hc_samples": totals["hc_n"],
+        "dep_samples": totals["dep_n"],
+        "pred_pos_rate": totals["pred_pos_mix"] / total_n,
+        "true_pos_rate": totals["true_pos_emo"] / total_n,
+        "pred_hc_rate": totals["pred_hc_diag"] / total_n,
+        "true_hc_rate": totals["true_hc_diag"] / total_n,
+        "sample_weight_mean": totals["sample_weight_sum"] / total_n,
+    }
+
+    metrics["emotion_macro_f1"] = f1_score(
+        all_emo_labels,
+        all_mix_preds,
+        average="macro",
+        labels=emotion_labels,
+        zero_division=0,
+    )
+    metrics["expert_macro_f1"] = f1_score(
+        all_emo_labels,
+        all_expert_preds,
+        average="macro",
+        labels=emotion_labels,
+        zero_division=0,
+    )
+    metrics["diag_macro_f1"] = f1_score(
+        all_diag_labels,
+        all_diag_preds,
+        average="macro",
+        labels=[0, 1],
+        zero_division=0,
+    )
+    domain_label_set = sorted(set(all_domain_labels) | set(all_domain_preds))
+    metrics["subject_domain_macro_f1"] = f1_score(
+        all_domain_labels,
+        all_domain_preds,
+        average="macro",
+        labels=domain_label_set,
+        zero_division=0,
+    )
+    metrics["emotion_confusion_matrix"] = confusion_matrix(
+        all_emo_labels,
+        all_mix_preds,
+        labels=emotion_labels,
+    )
+    metrics["expert_confusion_matrix"] = confusion_matrix(
+        all_emo_labels,
+        all_expert_preds,
+        labels=emotion_labels,
+    )
+    metrics["diag_confusion_matrix"] = confusion_matrix(
+        all_diag_labels,
+        all_diag_preds,
+        labels=[0, 1],
+    )
+    p, r, f1, support = precision_recall_fscore_support(
+        all_emo_labels,
+        all_mix_preds,
+        labels=emotion_labels,
+        zero_division=0,
+    )
+    metrics["per_class_emo"] = {
+        int(cls): {
+            "precision": float(p[i]),
+            "recall": float(r[i]),
+            "f1": float(f1[i]),
+            "support": int(support[i]),
+        }
+        for i, cls in enumerate(emotion_labels)
+    }
+
+    # V1-compatible aliases used by history/summary code.
+    metrics["acc_2cls"] = metrics["segment_acc"]
+    metrics["acc"] = metrics["segment_acc"]
+    metrics["macro_f1"] = metrics["emotion_macro_f1"]
+    metrics["emotion_acc"] = metrics["segment_acc"]
     return metrics
 
 
@@ -828,16 +973,54 @@ def validate_stage2_trial_level(
         "segment_records": segment_records,
     }
     metrics.update(trial_metrics)
+
+    # V1-compatible aliases for checkpoint criteria and summary tables.
+    metrics["emotion_acc"] = metrics["segment_acc"]
+    metrics["emotion_macro_f1"] = metrics["segment_macro_f1"]
+    metrics["acc"] = metrics["segment_acc"]
+    metrics["macro_f1"] = metrics["segment_macro_f1"]
+    metrics["trial_emotion_acc"] = metrics["trial_acc"]
+    metrics["trial_emotion_macro_f1"] = metrics["trial_macro_f1"]
     return metrics
 
 
 def metric_value(metrics: dict, key: str, default: float = 0.0) -> float:
     value = metrics.get(key, default)
+    if value is None:
+        return default
     if isinstance(value, torch.Tensor):
         return float(value.detach().cpu().item())
     if isinstance(value, np.ndarray):
         return default
     return float(value)
+
+
+def make_compare_key(metrics: dict, criteria) -> tuple:
+    key = []
+    for metric_name, mode in criteria:
+        value = metric_value(metrics, metric_name, default=None)
+        if value is None:
+            value = -1e18 if mode == "max" else 1e18
+        key.append(value if mode == "max" else -value)
+    return tuple(key)
+
+
+def is_better_by_criteria(current_metrics: dict, best_metrics: Optional[dict], criteria, eps: float = 1e-12) -> bool:
+    if best_metrics is None:
+        return True
+
+    cur_key = make_compare_key(current_metrics, criteria)
+    best_key = make_compare_key(best_metrics, criteria)
+    for cur_value, best_value in zip(cur_key, best_key):
+        if cur_value > best_value + eps:
+            return True
+        if cur_value < best_value - eps:
+            return False
+    return False
+
+
+def format_criteria(criteria) -> str:
+    return " -> ".join([f"{name}({mode})" for name, mode in criteria])
 
 
 def is_better(current: dict, best: Optional[dict]) -> bool:
@@ -849,18 +1032,7 @@ def is_better(current: dict, best: Optional[dict]) -> bool:
         ("segment_macro_f1", "max"),
         ("loss", "min"),
     ]
-    for name, mode in criteria:
-        c = metric_value(current, name, 1e18 if mode == "min" else -1e18)
-        b = metric_value(best, name, 1e18 if mode == "min" else -1e18)
-        if mode == "max" and c > b + 1e-12:
-            return True
-        if mode == "max" and c < b - 1e-12:
-            return False
-        if mode == "min" and c < b - 1e-12:
-            return True
-        if mode == "min" and c > b + 1e-12:
-            return False
-    return False
+    return is_better_by_criteria(current, best, criteria)
 
 
 def flatten_metrics_for_csv(prefix: str, metrics: dict) -> dict:
@@ -882,34 +1054,230 @@ def flatten_metrics_for_csv(prefix: str, metrics: dict) -> dict:
 
 def save_best_checkpoint(
     save_dir: str | Path,
+    fold: int,
+    best_name: str,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     epoch: int,
     train_metrics: dict,
     val_metrics: dict,
+    train_subjects,
+    val_subjects,
+    criteria,
     config_dict: dict,
-    filename: str = "stage2_best.pt",
-) -> str:
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    extra_state: Optional[dict] = None,
+    filename: Optional[str] = None,
+) -> tuple[str, str, str]:
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
+
+    if filename is None:
+        filename = "stage2_best.pt" if best_name == "combined" else f"stage2_best_{best_name}_fold{fold}.pt"
     ckpt_path = save_dir / filename
-    torch.save(
+    json_path = save_dir / f"{Path(filename).stem}_metrics.json"
+    csv_path = save_dir / f"{Path(filename).stem}_summary.csv"
+
+    ckpt = {
+        "best_name": best_name,
+        "epoch": epoch,
+        "criteria": criteria,
+        "criteria_readable": format_criteria(criteria),
+        "model_state_dict": copy.deepcopy(model.state_dict()),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "train_metrics": to_jsonable(train_metrics),
+        "val_metrics": to_jsonable(val_metrics),
+        "train_subjects": to_jsonable(train_subjects),
+        "val_subjects": to_jsonable(val_subjects),
+        "config": to_jsonable(config_dict),
+    }
+    if scheduler is not None:
+        ckpt["scheduler_state_dict"] = scheduler.state_dict()
+    if extra_state is not None:
+        ckpt["extra_state"] = to_jsonable(extra_state)
+    torch.save(ckpt, ckpt_path)
+
+    save_json(
+        json_path,
         {
+            "best_name": best_name,
             "epoch": epoch,
-            "model_state_dict": copy.deepcopy(model.state_dict()),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "train_metrics": to_jsonable(train_metrics),
-            "val_metrics": to_jsonable(val_metrics),
-            "config": to_jsonable(config_dict),
+            "criteria": criteria,
+            "criteria_readable": format_criteria(criteria),
+            "train_metrics": train_metrics,
+            "val_metrics": val_metrics,
+            "train_subjects": train_subjects,
+            "val_subjects": val_subjects,
+            "config": config_dict,
+            "extra_state": extra_state or {},
+            "checkpoint_path": str(ckpt_path),
         },
-        ckpt_path,
     )
-    save_json(save_dir / f"{Path(filename).stem}_metrics.json", {"epoch": epoch, "train": train_metrics, "val": val_metrics})
-    row = {"epoch": epoch, "checkpoint_path": str(ckpt_path)}
+    row = {
+        "best_name": best_name,
+        "epoch": epoch,
+        "criteria": format_criteria(criteria),
+        "checkpoint_path": str(ckpt_path),
+    }
     row.update(flatten_metrics_for_csv("train", train_metrics))
     row.update(flatten_metrics_for_csv("val", val_metrics))
-    pd.DataFrame([row]).to_csv(save_dir / f"{Path(filename).stem}_summary.csv", index=False, encoding="utf-8-sig")
-    return str(ckpt_path)
+    pd.DataFrame([row]).to_csv(csv_path, index=False, encoding="utf-8-sig")
+    return str(ckpt_path), str(json_path), str(csv_path)
+
+
+def save_final_checkpoint(
+    save_dir: str | Path,
+    stage_name: str,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    train_metrics: dict,
+    val_metrics: dict,
+    train_subjects,
+    val_subjects,
+    config_dict: dict,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    extra_state: Optional[dict] = None,
+) -> tuple[str, str, str]:
+    """Save the final epoch snapshot without marking it as a best model."""
+
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = save_dir / f"{stage_name}_final.pt"
+    json_path = save_dir / f"{stage_name}_final_metrics.json"
+    csv_path = save_dir / f"{stage_name}_final_summary.csv"
+
+    ckpt = {
+        "best_name": "final",
+        "is_best": False,
+        "epoch": epoch,
+        "model_state_dict": copy.deepcopy(model.state_dict()),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "train_metrics": to_jsonable(train_metrics),
+        "val_metrics": to_jsonable(val_metrics),
+        "train_subjects": to_jsonable(train_subjects),
+        "val_subjects": to_jsonable(val_subjects),
+        "config": to_jsonable(config_dict),
+    }
+    if scheduler is not None:
+        ckpt["scheduler_state_dict"] = scheduler.state_dict()
+    if extra_state is not None:
+        ckpt["extra_state"] = to_jsonable(extra_state)
+    torch.save(ckpt, ckpt_path)
+
+    save_json(
+        json_path,
+        {
+            "best_name": "final",
+            "is_best": False,
+            "epoch": epoch,
+            "train_metrics": train_metrics,
+            "val_metrics": val_metrics,
+            "train_subjects": train_subjects,
+            "val_subjects": val_subjects,
+            "config": config_dict,
+            "extra_state": extra_state or {},
+            "checkpoint_path": str(ckpt_path),
+        },
+    )
+    row = {
+        "best_name": "final",
+        "is_best": False,
+        "epoch": epoch,
+        "checkpoint_path": str(ckpt_path),
+    }
+    row.update(flatten_metrics_for_csv("train", train_metrics))
+    row.update(flatten_metrics_for_csv("val", val_metrics))
+    pd.DataFrame([row]).to_csv(csv_path, index=False, encoding="utf-8-sig")
+    return str(ckpt_path), str(json_path), str(csv_path)
+
+
+def apply_subject_topk(trial_records: list[dict], k_pos: int = 4) -> list[dict]:
+    """Apply V1-style per-subject soft top-K prediction on trial scores."""
+
+    k_pos = 4 if int(k_pos) <= 0 else int(k_pos)
+    by_subject = defaultdict(list)
+    for record in trial_records:
+        by_subject[str(record["user_id"])].append(dict(record))
+
+    results = []
+    for _subject_id, records in by_subject.items():
+        records = sorted(records, key=lambda x: float(x.get("score_pos", 0.0)), reverse=True)
+        cur_k = int(k_pos) if len(records) == 8 else max(1, int(round(len(records) * 0.5)))
+        cur_k = max(0, min(cur_k, len(records)))
+        positive_keys = {(r["user_id"], r["trial_id"]) for r in records[:cur_k]}
+
+        for record in records:
+            record["Emotion_label"] = 1 if (record["user_id"], record["trial_id"]) in positive_keys else 0
+            results.append(record)
+
+    return sorted(results, key=lambda x: (str(x["user_id"]), int(x["trial_id"])))
+
+
+def build_stage2_best_trackers() -> dict:
+    def tracker(criteria):
+        return {
+            "criteria": criteria,
+            "best_metrics": None,
+            "best_train_metrics": None,
+            "best_epoch": None,
+            "checkpoint_path": None,
+            "metrics_json_path": None,
+            "summary_csv_path": None,
+        }
+
+    return {
+        "combined": tracker(
+            [
+                ("trial_macro_f1", "max"),
+                ("trial_acc", "max"),
+                ("emotion_macro_f1", "max"),
+                ("emotion_acc", "max"),
+                ("diag_macro_f1", "max"),
+                ("diag_acc", "max"),
+                ("loss", "min"),
+            ]
+        ),
+        "trial_f1": tracker(
+            [
+                ("trial_macro_f1", "max"),
+                ("trial_acc", "max"),
+                ("emotion_macro_f1", "max"),
+                ("loss", "min"),
+            ]
+        ),
+        "trial_acc": tracker(
+            [
+                ("trial_acc", "max"),
+                ("trial_macro_f1", "max"),
+                ("emotion_acc", "max"),
+                ("loss", "min"),
+            ]
+        ),
+        "segment_emo_f1": tracker(
+            [
+                ("emotion_macro_f1", "max"),
+                ("emotion_acc", "max"),
+                ("trial_macro_f1", "max"),
+                ("loss", "min"),
+            ]
+        ),
+        "diag_f1": tracker(
+            [
+                ("diag_macro_f1", "max"),
+                ("diag_acc", "max"),
+                ("trial_macro_f1", "max"),
+                ("loss", "min"),
+            ]
+        ),
+        "loss": tracker(
+            [
+                ("loss", "min"),
+                ("trial_macro_f1", "max"),
+                ("emotion_macro_f1", "max"),
+            ]
+        ),
+    }
 
 
 @torch.no_grad()
@@ -923,6 +1291,7 @@ def predict_test_trial_level(
     num_workers: int = 0,
     threshold: float = 0.5,
     vote_method: str = "prob",
+    k_pos: int = 4,
 ) -> pd.DataFrame:
     dataset = UnlabeledTargetDataset(test_csv, domain_mapping=domain_mapping, root=ROOT, normalize=True)
     loader = DataLoader(
@@ -939,7 +1308,11 @@ def predict_test_trial_level(
     for batch in tqdm(loader, desc="Test-Predict", leave=False):
         batch = move_batch_to_device(batch, device)
         out = model(batch["x"], batch["de_feat"], lambda_subject=0.0)
-        prob_pos = out["mix_prob"][:, 1].detach().cpu().tolist()
+        mix_prob = out["mix_prob"].clamp_min(1e-8)
+        prob_pos_tensor = mix_prob[:, 1]
+        score_pos_tensor = torch.log(mix_prob[:, 1]) - torch.log(mix_prob[:, 0])
+        prob_pos = prob_pos_tensor.detach().cpu().tolist()
+        score_pos = score_pos_tensor.detach().cpu().tolist()
         pred_window = [int(p >= threshold) for p in prob_pos]
         for i, p in enumerate(prob_pos):
             rows.append(
@@ -947,35 +1320,69 @@ def predict_test_trial_level(
                     "user_id": batch["user_id"][i],
                     "trial_id": int(batch["trial_id"][i].detach().cpu()),
                     "prob_window": float(p),
+                    "score_window": float(score_pos[i]),
                     "pred_window": int(pred_window[i]),
                 }
             )
     pred_df = pd.DataFrame(rows)
+    trial_df = (
+        pred_df.groupby(["user_id", "trial_id"], as_index=False)
+        .agg(
+            prob_pos=("prob_window", "mean"),
+            score_pos=("score_window", "mean"),
+            hard_mean=("pred_window", "mean"),
+            n_windows=("prob_window", "count"),
+        )
+        .sort_values(["user_id", "trial_id"])
+    )
+    trial_df["trial_prob"] = trial_df["prob_pos"]
+    trial_df["pred_soft_threshold"] = (trial_df["prob_pos"] >= threshold).astype(int)
+    trial_df["pred_hard_threshold"] = (trial_df["hard_mean"] >= 0.5).astype(int)
+
+    topk_records = apply_subject_topk(
+        trial_df[["user_id", "trial_id", "prob_pos", "score_pos"]].to_dict("records"),
+        k_pos=k_pos,
+    )
+    topk_df = pd.DataFrame(topk_records)[["user_id", "trial_id", "Emotion_label"]].rename(
+        columns={"Emotion_label": "pred_soft_topk"}
+    )
+    trial_df = trial_df.merge(topk_df, on=["user_id", "trial_id"], how="left")
+    trial_df["pred_soft_topk"] = trial_df["pred_soft_topk"].fillna(0).astype(int)
+
     if vote_method == "hard":
-        trial_df = (
-            pred_df.groupby(["user_id", "trial_id"], as_index=False)
-            .agg(
-                trial_prob=("prob_window", "mean"),
-                hard_mean=("pred_window", "mean"),
-                n_windows=("prob_window", "count"),
-            )
-            .sort_values(["user_id", "trial_id"])
-        )
-        trial_df["Emotion_label"] = (trial_df["hard_mean"] >= 0.5).astype(int)
+        trial_df["Emotion_label"] = trial_df["pred_hard_threshold"]
+    elif vote_method in {"soft_topk", "topk"}:
+        trial_df["Emotion_label"] = trial_df["pred_soft_topk"]
+    elif vote_method in {"prob", "soft_threshold"}:
+        trial_df["Emotion_label"] = trial_df["pred_soft_threshold"]
     else:
-        trial_df = (
-            pred_df.groupby(["user_id", "trial_id"], as_index=False)
-            .agg(trial_prob=("prob_window", "mean"), n_windows=("prob_window", "count"))
-            .sort_values(["user_id", "trial_id"])
-        )
-        trial_df["Emotion_label"] = (trial_df["trial_prob"] >= threshold).astype(int)
+        raise ValueError(f"Unknown vote_method={vote_method}")
 
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     pred_df.to_csv(save_dir / "test_window_probs.csv", index=False, encoding="utf-8-sig")
     trial_df.to_csv(save_dir / "test_trial_probs.csv", index=False, encoding="utf-8-sig")
+
+    sub_soft_threshold = trial_df[["user_id", "trial_id", "pred_soft_threshold"]].copy()
+    sub_soft_threshold.rename(columns={"pred_soft_threshold": "Emotion_label"}, inplace=True)
+    sub_soft_threshold.to_csv(save_dir / "submission_soft_threshold.csv", index=False, encoding="utf-8-sig")
+
+    sub_soft_topk = trial_df[["user_id", "trial_id", "pred_soft_topk"]].copy()
+    sub_soft_topk.rename(columns={"pred_soft_topk": "Emotion_label"}, inplace=True)
+    sub_soft_topk.to_csv(save_dir / "submission_soft_topk.csv", index=False, encoding="utf-8-sig")
+
+    sub_hard_threshold = trial_df[["user_id", "trial_id", "pred_hard_threshold"]].copy()
+    sub_hard_threshold.rename(columns={"pred_hard_threshold": "Emotion_label"}, inplace=True)
+    sub_hard_threshold.to_csv(save_dir / "submission_hard_threshold.csv", index=False, encoding="utf-8-sig")
+
     submission = trial_df[["user_id", "trial_id", "Emotion_label"]].copy()
     submission.to_csv(save_dir / "submission_expert_ssas.csv", index=False, encoding="utf-8-sig")
+    n_topk = int(sub_soft_topk["Emotion_label"].sum())
+    n_selected = int(submission["Emotion_label"].sum())
+    print(
+        f"[test] soft-topk={k_pos}: {n_topk}/{len(sub_soft_topk)} positive; "
+        f"selected={vote_method}: {n_selected}/{len(submission)} positive"
+    )
     return trial_df
 
 
@@ -1003,6 +1410,12 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
     print(
         f"[fold] repeat={repeat_index} fold={fold} seed={rand_seed} run_seed={run_seed} "
         f"source_subjects={len(split['train_all'])} val_subjects={len(split['val_all'])} domains={domain_mapping['num_domains']}"
+    )
+    config_dict = vars(args).copy()
+    config_dict.update({"fold": fold, "repeat_index": repeat_index, "rand_seed": rand_seed, "run_seed": run_seed})
+    print(
+        f"[Checkpoint] save_warmup_epochs={args.save_warmup_epochs}: "
+        f"epochs <= {args.save_warmup_epochs} will not update best checkpoints."
     )
 
     generator = torch.Generator()
@@ -1063,7 +1476,11 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
     diag_weights = build_diag_class_weights(source_dataset, use_label4_for_diagnosis=not args.use_raw_diagnosis_label)
 
     best_stage1 = None
+    stage1_best_path = None
     history1 = []
+    last_stage1_train_metrics = {}
+    last_stage1_val_metrics = {}
+    last_stage1_epoch = 0
     for epoch in range(1, args.stage1_epochs + 1):
         train_metrics = train_stage1_one_epoch(
             stage1,
@@ -1087,24 +1504,77 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
         row.update(flatten_metrics_for_csv("train", train_metrics))
         row.update(flatten_metrics_for_csv("val", val_stage1))
         history1.append(row)
+        last_stage1_train_metrics = copy.deepcopy(train_metrics)
+        last_stage1_val_metrics = copy.deepcopy(val_stage1)
+        last_stage1_epoch = epoch
         print(f"[Stage1] epoch={epoch} train_loss={train_metrics['loss']:.4f} val_domain={val_stage1['loss_domain']:.4f}")
-        if best_stage1 is None or val_stage1["loss_domain"] < best_stage1["val"]["loss_domain"]:
+        if epoch <= args.save_warmup_epochs:
+            print(f"[Stage1] skip best checkpoint during save warmup ({epoch}/{args.save_warmup_epochs})")
+        elif best_stage1 is None or val_stage1["loss_domain"] < best_stage1["val"]["loss_domain"]:
             best_stage1 = {"epoch": epoch, "train": copy.deepcopy(train_metrics), "val": copy.deepcopy(val_stage1)}
+            stage1_ckpt_path = save_dir / "stage1_best.pt"
+            stage1_best_path = stage1_ckpt_path
             torch.save(
                 {
+                    "best_name": "stage1_domain",
                     "epoch": epoch,
+                    "criteria": [("loss_domain", "min"), ("domain_acc", "max"), ("loss", "min")],
+                    "criteria_readable": "loss_domain(min) -> domain_acc(max) -> loss(min)",
                     "model_state_dict": copy.deepcopy(stage1.state_dict()),
                     "optimizer_state_dict": optimizer1.state_dict(),
+                    "scheduler_state_dict": scheduler1.state_dict(),
                     "train_metrics": to_jsonable(train_metrics),
                     "val_metrics": to_jsonable(val_stage1),
+                    "train_subjects": to_jsonable(split["train_all"]),
+                    "val_subjects": to_jsonable(split["val_all"]),
                     "domain_mapping": to_jsonable(domain_mapping),
                 },
-                save_dir / "stage1_best.pt",
+                stage1_ckpt_path,
             )
+            save_json(
+                save_dir / "stage1_best_metrics.json",
+                {
+                    "best_name": "stage1_domain",
+                    "epoch": epoch,
+                    "criteria": [("loss_domain", "min"), ("domain_acc", "max"), ("loss", "min")],
+                    "criteria_readable": "loss_domain(min) -> domain_acc(max) -> loss(min)",
+                    "train_metrics": train_metrics,
+                    "val_metrics": val_stage1,
+                    "train_subjects": split["train_all"],
+                    "val_subjects": split["val_all"],
+                    "checkpoint_path": str(stage1_ckpt_path),
+                },
+            )
+            stage1_row = {
+                "best_name": "stage1_domain",
+                "epoch": epoch,
+                "criteria": "loss_domain(min) -> domain_acc(max) -> loss(min)",
+                "checkpoint_path": str(stage1_ckpt_path),
+            }
+            stage1_row.update(flatten_metrics_for_csv("train", train_metrics))
+            stage1_row.update(flatten_metrics_for_csv("val", val_stage1))
+            pd.DataFrame([stage1_row]).to_csv(save_dir / "stage1_best_summary.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame(history1).to_csv(save_dir / "stage1_history.csv", index=False, encoding="utf-8-sig")
-    if (save_dir / "stage1_best.pt").exists():
-        ckpt = torch.load(save_dir / "stage1_best.pt", map_location=device)
+    if last_stage1_epoch > 0:
+        save_final_checkpoint(
+            save_dir=save_dir,
+            stage_name="stage1",
+            model=stage1,
+            optimizer=optimizer1,
+            epoch=last_stage1_epoch,
+            train_metrics=last_stage1_train_metrics,
+            val_metrics=last_stage1_val_metrics,
+            train_subjects=split["train_all"],
+            val_subjects=split["val_all"],
+            config_dict=config_dict,
+            scheduler=scheduler1,
+            extra_state={"domain_mapping": domain_mapping},
+        )
+    if stage1_best_path is not None and stage1_best_path.exists():
+        ckpt = torch.load(stage1_best_path, map_location=device)
         stage1.load_state_dict(ckpt["model_state_dict"])
+    elif last_stage1_epoch > 0:
+        print("[Stage1] no best checkpoint saved after warmup; using final Stage1 model for voting.")
 
     vote_result = compute_source_weights_by_classification_voting(
         stage1,
@@ -1133,11 +1603,11 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
 
     optimizer2 = torch.optim.AdamW(stage2.parameters(), lr=args.lr_stage2, weight_decay=args.weight_decay)
     scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer2, T_max=max(args.stage2_epochs, 1))
-    best_val = None
-    best_path = None
+    best_trackers = build_stage2_best_trackers()
     history2 = []
-    config_dict = vars(args).copy()
-    config_dict.update({"fold": fold, "repeat_index": repeat_index, "rand_seed": rand_seed, "run_seed": run_seed})
+    last_stage2_train_metrics = {}
+    last_stage2_val_metrics = {}
+    last_stage2_epoch = 0
 
     for epoch in range(1, args.stage2_epochs + 1):
         train_metrics = train_stage2_one_epoch(
@@ -1163,24 +1633,111 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
         row.update(flatten_metrics_for_csv("train", train_metrics))
         row.update(flatten_metrics_for_csv("val", val_metrics))
         history2.append(row)
+        last_stage2_train_metrics = copy.deepcopy(train_metrics)
+        last_stage2_val_metrics = copy.deepcopy(val_metrics)
+        last_stage2_epoch = epoch
         print(
             f"[Stage2] epoch={epoch} loss={train_metrics['loss']:.4f} "
+            f"train_emo_f1={train_metrics['emotion_macro_f1']:.4f} "
+            f"train_diag_f1={train_metrics['diag_macro_f1']:.4f} "
             f"val_trial_f1={val_metrics['trial_macro_f1']:.4f} val_trial_acc={val_metrics['trial_acc']:.4f}"
         )
-        if is_better(val_metrics, best_val):
-            best_val = copy.deepcopy(val_metrics)
-            best_path = save_best_checkpoint(
-                save_dir,
-                stage2,
-                optimizer2,
-                epoch,
-                train_metrics,
-                val_metrics,
-                config_dict,
-                filename="stage2_best.pt",
-            )
-            print(f"[Stage2] saved best: {best_path}")
-    pd.DataFrame(history2).to_csv(save_dir / "stage2_history.csv", index=False, encoding="utf-8-sig")
+
+        if epoch <= args.save_warmup_epochs:
+            print(f"[Stage2] skip best checkpoint during save warmup ({epoch}/{args.save_warmup_epochs})")
+        else:
+            for best_name, tracker in best_trackers.items():
+                criteria = tracker["criteria"]
+                if is_better_by_criteria(val_metrics, tracker["best_metrics"], criteria):
+                    ckpt_path, json_path, csv_path = save_best_checkpoint(
+                        save_dir=save_dir,
+                        fold=fold,
+                        best_name=best_name,
+                        model=stage2,
+                        optimizer=optimizer2,
+                        epoch=epoch,
+                        train_metrics=train_metrics,
+                        val_metrics=val_metrics,
+                        train_subjects=split["train_all"],
+                        val_subjects=split["val_all"],
+                        criteria=criteria,
+                        config_dict=config_dict,
+                        scheduler=scheduler2,
+                        extra_state={
+                            "domain_mapping": domain_mapping,
+                            "source_subject_weights": source_weights,
+                            "source_weight_vote": vote_result,
+                        },
+                    )
+                    tracker["best_metrics"] = copy.deepcopy(val_metrics)
+                    tracker["best_train_metrics"] = copy.deepcopy(train_metrics)
+                    tracker["best_epoch"] = epoch
+                    tracker["checkpoint_path"] = ckpt_path
+                    tracker["metrics_json_path"] = json_path
+                    tracker["summary_csv_path"] = csv_path
+                    print(
+                        f"[Stage2] saved best_{best_name}: epoch={epoch}, "
+                        f"criteria={format_criteria(criteria)}, path={ckpt_path}"
+                    )
+
+    stage2_history_csv = save_dir / "stage2_history.csv"
+    pd.DataFrame(history2).to_csv(stage2_history_csv, index=False, encoding="utf-8-sig")
+    stage2_final_path = None
+    stage2_final_json = None
+    stage2_final_csv = None
+    if last_stage2_epoch > 0:
+        stage2_final_path, stage2_final_json, stage2_final_csv = save_final_checkpoint(
+            save_dir=save_dir,
+            stage_name="stage2",
+            model=stage2,
+            optimizer=optimizer2,
+            epoch=last_stage2_epoch,
+            train_metrics=last_stage2_train_metrics,
+            val_metrics=last_stage2_val_metrics,
+            train_subjects=split["train_all"],
+            val_subjects=split["val_all"],
+            config_dict=config_dict,
+            scheduler=scheduler2,
+            extra_state={
+                "domain_mapping": domain_mapping,
+                "source_subject_weights": source_weights,
+                "source_weight_vote": vote_result,
+            },
+        )
+
+    best_rows = []
+    for best_name, tracker in best_trackers.items():
+        row = {
+            "best_name": best_name,
+            "best_epoch": tracker["best_epoch"],
+            "criteria": format_criteria(tracker["criteria"]),
+            "checkpoint_path": tracker["checkpoint_path"],
+            "metrics_json_path": tracker["metrics_json_path"],
+            "summary_csv_path": tracker["summary_csv_path"],
+        }
+        if tracker["best_metrics"] is not None:
+            row.update(flatten_metrics_for_csv("val", tracker["best_metrics"]))
+        best_rows.append(row)
+    stage2_best_summary_csv = save_dir / f"stage2_best_summary_fold{fold}.csv"
+    pd.DataFrame(best_rows).to_csv(stage2_best_summary_csv, index=False, encoding="utf-8-sig")
+    print(f"[Stage2] history saved: {stage2_history_csv}")
+    print(f"[Stage2] best summary saved: {stage2_best_summary_csv}")
+
+    selected_best_name = args.predict_best_name
+    if selected_best_name not in best_trackers:
+        print(f"[Stage2] predict_best_name={selected_best_name} not found, fallback to combined")
+        selected_best_name = "combined"
+    selected_tracker = best_trackers[selected_best_name]
+    best_path = selected_tracker["checkpoint_path"]
+    best_val = selected_tracker["best_metrics"]
+    if best_path is None and stage2_final_path is not None:
+        print(
+            "[Stage2] no best checkpoint was saved after warmup; "
+            f"fallback to final checkpoint for prediction: {stage2_final_path}"
+        )
+        selected_best_name = "final_fallback"
+        best_path = stage2_final_path
+        best_val = last_stage2_val_metrics
 
     if args.predict_test and args.test_csv and Path(args.test_csv).exists() and best_path:
         ckpt = torch.load(best_path, map_location=device)
@@ -1195,6 +1752,7 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
             num_workers=args.num_workers,
             threshold=args.threshold,
             vote_method=args.test_vote_method,
+            k_pos=args.k_pos,
         )
         print(f"[test] saved predictions, trials={len(trial_df)}")
 
@@ -1205,7 +1763,14 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
         "run_seed": run_seed,
         "save_dir": str(save_dir),
         "best_path": best_path,
+        "best_name": selected_best_name,
         "best_val": best_val,
+        "stage2_history_csv": str(stage2_history_csv),
+        "stage2_best_summary_csv": str(stage2_best_summary_csv),
+        "stage2_final_path": stage2_final_path,
+        "stage2_final_metrics_json": stage2_final_json,
+        "stage2_final_summary_csv": stage2_final_csv,
+        "best_models": best_trackers,
     }
 
 
@@ -1221,6 +1786,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--all_repeats", action="store_true")
     parser.add_argument("--stage1_epochs", type=int, default=20)
     parser.add_argument("--stage2_epochs", type=int, default=100)
+    parser.add_argument("--save_warmup_epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda:0")
@@ -1238,7 +1804,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use_raw_diagnosis_label", action="store_true")
 
     parser.add_argument("--lambda_domain", type=float, default=1.0)
-    parser.add_argument("--stage1_lambda_mmd", type=float, default=0.01)
+    parser.add_argument("--stage1_lambda_mmd", type=float, default=0.03)
     parser.add_argument("--lambda_emo_grl", type=float, default=0.001)
     parser.add_argument("--grl_emo", type=float, default=0.01)
     parser.add_argument("--lambda_diag_grl", type=float, default=0.001)
@@ -1260,7 +1826,13 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--predict_test", action="store_true")
-    parser.add_argument("--test_vote_method", choices=["prob", "hard"], default="prob")
+    parser.add_argument("--predict_best_name", type=str, default="combined")
+    parser.add_argument(
+        "--test_vote_method",
+        choices=["prob", "soft_threshold", "hard", "soft_topk", "topk"],
+        default="soft_topk",
+    )
+    parser.add_argument("--k_pos", type=int, default=4)
     return parser.parse_args()
 
 
@@ -1284,7 +1856,11 @@ def main() -> None:
             "rand_seed": result["rand_seed"],
             "run_seed": result["run_seed"],
             "save_dir": result["save_dir"],
+            "best_name": result.get("best_name"),
             "best_path": result["best_path"],
+            "stage2_history_csv": result.get("stage2_history_csv"),
+            "stage2_best_summary_csv": result.get("stage2_best_summary_csv"),
+            "stage2_final_path": result.get("stage2_final_path"),
         }
         if result["best_val"] is not None:
             row.update(flatten_metrics_for_csv("val", result["best_val"]))
