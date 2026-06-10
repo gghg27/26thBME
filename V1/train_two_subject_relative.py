@@ -277,12 +277,17 @@ def validate_one_epoch_two_branch(
 
     total_correct_4cls = 0
     total_correct_2cls = 0
+    total_correct_group_from_4cls = 0
+    total_correct_emo_from_4cls = 0
     total_num = 0
 
     all_preds_4cls = []
     all_labels_4cls = []
     all_preds_2cls = []
     all_labels_2cls = []
+    all_preds_group_from_4cls = []
+    all_labels_group = []
+    all_preds_emo_from_4cls = []
     segment_records = []
 
     _need_graph = lambda_graph > 0
@@ -324,12 +329,15 @@ def validate_one_epoch_two_branch(
                 loss_graph = intra_class_graph_loss(adj_dense, y_4cls)
             else:
                 loss_graph = logits_4cls.new_tensor(0.0)
-            loss = loss_4cls + lambda_diag * loss_2cls + lambda_graph * loss_graph
+            loss = 0.5 * loss_4cls + lambda_diag * loss_2cls + lambda_graph * loss_graph
         else:
-            loss = loss_4cls + lambda_diag * loss_2cls
+            loss = 0.5 * loss_4cls + lambda_diag * loss_2cls
 
         pred_4cls = logits_4cls.argmax(dim=1)
         pred_2cls = logits_2cls.argmax(dim=1)
+        label_group = (y_4cls >= 2).long()
+        pred_group_from_4cls = (pred_4cls >= 2).long()
+        pred_emo_from_4cls = (pred_4cls % 2).long()
 
         # 四分类概率：情绪正性概率 = P(class=1) + P(class=3)
         prob_4 = torch.softmax(logits_4cls, dim=1)
@@ -358,6 +366,8 @@ def validate_one_epoch_two_branch(
 
         correct_4cls = (pred_4cls == y_4cls).sum().item()
         correct_2cls = (pred_2cls == y_2cls).sum().item()
+        correct_group_from_4cls = (pred_group_from_4cls == label_group).sum().item()
+        correct_emo_from_4cls = (pred_emo_from_4cls == y_2cls).sum().item()
         bsz = x.size(0)
 
         total_loss += loss.item() * bsz
@@ -365,17 +375,24 @@ def validate_one_epoch_two_branch(
         total_ce_2cls += loss_2cls.item() * bsz
         total_correct_4cls += correct_4cls
         total_correct_2cls += correct_2cls
+        total_correct_group_from_4cls += correct_group_from_4cls
+        total_correct_emo_from_4cls += correct_emo_from_4cls
         total_num += bsz
 
         all_preds_4cls.extend(pred_4cls.detach().cpu().numpy().tolist())
         all_labels_4cls.extend(y_4cls.detach().cpu().numpy().tolist())
         all_preds_2cls.extend(pred_2cls.detach().cpu().numpy().tolist())
         all_labels_2cls.extend(y_2cls.detach().cpu().numpy().tolist())
+        all_preds_group_from_4cls.extend(pred_group_from_4cls.detach().cpu().numpy().tolist())
+        all_labels_group.extend(label_group.detach().cpu().numpy().tolist())
+        all_preds_emo_from_4cls.extend(pred_emo_from_4cls.detach().cpu().numpy().tolist())
 
         pbar.set_postfix({
             "loss": f"{total_loss / max(total_num, 1):.4f}",
             "acc4": f"{total_correct_4cls / max(total_num, 1):.4f}",
             "acc2": f"{total_correct_2cls / max(total_num, 1):.4f}",
+            "grp4": f"{total_correct_group_from_4cls / max(total_num, 1):.4f}",
+            "emo4": f"{total_correct_emo_from_4cls / max(total_num, 1):.4f}",
         })
 
     if total_num == 0:
@@ -384,8 +401,26 @@ def validate_one_epoch_two_branch(
     # ── 四分类指标 ──
     cls4_labels = [0, 1, 2, 3]
     acc_4cls = total_correct_4cls / total_num
+    group_acc_from_4cls = total_correct_group_from_4cls / total_num
+    emo_acc_from_4cls = total_correct_emo_from_4cls / total_num
     macro_f1_4cls = f1_score(all_labels_4cls, all_preds_4cls, average="macro", labels=cls4_labels, zero_division=0)
     cm_4cls = confusion_matrix(all_labels_4cls, all_preds_4cls, labels=cls4_labels)
+    group_macro_f1_from_4cls = f1_score(
+        all_labels_group,
+        all_preds_group_from_4cls,
+        average="macro",
+        labels=[0, 1],
+        zero_division=0,
+    )
+    emo_macro_f1_from_4cls = f1_score(
+        all_labels_2cls,
+        all_preds_emo_from_4cls,
+        average="macro",
+        labels=[0, 1],
+        zero_division=0,
+    )
+    group_cm_from_4cls = confusion_matrix(all_labels_group, all_preds_group_from_4cls, labels=[0, 1])
+    emo_cm_from_4cls = confusion_matrix(all_labels_2cls, all_preds_emo_from_4cls, labels=[0, 1])
 
     p4, r4, f14, s4 = precision_recall_fscore_support(
         all_labels_4cls, all_preds_4cls, labels=cls4_labels, zero_division=0,
@@ -432,7 +467,7 @@ def validate_one_epoch_two_branch(
         "loss": total_loss / total_num,
         "ce_loss_4cls": total_ce_4cls / total_num,
         "ce_loss_2cls": total_ce_2cls / total_num,
-        "ce_loss": (total_ce_4cls + lambda_diag * total_ce_2cls) / total_num,
+        "ce_loss": (0.5 * total_ce_4cls + lambda_diag * total_ce_2cls) / total_num,
         "graph_loss": 0.0,
         "contrast_loss": 0.0,
 
@@ -443,6 +478,12 @@ def validate_one_epoch_two_branch(
         "per_class_4": per_class_4,
         "segment_preds_4": all_preds_4cls,
         "segment_labels_4": all_labels_4cls,
+        "group_acc_from_4cls": group_acc_from_4cls,
+        "group_macro_f1_from_4cls": group_macro_f1_from_4cls,
+        "group_confusion_matrix_from_4cls": group_cm_from_4cls,
+        "emo_acc_from_4cls": emo_acc_from_4cls,
+        "emo_macro_f1_from_4cls": emo_macro_f1_from_4cls,
+        "emo_confusion_matrix_from_4cls": emo_cm_from_4cls,
 
         # 兼容旧 key
         "acc": acc_4cls,
@@ -1005,9 +1046,16 @@ def apply_subject_topk_prediction(trial_score_records, k_pos=4):
     list[dict]，每条记录包含 Emotion_label，可直接供测试集提交逻辑复用。
     """
     subject_trials = defaultdict(list)
+
+    def _subject_key(value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return str(value)
+
     for r in trial_score_records:
         rec = dict(r)
-        rec["subject_id"] = int(rec.get("subject_id", rec.get("user_id")))
+        rec["subject_id"] = _subject_key(rec.get("subject_id", rec.get("user_id")))
         rec["trial_id"] = int(rec["trial_id"])
         rec["score_pos"] = float(rec.get("score_pos", rec.get("prob_pos", 0.0)))
         if "prob_pos" in rec:
@@ -1026,7 +1074,7 @@ def apply_subject_topk_prediction(trial_score_records, k_pos=4):
             out["Emotion_label"] = 1 if (r["subject_id"], r["trial_id"]) in positive_keys else 0
             results.append(out)
 
-    return sorted(results, key=lambda x: (x["subject_id"], x["trial_id"]))
+    return sorted(results, key=lambda x: (str(x["subject_id"]), x["trial_id"]))
 
 
 def compute_subject_topk_trial_metrics(
@@ -1559,13 +1607,14 @@ def train_competition_cross_subject(
     _sub_df["group_binary"] = (_sub_df["label4"].astype(int) >= 2).astype(int)  # 0=DEP, 1=HC
     _all_subjects = _sub_df["subject_id"].astype(str).tolist()
     _all_groups = _sub_df["group_binary"].tolist()
+    split_seed = config.make_run_seed(rand, fold)
     train_subjects, val_subjects = train_test_split(
-        _all_subjects, test_size=0.1, stratify=_all_groups, random_state=rand,
+        _all_subjects, test_size=0.1, stratify=_all_groups, random_state=split_seed,
     )
     train_subjects = [str(s) for s in train_subjects]
     val_subjects = [str(s) for s in val_subjects]
 
-    print(f"Fold {fold} (90/10 split, seed={rand})")
+    print(f"Fold {fold} (90/10 split, rand={rand}, split_seed={split_seed})")
     print("train subjects:", len(train_subjects), train_subjects)
     print("val subjects:", len(val_subjects), val_subjects)
 
@@ -1952,6 +2001,8 @@ def train_competition_cross_subject(
             f"L2={val_metrics['ce_loss_2cls']:.4f} "
             f"acc4={val_metrics['acc_4cls']:.4f} "
             f"f1_4={val_metrics['macro_f1_4cls']:.4f} "
+            f"group4_acc={val_metrics['group_acc_from_4cls']:.4f} "
+            f"emo4_acc={val_metrics['emo_acc_from_4cls']:.4f} "
             f"seg_emo_acc={val_metrics['emotion_acc']:.4f} "
             f"seg_emo_f1={val_metrics['emotion_macro_f1']:.4f} "
             f"trial_emo_acc={val_metrics['trial_acc']:.4f} "
@@ -2128,14 +2179,18 @@ def predict_test_trial(
     -------
     pd.DataFrame with columns: [user_id, trial_id, prob_pos, pred_emotion]
     """
-    from utils.data import expand_window_index
+    from torch.utils.data import Dataset
+    from utils.data import expand_window_index, load_feature, load_raw_window
 
     model.eval()
 
     # 加载测试 CSV
     test_df = pd.read_csv(test_csv)
     id_col = "user_id" if "user_id" in test_df.columns else "subject_id"
-    print(f"[predict_test] test samples: {len(test_df)}, id_col={id_col}")
+    subject_id_col = "subject_number" if "subject_number" in test_df.columns else (
+        "subject_id" if "subject_id" in test_df.columns else id_col
+    )
+    print(f"[predict_test] test samples: {len(test_df)}, id_col={id_col}, subject_id_col={subject_id_col}")
 
     # 展开窗口索引：如果 CSV 已有 de_win_id 则无需展开；
     # 否则尝试 expand_window_index，失败则用 n_windows 直接展开
@@ -2167,12 +2222,30 @@ def predict_test_trial(
     print(f"[predict_test] expanded windows: {len(test_df)}")
 
     # 构造无标签 dataset
-    dataset = EEGWindowDataset(
-        test_df.reset_index(drop=True),
-        label_col=None,
-        root=root,
-        return_de=True,
-    )
+    class _TestWindowDataset(Dataset):
+        def __init__(self, df: pd.DataFrame, id_column: str, subject_column: str, root_dir: Path):
+            self.df = df.reset_index(drop=True).copy()
+            self.id_column = id_column
+            self.subject_column = subject_column
+            self.root_dir = Path(root_dir)
+
+        def __len__(self):
+            return len(self.df)
+
+        def __getitem__(self, idx: int):
+            row = self.df.iloc[idx]
+            subject_value = int(row[self.subject_column])
+            item = {
+                "x": torch.as_tensor(load_raw_window(row, root=self.root_dir), dtype=torch.float32),
+                "de_feat": torch.as_tensor(load_feature(row, root=self.root_dir), dtype=torch.float32),
+                "subject_id": torch.tensor(subject_value, dtype=torch.long),
+                "trial_id": torch.tensor(int(row["trial_id"]), dtype=torch.long),
+            }
+            if self.id_column in row.index and self.id_column != "subject_id":
+                item[self.id_column] = str(row[self.id_column])
+            return item
+
+    dataset = _TestWindowDataset(test_df, id_col, subject_id_col, Path(root))
 
     # 简易 dict collate：EEGWindowDataset 返回 dict，需要自定义 collate
     from torch.utils.data._utils.collate import default_collate
@@ -2234,12 +2307,15 @@ def predict_test_trial(
         score_pos = logits_2cls[:, 1] - logits_2cls[:, 0]
 
         user_key = id_col if id_col in batch else "subject_id"
-        user_ids = batch[user_key].detach().cpu().numpy()
+        user_values = batch[user_key]
         trial_ids = batch["trial_id"].detach().cpu().numpy()
         probs = prob_pos.detach().cpu().numpy()
         scores = score_pos.detach().cpu().numpy()
 
-        all_user_ids.extend(user_ids.tolist())
+        if isinstance(user_values, torch.Tensor):
+            all_user_ids.extend(user_values.detach().cpu().numpy().tolist())
+        else:
+            all_user_ids.extend(list(user_values))
         all_trial_ids.extend(trial_ids.tolist())
         all_probs.extend(probs.tolist())
         all_scores.extend(scores.tolist())
