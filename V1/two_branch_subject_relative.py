@@ -2523,17 +2523,17 @@ class EmotionPretrainModel(nn.Module):
 
 class TwoBranchModel(nn.Module):
     """
-    V1 升级版模型：三分支 backbone + 独立分类头。
+    V1 升级版模型：三分支 backbone + 独立分类头（所有头共享全量特征 z）。
 
     结构：
         EEG x + de_feat
         -> BrainGraphBackbone (3 branches)
-        -> z_conv  [B, 64]  ──→ cls4_head  ──→ 四分类情绪 logits
-        -> z_diag  [B, 121] ──→ cls2_head  ──→ 二分类诊断 logits
-        -> z_diag  [B, 121] ──→ domain_head (GRL) ──→ 被试域 logits
+        -> z  [B, 185]  ──→ cls4_head  ──→ 四分类情绪 logits
+        -> z  [B, 185]  ──→ cls2_head  ──→ 二分类情绪 logits
+        -> z  [B, 185]  ──→ domain_head (GRL) ──→ 被试域 logits
 
     两个 loss：
-        L = L_4cls(z_conv, label4) + λ_diag × L_2cls(z_diag, diagnosis_label) + λ_dom × L_domain
+        L = L_4cls(z, label4) + λ_diag × L_2cls(z, emotion_binary) + λ_dom × L_domain
     """
 
     def __init__(
@@ -2569,37 +2569,36 @@ class TwoBranchModel(nn.Module):
             relative_eps=self.relative_eps,
         )
 
-        conv_dim = self.backbone.conv_dim    # 64
-        diag_dim = self.backbone.diag_dim    # 128
+        head_in_dim = self.backbone.out_dim  # 185 = z_conv(64) + z_plv(64) + z_bio(57)
 
-        # 四分类情绪头：z_conv → 4 classes
+        # 四分类情绪头：z → 4 classes
         self.cls4_head = ClassificationHead(
-            in_dim=conv_dim,
+            in_dim=head_in_dim,
             num_classes=num_classes_4,
             hidden_dim=64,
             dropout=dropout,
         )
 
-        # 二分类诊断头：z_diag → 2 classes
+        # 二分类情绪头：z → 2 classes
         self.cls2_head = ClassificationHead(
-            in_dim=diag_dim,
+            in_dim=head_in_dim,
             num_classes=num_classes_2,
             hidden_dim=64,
             dropout=dropout,
         )
 
-        # 被试域对抗头：z_diag → num_subjects（通过 GRL）
+        # 被试域对抗头：z → num_subjects（通过 GRL）
         self.domain_head = SubjectDomainHead(
-            in_dim=diag_dim,
+            in_dim=head_in_dim,
             num_subjects=num_subjects,
             hidden_dim=64,
             dropout=dropout,
         )
 
         # 记录维度供外部使用
-        self.in_dim = diag_dim          # 兼容 center loss 等需要 in_dim 的场景
-        self.conv_dim = conv_dim
-        self.diag_dim = diag_dim
+        self.in_dim = head_in_dim          # 全量特征维度，兼容 center loss 等
+        self.conv_dim = self.backbone.conv_dim
+        self.diag_dim = self.backbone.diag_dim
 
     def forward(
             self,
@@ -2620,31 +2619,29 @@ class TwoBranchModel(nn.Module):
             dict:
                 logits:          四分类情绪 logits（兼容旧接口）
                 logits_4cls:     四分类情绪 logits [B, 4]
-                logits_2cls:     二分类诊断 logits [B, 2]
+                logits_2cls:     二分类情绪 logits [B, 2]
                 domain_logits:   被试域分类 logits
-                graph_feat:      z_diag [B, 128]
+                graph_feat:      z [B, 185]  全量拼接特征（兼用于 center loss）
                 z_conv, z_plv, z_bio, z_diag, z:  各分支特征
         """
         out = self.backbone(x, de_feat=de_feat, **kwargs)
 
-        z_conv = out["z_conv"]          # [B, 64]
-        z_diag = out["z_diag"]          # [B, 128]
+        z = out["z"]  # [B, 185] = z_conv ⊕ z_plv ⊕ z_bio
 
-        # 四分类情绪头
-        logits_4cls = self.cls4_head(z_conv)
+        # 四分类情绪头（全量特征）
+        logits_4cls = self.cls4_head(z)
 
-        # 二分类诊断头
-        logits_2cls = self.cls2_head(z_diag)
+        # 二分类情绪头（全量特征）
+        logits_2cls = self.cls2_head(z)
 
-        # 被试域对抗头
-        domain_logits = self.domain_head(z_diag, lambda_grl=lambda_dom)
+        # 被试域对抗头（全量特征，通过 GRL）
+        domain_logits = self.domain_head(z, lambda_grl=lambda_dom)
 
         out["logits"] = logits_4cls             # 兼容旧接口：logits = 四分类
         out["logits_4cls"] = logits_4cls
         out["logits_2cls"] = logits_2cls
         out["domain_logits"] = domain_logits
-        out["graph_feat"] = z_diag              # 二分类侧特征
-        out["z_diag"] = z_diag
+        out["graph_feat"] = z                   # 全量特征，兼用于 center loss
         return out
 
 

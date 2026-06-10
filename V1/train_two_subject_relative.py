@@ -39,7 +39,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
-from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     f1_score,
     confusion_matrix,
@@ -56,8 +56,6 @@ from dataloader import (
     comp4_collate_fn,
 )
 from two_branch_subject_relative import TwoBranchModel
-from utils.folds import get_unified_subject_split
-
 
 # =========================================================
 # Random seed utilities
@@ -584,7 +582,7 @@ def train_one_epoch_two_branch(
         logits_4cls = out["logits_4cls"]
         logits_2cls = out["logits_2cls"]
         domain_logits = out.get("domain_logits", None)
-        graph_feat = out.get("graph_feat", None)  # z_diag
+        graph_feat = out.get("graph_feat", None)  # z（全量拼接特征）
 
         # ── 四分类情绪 loss ──
         loss_4cls = criterion_4cls(logits_4cls, y_4cls)
@@ -1581,17 +1579,19 @@ def train_competition_cross_subject(
     print(f"[Seed] rand={rand}, fold={fold}, run_seed={run_seed}, deterministic={deterministic}")
 
     # -------- subject-level split --------
-    # ── 统一交叉验证划分：三个模型共用同一套 StratifiedGroupKFold ──
-    split = get_unified_subject_split(
-        index_csv=index_csv,
-        fold=fold,
-        n_splits=n_splits,
-        seed=rand,
+    # 90% 训练 / 10% 验证，按诊断标签分层
+    _df = pd.read_csv(index_csv)
+    _sub_df = _df[["subject_id", "label4"]].drop_duplicates("subject_id")
+    _sub_df["group_binary"] = (_sub_df["label4"].astype(int) >= 2).astype(int)  # 0=DEP, 1=HC
+    _all_subjects = _sub_df["subject_id"].astype(str).tolist()
+    _all_groups = _sub_df["group_binary"].tolist()
+    train_subjects, val_subjects = train_test_split(
+        _all_subjects, test_size=0.1, stratify=_all_groups, random_state=rand,
     )
-    train_subjects = split["train_all"]
-    val_subjects = split["val_all"]
+    train_subjects = [str(s) for s in train_subjects]
+    val_subjects = [str(s) for s in val_subjects]
 
-    print(f"Fold {fold}")
+    print(f"Fold {fold} (90/10 split, seed={rand})")
     print("train subjects:", len(train_subjects), train_subjects)
     print("val subjects:", len(val_subjects), val_subjects)
 
@@ -1737,7 +1737,7 @@ def train_competition_cross_subject(
 
     dom_criterion = torch.nn.CrossEntropyLoss()
     center_criterion = ClassCenterContrastLoss(
-        in_dim=model.diag_dim if hasattr(model, "diag_dim") else 128,
+        in_dim=model.in_dim if hasattr(model, "in_dim") else 185,
         proj_dim=64,
         num_classes=2,
         tau=center_tau,
