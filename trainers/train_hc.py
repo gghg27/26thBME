@@ -1365,6 +1365,7 @@ def train_competition_cross_subject(
     use_subject_relative_bio: bool = True,
     bio_abs_scale: float = 0.3,
     relative_eps: float = 1e-6,
+    save_warmup_epochs: int = 10,
 ):
     os.makedirs(save_dir, exist_ok=True)
     train_group = normalize_train_group(train_group)
@@ -1576,6 +1577,7 @@ def train_competition_cross_subject(
         "use_subject_relative_bio": use_subject_relative_bio,
         "bio_abs_scale": bio_abs_scale,
         "relative_eps": relative_eps,
+        "save_warmup_epochs": save_warmup_epochs,
     }
 
     best_trackers = {
@@ -1662,6 +1664,10 @@ def train_competition_cross_subject(
         f"[EarlyStopping] track={early_stop_track}, "
         f"criteria={format_criteria(early_stopper.criteria)}, "
         f"patience={early_stop_patience}, warmup={early_stop_warmup}"
+    )
+    print(
+        f"[Checkpoint] save_warmup_epochs={save_warmup_epochs} — "
+        f"前 {save_warmup_epochs} 个 epoch 不保存模型，避免随机初始 epoch 被选为最优"
     )
 
     history = []
@@ -1750,30 +1756,32 @@ def train_competition_cross_subject(
             "val_metrics": val_metrics,
         })
 
-        for best_name, tracker in best_trackers.items():
-            criteria = tracker["criteria"]
-            if is_better_by_criteria(val_metrics, tracker["best_metrics"], criteria):
-                ckpt_path, json_path, csv_path = save_best_checkpoint(
-                    save_dir=save_dir,
-                    fold=fold,
-                    best_name=best_name,
-                    model=model,
-                    optimizer=optimizer,
-                    epoch=epoch,
-                    train_metrics=train_metrics,
-                    val_metrics=val_metrics,
-                    train_subjects=train_subjects,
-                    val_subjects=val_subjects,
-                    criteria=criteria,
-                    config=config,
-                )
-                tracker["best_metrics"] = copy.deepcopy(val_metrics)
-                tracker["best_train_metrics"] = copy.deepcopy(train_metrics)
-                tracker["best_epoch"] = epoch
-                tracker["checkpoint_path"] = ckpt_path
-                tracker["metrics_json_path"] = json_path
-                tracker["summary_csv_path"] = csv_path
-                print(f"保存 best_{best_name}: epoch={epoch}, criteria={format_criteria(criteria)}, path={ckpt_path}")
+        # 按多个标准并列保存最优模型（前 save_warmup_epochs 轮不保存，避免随机初始 epoch 被选为最优）
+        if epoch > save_warmup_epochs:
+            for best_name, tracker in best_trackers.items():
+                criteria = tracker["criteria"]
+                if is_better_by_criteria(val_metrics, tracker["best_metrics"], criteria):
+                    ckpt_path, json_path, csv_path = save_best_checkpoint(
+                        save_dir=save_dir,
+                        fold=fold,
+                        best_name=best_name,
+                        model=model,
+                        optimizer=optimizer,
+                        epoch=epoch,
+                        train_metrics=train_metrics,
+                        val_metrics=val_metrics,
+                        train_subjects=train_subjects,
+                        val_subjects=val_subjects,
+                        criteria=criteria,
+                        config=config,
+                    )
+                    tracker["best_metrics"] = copy.deepcopy(val_metrics)
+                    tracker["best_train_metrics"] = copy.deepcopy(train_metrics)
+                    tracker["best_epoch"] = epoch
+                    tracker["checkpoint_path"] = ckpt_path
+                    tracker["metrics_json_path"] = json_path
+                    tracker["summary_csv_path"] = csv_path
+                    print(f"保存 best_{best_name}: epoch={epoch}, criteria={format_criteria(criteria)}, path={ckpt_path}")
 
         early_improved, should_stop = early_stopper.step(val_metrics, epoch)
         print(
