@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Train and predict a DE-indexed three-branch emotion baseline.
+"""Train and predict a DE-only three-branch emotion baseline.
 
 Main objective:
     L = CE(emotion_2cls) + aux_weight * CE(label4)
@@ -84,7 +84,7 @@ def stable_int_id(value: Any) -> int:
 
 
 class DEWindowDataset(Dataset):
-    """Window dataset reading raw EEG windows and their aligned DE features."""
+    """Window dataset reading precomputed DE features only."""
 
     def __init__(
         self,
@@ -111,14 +111,11 @@ class DEWindowDataset(Dataset):
             raise ValueError("No rows left for DEWindowDataset.")
         if "de_path" not in df.columns:
             raise KeyError("CSV/DataFrame must contain de_path.")
-        if "trial_path" not in df.columns:
-            raise KeyError("CSV/DataFrame must contain trial_path for the three-branch encoder.")
 
         self.df = df.reset_index(drop=True)
         self.root = root
         self.normalize = bool(normalize)
         self.has_labels = bool(has_labels)
-        self._trial_cache: dict[str, np.ndarray] = {}
         self._de_cache: dict[str, np.ndarray] = {}
 
     def __len__(self) -> int:
@@ -139,28 +136,6 @@ class DEWindowDataset(Dataset):
             return None
         return int(value)
 
-    def _load_x(self, row: pd.Series) -> np.ndarray:
-        trial = self._load_cached(self._trial_cache, row["trial_path"])
-        start = self._valid_int(row, "start")
-        end = self._valid_int(row, "end")
-
-        if start is None or end is None:
-            trial_start = self._valid_int(row, "trial_start")
-            trial_end = self._valid_int(row, "trial_end")
-            if trial_start is not None and trial_end is not None and 0 <= trial_start < trial_end <= trial.shape[-1]:
-                start, end = trial_start, trial_end
-            else:
-                start, end = 0, trial.shape[-1]
-
-        x = np.asarray(trial[:, start:end], dtype=np.float32)
-        if x.shape[-1] == 0:
-            x = np.asarray(trial, dtype=np.float32)
-        if self.normalize:
-            mean = x.mean(axis=-1, keepdims=True)
-            std = x.std(axis=-1, keepdims=True) + 1e-6
-            x = (x - mean) / std
-        return np.ascontiguousarray(x, dtype=np.float32)
-
     def _load_de(self, row: pd.Series) -> np.ndarray:
         de_arr = self._load_cached(self._de_cache, row["de_path"])
         win_id = self._valid_int(row, "de_win_id")
@@ -170,11 +145,15 @@ class DEWindowDataset(Dataset):
             de_feat = de_arr[int(win_id)]
         else:
             de_feat = de_arr
+        de_feat = np.asarray(de_feat, dtype=np.float32)
+        if self.normalize:
+            mean = de_feat.mean(axis=0, keepdims=True)
+            std = de_feat.std(axis=0, keepdims=True) + 1e-6
+            de_feat = (de_feat - mean) / std
         return np.ascontiguousarray(de_feat, dtype=np.float32)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         row = self.df.iloc[idx]
-        x = self._load_x(row)
         de_feat = self._load_de(row)
 
         label4 = int(row["label4"]) if self.has_labels and "label4" in row.index else 0
@@ -188,7 +167,6 @@ class DEWindowDataset(Dataset):
         trial_id = int(row.get("trial_id", 0))
 
         return {
-            "x": torch.tensor(x, dtype=torch.float32),
             "de_feat": torch.tensor(de_feat, dtype=torch.float32),
             "emotion_label": torch.tensor(emotion_label, dtype=torch.long),
             "label4": torch.tensor(label4, dtype=torch.long),
@@ -219,7 +197,7 @@ def prepare_test_df(test_csv: str | Path) -> pd.DataFrame:
 
 
 def collate_with_meta(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    tensor_keys = ["x", "de_feat", "emotion_label", "label4", "subject_id", "trial_id"]
+    tensor_keys = ["de_feat", "emotion_label", "label4", "subject_id", "trial_id"]
     out: dict[str, Any] = {key: torch.stack([item[key] for item in batch], dim=0) for key in tensor_keys}
     out["user_id"] = [item["user_id"] for item in batch]
     return out
@@ -377,14 +355,13 @@ def train_one_epoch(
     y4_pred: list[int] = []
 
     for batch in tqdm(loader, desc="train", leave=False):
-        x = batch["x"].to(device, non_blocking=True)
         de_feat = batch["de_feat"].to(device, non_blocking=True)
         y2 = batch["emotion_label"].to(device, non_blocking=True).long()
         y4 = batch["label4"].to(device, non_blocking=True).long()
 
         optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(enabled=amp):
-            out = model(x, de_feat)
+            out = model(de_feat)
             loss_2 = F.cross_entropy(out["logits_2cls"], y2, weight=weight_2cls)
             loss_4 = F.cross_entropy(out["logits_4cls"], y4, weight=weight_4cls)
             loss = loss_2 + float(aux_weight) * loss_4
@@ -438,12 +415,11 @@ def evaluate(
     records: list[dict[str, Any]] = []
 
     for batch in tqdm(loader, desc="eval", leave=False):
-        x = batch["x"].to(device, non_blocking=True)
         de_feat = batch["de_feat"].to(device, non_blocking=True)
         y2 = batch["emotion_label"].to(device, non_blocking=True).long()
         y4 = batch["label4"].to(device, non_blocking=True).long()
 
-        out = model(x, de_feat)
+        out = model(de_feat)
         loss_2 = F.cross_entropy(out["logits_2cls"], y2, weight=weight_2cls)
         loss_4 = F.cross_entropy(out["logits_4cls"], y4, weight=weight_4cls)
         loss = loss_2 + float(aux_weight) * loss_4
@@ -533,10 +509,13 @@ def load_model_checkpoint(checkpoint_path: str | Path, device: torch.device) -> 
 
 def build_model_config(args: argparse.Namespace) -> dict[str, Any]:
     return {
+        "input_type": "de_only",
+        "num_channels": args.num_channels,
+        "encoder_hidden_dim": args.encoder_hidden_dim,
         "sfreq": args.sfreq,
         "topk": args.topk,
         "dropout": args.dropout,
-        "use_biomarkers": not args.no_biomarkers,
+        "use_biomarkers": False,
         "biomarker_dim": args.biomarker_dim,
         "de_num_bands": args.de_num_bands,
         "head_hidden_dim": args.head_hidden_dim,
@@ -709,15 +688,14 @@ def predict_test(
     model.eval()
     rows: list[dict[str, Any]] = []
     for batch in tqdm(loader, desc="predict", leave=False):
-        x = batch["x"].to(device, non_blocking=True)
         de_feat = batch["de_feat"].to(device, non_blocking=True)
-        out = model(x, de_feat)
+        out = model(de_feat)
         p2 = torch.softmax(out["logits_2cls"], dim=1)
         p4 = torch.softmax(out["logits_4cls"], dim=1)
         score_pos = out["logits_2cls"][:, 1] - out["logits_2cls"][:, 0]
         pred_window = p2.argmax(dim=1)
 
-        for i in range(x.size(0)):
+        for i in range(de_feat.size(0)):
             row = {
                 "user_id": batch["user_id"][i],
                 "subject_id": int(batch["subject_id"][i].cpu().item()),
@@ -807,6 +785,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sfreq", type=float, default=250.0)
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--num_channels", type=int, default=30)
+    parser.add_argument("--encoder_hidden_dim", type=int, default=128)
     parser.add_argument("--head_hidden_dim", type=int, default=128)
     parser.add_argument("--biomarker_dim", type=int, default=57)
     parser.add_argument("--de_num_bands", type=int, default=5)
@@ -872,4 +852,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
