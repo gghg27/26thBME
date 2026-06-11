@@ -254,6 +254,7 @@ def validate_one_epoch_two_branch(
     criterion_4cls,
     criterion_2cls,
     device,
+    lambda_4cls: float = 0.3,
     lambda_diag: float = 1.0,
     lambda_graph: float = 0.1,
     subject_de_mu=None,
@@ -329,9 +330,9 @@ def validate_one_epoch_two_branch(
                 loss_graph = intra_class_graph_loss(adj_dense, y_4cls)
             else:
                 loss_graph = logits_4cls.new_tensor(0.0)
-            loss = loss_4cls + lambda_diag * loss_2cls + lambda_graph * loss_graph
+            loss = lambda_4cls * loss_4cls + lambda_diag * loss_2cls + lambda_graph * loss_graph
         else:
-            loss =  loss_4cls + lambda_diag * loss_2cls
+            loss = lambda_4cls * loss_4cls + lambda_diag * loss_2cls
 
         pred_4cls = logits_4cls.argmax(dim=1)
         pred_2cls = logits_2cls.argmax(dim=1)
@@ -467,7 +468,7 @@ def validate_one_epoch_two_branch(
         "loss": total_loss / total_num,
         "ce_loss_4cls": total_ce_4cls / total_num,
         "ce_loss_2cls": total_ce_2cls / total_num,
-        "ce_loss": (0.5 * total_ce_4cls + lambda_diag * total_ce_2cls) / total_num,
+        "ce_loss": (lambda_4cls * total_ce_4cls + lambda_diag * total_ce_2cls) / total_num,
         "graph_loss": 0.0,
         "contrast_loss": 0.0,
 
@@ -565,9 +566,10 @@ def train_one_epoch_two_branch(
     criterion_2cls,
     dom_criterion,
     device,
+    lambda_4cls: float = 0.3,
     lambda_diag: float = 1.0,
-    lambda_domain: float = 0.0,
-    grl_domain: float = 0.1,
+    lambda_domain: float = 0.01,
+    grl_domain: float = 0.05,
     # 类中心损失（作用于 z_diag）
     center_criterion=None,
     lambda_center: float = 0.0,
@@ -653,7 +655,7 @@ def train_one_epoch_two_branch(
 
         # ── 总 loss ──
         loss = (
-            loss_4cls
+            lambda_4cls * loss_4cls
             + lambda_diag * loss_2cls
             + center_weight * loss_center
             + lambda_domain * loss_dom
@@ -1547,21 +1549,22 @@ def train_competition_cross_subject(
     dataset,
     rand,
     n_splits: int = 10,
-    epochs: int = 50,
+    epochs: int = 30,
     batch_size: int = 256,
     lr: float = 1e-4,
-    weight_decay: float = 1e-4,
+    weight_decay: float = 5e-4,
     num_workers: int = 4,
+    lambda_4cls: float = 0.3,
     lambda_diag: float = 1.0,
     lambda_graph: float = 0.1,
-    lambda_domain: float = 0.0,
-    grl_domain: float = 0.1,
+    lambda_domain: float = 0.01,
+    grl_domain: float = 0.05,
     lambda_con: float = 0.05,
     device: str = "cuda",
     run_seed: int = None,
     deterministic: bool = False,
-    early_stop_patience: int = 20,
-    early_stop_warmup: int = 15,
+    early_stop_patience: int = 8,
+    early_stop_warmup: int = 3,
     early_stop_min_delta: float = 1e-6,
     early_stop_track: str = "trial_f1",
     # 类中心损失
@@ -1573,7 +1576,7 @@ def train_competition_cross_subject(
     use_subject_relative_bio: bool = True,
     bio_abs_scale: float = 0.3,
     relative_eps: float = 1e-6,
-    save_warmup_epochs: int = 10,
+    save_warmup_epochs: int = 1,
 ):
     """
     双任务训练（TwoBranchModel），按被试做分层 K 折交叉验证。
@@ -1794,6 +1797,7 @@ def train_competition_cross_subject(
         "batch_size": batch_size,
         "lr": lr,
         "weight_decay": weight_decay,
+        "lambda_4cls": lambda_4cls,
         "lambda_diag": lambda_diag,
         "lambda_graph": lambda_graph,
         "lambda_domain": lambda_domain,
@@ -1933,6 +1937,7 @@ def train_competition_cross_subject(
         f"patience={early_stop_patience}, "
         f"warmup={early_stop_warmup}, "
         f"min_delta={early_stop_min_delta}, "
+        f"lambda_4cls={lambda_4cls}, "
         f"lambda_center={lambda_center}, "
         f"center_warmup_epochs={center_warmup_epochs}"
     )
@@ -1954,6 +1959,7 @@ def train_competition_cross_subject(
             criterion_2cls=criterion_2cls,
             dom_criterion=dom_criterion,
             device=device,
+            lambda_4cls=lambda_4cls,
             lambda_diag=lambda_diag,
             lambda_domain=lambda_domain,
             grl_domain=grl_domain,
@@ -1973,6 +1979,7 @@ def train_competition_cross_subject(
             criterion_4cls=criterion_4cls,
             criterion_2cls=criterion_2cls,
             device=device,
+            lambda_4cls=lambda_4cls,
             lambda_diag=lambda_diag,
             lambda_graph=lambda_graph,
             subject_de_mu=val_subject_de_mu,
@@ -2029,7 +2036,9 @@ def train_competition_cross_subject(
         })
 
         # 按多个标准并列保存最优模型（前 save_warmup_epochs 轮不保存，避免随机初始 epoch 被选为最优）
-        if epoch > save_warmup_epochs:
+        if epoch <= save_warmup_epochs:
+            print(f"[Checkpoint] skip best checkpoint during warmup ({epoch}/{save_warmup_epochs})")
+        else:
             for best_name, tracker in best_trackers.items():
                 criteria = tracker["criteria"]
                 if is_better_by_criteria(val_metrics, tracker["best_metrics"], criteria):
@@ -2479,7 +2488,7 @@ if __name__ == "__main__":
                 sfreq=250.0,
                 prior_matrix=None,
                 topk=6,
-                dropout=0.2,
+                dropout=0.35,
                 num_subjects=48,
                 num_classes_4=4,
                 num_classes_2=2,
@@ -2496,28 +2505,30 @@ if __name__ == "__main__":
                 save_dir=os.path.join(model_params_root, f"two_branch_reapt{repeat}_fold{fold}"),
                 dataset="com",
                 n_splits=n_splits,
-                epochs=100,
+                epochs=30,
                 batch_size=_bs,
                 lr=1e-4,
                 rand=rand,
-                weight_decay=1e-4,
+                weight_decay=5e-4,
                 num_workers=4,
+                lambda_4cls=0.3,
                 lambda_diag=1.0,
                 lambda_graph=0.0,
-                lambda_domain=0.0,
-                grl_domain=0.0,
+                lambda_domain=0.01,
+                grl_domain=0.05,
                 lambda_con=0.0,
                 device=device,
                 run_seed=run_seed,
                 deterministic=False,
                 early_stop_track="combined",
-                early_stop_patience=25,
-                early_stop_warmup=15,
+                early_stop_patience=8,
+                early_stop_warmup=3,
                 early_stop_min_delta=1e-6,
                 use_subject_relative_de=True,
                 use_subject_relative_bio=True,
                 bio_abs_scale=0.3,
                 relative_eps=1e-6,
+                save_warmup_epochs=1,
             )
 
             combined_tracker = result["best_models"]["combined"]
