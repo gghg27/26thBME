@@ -14,8 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Function
 
-from models.dep_contrast_bio import BrainGraphBackbone
-
+# from models.dep_contrast_bio import BrainGraphBackbone
+from pmg_backbone import BrainGraphBackbone
 
 class GradReverse(Function):
     @staticmethod
