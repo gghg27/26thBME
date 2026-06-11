@@ -3,7 +3,7 @@
 EEG 情绪二分类 + 四分类跨被试训练脚本。
 
 双任务架构（所有头共享 encoder 全量特征 z = z_conv ⊕ z_plv ⊕ z_bio）：
-    - 四分类头 (cls4_head)：z [B, 185] → 4 类情绪 (DEP_neu, DEP_pos, HC_neu, HC_pos)
+    - 因子分解四分类：diag_head × cls2_head → 4 类情绪 (DEP_neu, DEP_pos, HC_neu, HC_pos)
     - 二分类头 (cls2_head)：z [B, 185] → 2 类情绪 (中性, 正性)
     - 域对抗头 (domain_head)：z [B, 185] → 被试域分类 (GRL)
 
@@ -253,9 +253,11 @@ def validate_one_epoch_two_branch(
     loader,
     criterion_4cls,
     criterion_2cls,
+    criterion_group,
     device,
-    lambda_4cls: float = 0.3,
+    lambda_4cls: float = 0.1,
     lambda_diag: float = 1.0,
+    lambda_group: float = 0.2,
     lambda_graph: float = 0.1,
     subject_de_mu=None,
     subject_de_std=None,
@@ -275,9 +277,11 @@ def validate_one_epoch_two_branch(
     total_loss = 0.0
     total_ce_4cls = 0.0
     total_ce_2cls = 0.0
+    total_ce_group = 0.0
 
     total_correct_4cls = 0
     total_correct_2cls = 0
+    total_correct_group_head = 0
     total_correct_group_from_4cls = 0
     total_correct_emo_from_4cls = 0
     total_num = 0
@@ -286,6 +290,7 @@ def validate_one_epoch_two_branch(
     all_labels_4cls = []
     all_preds_2cls = []
     all_labels_2cls = []
+    all_preds_group_head = []
     all_preds_group_from_4cls = []
     all_labels_group = []
     all_preds_emo_from_4cls = []
@@ -320,9 +325,15 @@ def validate_one_epoch_two_branch(
         )
         logits_4cls = out["logits_4cls"]
         logits_2cls = out["logits_2cls"]
+        logits_group = out.get("logits_group", out.get("logits_diag", None))
 
         loss_4cls = criterion_4cls(logits_4cls, y_4cls)
         loss_2cls = criterion_2cls(logits_2cls, y_2cls)
+        label_group = (y_4cls >= 2).long()
+        if logits_group is not None and criterion_group is not None and lambda_group > 0:
+            loss_group = criterion_group(logits_group, label_group)
+        else:
+            loss_group = logits_4cls.new_tensor(0.0)
 
         if _need_graph:
             adj_dense = out.get("adj_dense", None)
@@ -330,13 +341,13 @@ def validate_one_epoch_two_branch(
                 loss_graph = intra_class_graph_loss(adj_dense, y_4cls)
             else:
                 loss_graph = logits_4cls.new_tensor(0.0)
-            loss = lambda_4cls * loss_4cls + lambda_diag * loss_2cls + lambda_graph * loss_graph
+            loss = lambda_4cls * loss_4cls + lambda_diag * loss_2cls + lambda_group * loss_group + lambda_graph * loss_graph
         else:
-            loss = lambda_4cls * loss_4cls + lambda_diag * loss_2cls
+            loss = lambda_4cls * loss_4cls + lambda_diag * loss_2cls + lambda_group * loss_group
 
         pred_4cls = logits_4cls.argmax(dim=1)
         pred_2cls = logits_2cls.argmax(dim=1)
-        label_group = (y_4cls >= 2).long()
+        pred_group_head = logits_group.argmax(dim=1) if logits_group is not None else pred_4cls.new_zeros(pred_4cls.shape)
         pred_group_from_4cls = (pred_4cls >= 2).long()
         pred_emo_from_4cls = (pred_4cls % 2).long()
 
@@ -363,10 +374,13 @@ def validate_one_epoch_two_branch(
                 "label_cls": int(y_4cls[i].detach().cpu()),
                 "pred4": int(pred_4cls[i].detach().cpu()),
                 "label4": int(y_4cls[i].detach().cpu()),
+                "pred_group": int(pred_group_head[i].detach().cpu()),
+                "label_group": int(label_group[i].detach().cpu()),
             })
 
         correct_4cls = (pred_4cls == y_4cls).sum().item()
         correct_2cls = (pred_2cls == y_2cls).sum().item()
+        correct_group_head = (pred_group_head == label_group).sum().item()
         correct_group_from_4cls = (pred_group_from_4cls == label_group).sum().item()
         correct_emo_from_4cls = (pred_emo_from_4cls == y_2cls).sum().item()
         bsz = x.size(0)
@@ -374,8 +388,10 @@ def validate_one_epoch_two_branch(
         total_loss += loss.item() * bsz
         total_ce_4cls += loss_4cls.item() * bsz
         total_ce_2cls += loss_2cls.item() * bsz
+        total_ce_group += loss_group.item() * bsz
         total_correct_4cls += correct_4cls
         total_correct_2cls += correct_2cls
+        total_correct_group_head += correct_group_head
         total_correct_group_from_4cls += correct_group_from_4cls
         total_correct_emo_from_4cls += correct_emo_from_4cls
         total_num += bsz
@@ -384,6 +400,7 @@ def validate_one_epoch_two_branch(
         all_labels_4cls.extend(y_4cls.detach().cpu().numpy().tolist())
         all_preds_2cls.extend(pred_2cls.detach().cpu().numpy().tolist())
         all_labels_2cls.extend(y_2cls.detach().cpu().numpy().tolist())
+        all_preds_group_head.extend(pred_group_head.detach().cpu().numpy().tolist())
         all_preds_group_from_4cls.extend(pred_group_from_4cls.detach().cpu().numpy().tolist())
         all_labels_group.extend(label_group.detach().cpu().numpy().tolist())
         all_preds_emo_from_4cls.extend(pred_emo_from_4cls.detach().cpu().numpy().tolist())
@@ -402,10 +419,18 @@ def validate_one_epoch_two_branch(
     # ── 四分类指标 ──
     cls4_labels = [0, 1, 2, 3]
     acc_4cls = total_correct_4cls / total_num
+    group_head_acc = total_correct_group_head / total_num
     group_acc_from_4cls = total_correct_group_from_4cls / total_num
     emo_acc_from_4cls = total_correct_emo_from_4cls / total_num
     macro_f1_4cls = f1_score(all_labels_4cls, all_preds_4cls, average="macro", labels=cls4_labels, zero_division=0)
     cm_4cls = confusion_matrix(all_labels_4cls, all_preds_4cls, labels=cls4_labels)
+    group_head_macro_f1 = f1_score(
+        all_labels_group,
+        all_preds_group_head,
+        average="macro",
+        labels=[0, 1],
+        zero_division=0,
+    )
     group_macro_f1_from_4cls = f1_score(
         all_labels_group,
         all_preds_group_from_4cls,
@@ -420,6 +445,7 @@ def validate_one_epoch_two_branch(
         labels=[0, 1],
         zero_division=0,
     )
+    group_head_cm = confusion_matrix(all_labels_group, all_preds_group_head, labels=[0, 1])
     group_cm_from_4cls = confusion_matrix(all_labels_group, all_preds_group_from_4cls, labels=[0, 1])
     emo_cm_from_4cls = confusion_matrix(all_labels_2cls, all_preds_emo_from_4cls, labels=[0, 1])
 
@@ -468,7 +494,8 @@ def validate_one_epoch_two_branch(
         "loss": total_loss / total_num,
         "ce_loss_4cls": total_ce_4cls / total_num,
         "ce_loss_2cls": total_ce_2cls / total_num,
-        "ce_loss": (lambda_4cls * total_ce_4cls + lambda_diag * total_ce_2cls) / total_num,
+        "ce_loss_group": total_ce_group / total_num,
+        "ce_loss": (lambda_4cls * total_ce_4cls + lambda_diag * total_ce_2cls + lambda_group * total_ce_group) / total_num,
         "graph_loss": 0.0,
         "contrast_loss": 0.0,
 
@@ -479,6 +506,10 @@ def validate_one_epoch_two_branch(
         "per_class_4": per_class_4,
         "segment_preds_4": all_preds_4cls,
         "segment_labels_4": all_labels_4cls,
+        "group_head_acc": group_head_acc,
+        "group_head_macro_f1": group_head_macro_f1,
+        "group_head_confusion_matrix": group_head_cm,
+        "group_head_preds": all_preds_group_head,
         "group_acc_from_4cls": group_acc_from_4cls,
         "group_macro_f1_from_4cls": group_macro_f1_from_4cls,
         "group_confusion_matrix_from_4cls": group_cm_from_4cls,
@@ -564,10 +595,12 @@ def train_one_epoch_two_branch(
     optimizer,
     criterion_4cls,
     criterion_2cls,
+    criterion_group,
     dom_criterion,
     device,
-    lambda_4cls: float = 0.3,
+    lambda_4cls: float = 0.1,
     lambda_diag: float = 1.0,
+    lambda_group: float = 0.2,
     lambda_domain: float = 0.01,
     grl_domain: float = 0.05,
     # 类中心损失（作用于 z_diag）
@@ -591,10 +624,12 @@ def train_one_epoch_two_branch(
     total_loss = 0.0
     total_loss_4cls = 0.0
     total_loss_2cls = 0.0
+    total_loss_group = 0.0
     total_loss_dom = 0.0
     total_loss_center = 0.0
     total_correct_4cls = 0
     total_correct_2cls = 0
+    total_correct_group = 0
     total_num = 0
 
     pbar = tqdm(loader, desc="Train", leave=False)
@@ -626,6 +661,7 @@ def train_one_epoch_two_branch(
 
         logits_4cls = out["logits_4cls"]
         logits_2cls = out["logits_2cls"]
+        logits_group = out.get("logits_group", out.get("logits_diag", None))
         domain_logits = out.get("domain_logits", None)
         graph_feat = out.get("graph_feat", None)  # z（全量拼接特征）
 
@@ -634,6 +670,12 @@ def train_one_epoch_two_branch(
 
         # ── 二分类情绪 loss（中性 vs 正性）──
         loss_2cls = criterion_2cls(logits_2cls, y_2cls)
+
+        y_group = (y_4cls >= 2).long()
+        if logits_group is not None and criterion_group is not None and lambda_group > 0:
+            loss_group = criterion_group(logits_group, y_group)
+        else:
+            loss_group = logits_4cls.new_tensor(0.0)
 
         # ── 类中心损失（作用于 z_diag）──
         if center_criterion is not None and lambda_center > 0 and graph_feat is not None:
@@ -657,6 +699,7 @@ def train_one_epoch_two_branch(
         loss = (
             lambda_4cls * loss_4cls
             + lambda_diag * loss_2cls
+            + lambda_group * loss_group
             + center_weight * loss_center
             + lambda_domain * loss_dom
         )
@@ -666,25 +709,30 @@ def train_one_epoch_two_branch(
 
         pred_4cls = logits_4cls.argmax(dim=1)
         pred_2cls = logits_2cls.argmax(dim=1)
+        pred_group = logits_group.argmax(dim=1) if logits_group is not None else pred_4cls.new_zeros(pred_4cls.shape)
         bsz = x.size(0)
 
         total_loss += loss.item() * bsz
         total_loss_4cls += loss_4cls.item() * bsz
         total_loss_2cls += loss_2cls.item() * bsz
+        total_loss_group += loss_group.item() * bsz
         total_loss_dom += loss_dom.item() * bsz
         total_loss_center += loss_center.item() * bsz
         total_correct_4cls += (pred_4cls == y_4cls).sum().item()
         total_correct_2cls += (pred_2cls == y_2cls).sum().item()
+        total_correct_group += (pred_group == y_group).sum().item()
         total_num += bsz
 
         pbar.set_postfix({
             "loss": f"{total_loss / max(total_num, 1):.4f}",
             "L4": f"{total_loss_4cls / max(total_num, 1):.4f}",
             "L2": f"{total_loss_2cls / max(total_num, 1):.4f}",
+            "Lg": f"{total_loss_group / max(total_num, 1):.4f}",
             "dom": f"{total_loss_dom / max(total_num, 1):.4f}",
             "ctr": f"{total_loss_center / max(total_num, 1):.4f}",
             "acc4": f"{total_correct_4cls / max(total_num, 1):.4f}",
             "acc2": f"{total_correct_2cls / max(total_num, 1):.4f}",
+            "grp": f"{total_correct_group / max(total_num, 1):.4f}",
         })
 
     if total_num == 0:
@@ -694,10 +742,12 @@ def train_one_epoch_two_branch(
         "loss": total_loss / total_num,
         "loss_4cls": total_loss_4cls / total_num,
         "loss_2cls": total_loss_2cls / total_num,
+        "loss_group": total_loss_group / total_num,
         "loss_dom": total_loss_dom / total_num,
         "loss_center": total_loss_center / total_num,
         "acc_4cls": total_correct_4cls / total_num,
         "acc_2cls": total_correct_2cls / total_num,
+        "acc_group": total_correct_group / total_num,
         "acc": total_correct_4cls / total_num,  # 兼容旧接口：acc = 四分类
     }
     return metrics
@@ -1554,8 +1604,9 @@ def train_competition_cross_subject(
     lr: float = 1e-4,
     weight_decay: float = 5e-4,
     num_workers: int = 4,
-    lambda_4cls: float = 0.3,
+    lambda_4cls: float = 0.1,
     lambda_diag: float = 1.0,
+    lambda_group: float = 0.2,
     lambda_graph: float = 0.1,
     lambda_domain: float = 0.01,
     grl_domain: float = 0.05,
@@ -1759,6 +1810,13 @@ def train_competition_cross_subject(
         label_smoothing=0.05,
     )
 
+    class_weights_group = build_group_class_weights_from_label4(index_csv, train_subjects).to(device)
+    print(f"[Class weights group (DEP/HC from label4)] weights={class_weights_group.detach().cpu().numpy().tolist()}")
+    criterion_group = torch.nn.CrossEntropyLoss(
+        weight=class_weights_group,
+        label_smoothing=0.05,
+    )
+
     dom_criterion = torch.nn.CrossEntropyLoss()
     center_criterion = ClassCenterContrastLoss(
         in_dim=model.in_dim if hasattr(model, "in_dim") else 185,
@@ -1799,6 +1857,7 @@ def train_competition_cross_subject(
         "weight_decay": weight_decay,
         "lambda_4cls": lambda_4cls,
         "lambda_diag": lambda_diag,
+        "lambda_group": lambda_group,
         "lambda_graph": lambda_graph,
         "lambda_domain": lambda_domain,
         "grl_domain": grl_domain,
@@ -1824,17 +1883,19 @@ def train_competition_cross_subject(
     best_trackers = {
         "combined": {
             "criteria": [
+                ("topk_trial_macro_f1", "max"),
+                ("topk_trial_acc", "max"),
                 ("trial_macro_f1", "max"),
-                ("macro_f1", "max"),
                 ("trial_acc", "max"),
-                ("acc", "max"),
                 ("trial_prob_macro_f1", "max"),
                 ("trial_prob_acc", "max"),
                 ("emotion_macro_f1", "max"),
                 ("emotion_acc", "max"),
-                ("topk_trial_macro_f1", "max"),
-                ("topk_trial_acc", "max"),
                 ("topk_subject_gap_mean", "max"),
+                ("macro_f1", "max"),
+                ("acc", "max"),
+                ("group_head_macro_f1", "max"),
+                ("group_head_acc", "max"),
                 ("loss", "min"),
             ],
             "best_metrics": None,
@@ -1938,6 +1999,7 @@ def train_competition_cross_subject(
         f"warmup={early_stop_warmup}, "
         f"min_delta={early_stop_min_delta}, "
         f"lambda_4cls={lambda_4cls}, "
+        f"lambda_group={lambda_group}, "
         f"lambda_center={lambda_center}, "
         f"center_warmup_epochs={center_warmup_epochs}"
     )
@@ -1957,10 +2019,12 @@ def train_competition_cross_subject(
             optimizer=optimizer,
             criterion_4cls=criterion_4cls,
             criterion_2cls=criterion_2cls,
+            criterion_group=criterion_group,
             dom_criterion=dom_criterion,
             device=device,
             lambda_4cls=lambda_4cls,
             lambda_diag=lambda_diag,
+            lambda_group=lambda_group,
             lambda_domain=lambda_domain,
             grl_domain=grl_domain,
             center_criterion=center_criterion,
@@ -1978,9 +2042,11 @@ def train_competition_cross_subject(
             loader=val_loader,
             criterion_4cls=criterion_4cls,
             criterion_2cls=criterion_2cls,
+            criterion_group=criterion_group,
             device=device,
             lambda_4cls=lambda_4cls,
             lambda_diag=lambda_diag,
+            lambda_group=lambda_group,
             lambda_graph=lambda_graph,
             subject_de_mu=val_subject_de_mu,
             subject_de_std=val_subject_de_std,
@@ -1995,17 +2061,21 @@ def train_competition_cross_subject(
             f"[Train] loss={train_metrics['loss']:.4f} "
             f"L4={train_metrics['loss_4cls']:.4f} "
             f"L2={train_metrics['loss_2cls']:.4f} "
+            f"Lg={train_metrics['loss_group']:.4f} "
             f"dom={train_metrics['loss_dom']:.4f} "
             f"ctr={train_metrics['loss_center']:.4f} "
             f"acc4={train_metrics['acc_4cls']:.4f} "
-            f"acc2={train_metrics['acc_2cls']:.4f}"
+            f"acc2={train_metrics['acc_2cls']:.4f} "
+            f"grp={train_metrics['acc_group']:.4f}"
         )
         print(
             f"[Val]   loss={val_metrics['loss']:.4f} "
             f"L4={val_metrics['ce_loss_4cls']:.4f} "
             f"L2={val_metrics['ce_loss_2cls']:.4f} "
+            f"Lg={val_metrics['ce_loss_group']:.4f} "
             f"acc4={val_metrics['acc_4cls']:.4f} "
             f"f1_4={val_metrics['macro_f1_4cls']:.4f} "
+            f"group_head_acc={val_metrics['group_head_acc']:.4f} "
             f"group4_acc={val_metrics['group_acc_from_4cls']:.4f} "
             f"emo4_acc={val_metrics['emo_acc_from_4cls']:.4f} "
             f"seg_emo_acc={val_metrics['emotion_acc']:.4f} "
@@ -2163,6 +2233,25 @@ def build_emotion_class_weights(index_csv: str, subject_ids):
     weights = counts.sum() / counts
     weights = weights / weights.mean()
 
+    return torch.tensor(weights.values, dtype=torch.float32)
+
+
+def build_group_class_weights_from_label4(index_csv: str, subject_ids):
+    """Build DEP/HC weights from label4: 0/1=DEP, 2/3=HC."""
+
+    df = pd.read_csv(index_csv)
+    subject_set = {str(s) for s in subject_ids}
+    df = df[df["subject_id"].astype(str).isin(subject_set)].reset_index(drop=True)
+
+    if "label4" not in df.columns:
+        raise KeyError("index_csv 缺少 label4 列，无法从 label4 推导 DEP/HC 权重。")
+
+    group_labels = (df["label4"].astype(int) >= 2).astype(int)
+    counts = group_labels.value_counts().sort_index()
+    counts = counts.reindex([0, 1], fill_value=1)
+
+    weights = counts.sum() / counts
+    weights = weights / weights.mean()
     return torch.tensor(weights.values, dtype=torch.float32)
 
 
@@ -2516,8 +2605,9 @@ if __name__ == "__main__":
                 rand=rand,
                 weight_decay=5e-4,
                 num_workers=4,
-                lambda_4cls=0.3,
+                lambda_4cls=0.1,
                 lambda_diag=1.0,
+                lambda_group=0.2,
                 lambda_graph=0.0,
                 lambda_domain=0.01,
                 grl_domain=0.05,

@@ -2528,7 +2528,7 @@ class TwoBranchModel(nn.Module):
     结构：
         EEG x + de_feat
         -> BrainGraphBackbone (3 branches)
-        -> z  [B, 185]  ──→ cls4_head  ──→ 四分类情绪 logits
+        -> z  [B, 185]  ──→ diag_head + cls2_head  ──→ factorized 4-class logits
         -> z  [B, 185]  ──→ cls2_head  ──→ 二分类情绪 logits
         -> z  [B, 185]  ──→ domain_head (GRL) ──→ 被试域 logits
 
@@ -2571,18 +2571,19 @@ class TwoBranchModel(nn.Module):
 
         head_in_dim = self.backbone.out_dim  # 185 = z_conv(64) + z_plv(64) + z_bio(57)
 
-        # 四分类情绪头：z → 4 classes
-        self.cls4_head = ClassificationHead(
+        # Emotion head: z -> 2 classes.
+        self.cls2_head = ClassificationHead(
             in_dim=head_in_dim,
-            num_classes=num_classes_4,
+            num_classes=num_classes_2,
             hidden_dim=64,
             dropout=dropout,
         )
 
-        # 二分类情绪头：z → 2 classes
-        self.cls2_head = ClassificationHead(
+        # Diagnosis/group head: 0=DEP, 1=HC. The 4-class logits are
+        # factorized as P(diagnosis) * P(emotion).
+        self.diag_head = ClassificationHead(
             in_dim=head_in_dim,
-            num_classes=num_classes_2,
+            num_classes=2,
             hidden_dim=64,
             dropout=dropout,
         )
@@ -2628,11 +2629,21 @@ class TwoBranchModel(nn.Module):
 
         z = out["z"]  # [B, 185] = z_conv ⊕ z_plv ⊕ z_bio
 
-        # 四分类情绪头（全量特征）
-        logits_4cls = self.cls4_head(z)
+        # Diagnosis head plus emotion head form factorized 4-class logits.
+        logits_diag = self.diag_head(z)
 
-        # 二分类情绪头（全量特征）
         logits_2cls = self.cls2_head(z)
+        log_diag = F.log_softmax(logits_diag, dim=1)
+        log_emo = F.log_softmax(logits_2cls, dim=1)
+        logits_4cls = torch.stack(
+            [
+                log_diag[:, 0] + log_emo[:, 0],
+                log_diag[:, 0] + log_emo[:, 1],
+                log_diag[:, 1] + log_emo[:, 0],
+                log_diag[:, 1] + log_emo[:, 1],
+            ],
+            dim=1,
+        )
 
         # 被试域对抗头（全量特征，通过 GRL）
         domain_logits = self.domain_head(z, lambda_grl=lambda_dom)
@@ -2640,6 +2651,9 @@ class TwoBranchModel(nn.Module):
         out["logits"] = logits_4cls             # 兼容旧接口：logits = 四分类
         out["logits_4cls"] = logits_4cls
         out["logits_2cls"] = logits_2cls
+        out["logits_diag"] = logits_diag
+        out["logits_group"] = logits_diag
+        out["prob_4cls_factorized"] = logits_4cls.exp()
         out["domain_logits"] = domain_logits
         out["graph_feat"] = z                   # 全量特征，兼用于 center loss
         return out
@@ -2761,4 +2775,3 @@ if __name__ == "__main__":
     print("Graph embedding:", out_seed["z"].shape)  # [B, 185]
     print("Adjacency:", out_seed["adj_norm"].shape)  # [B, 30, 30]
     print("Power diag:", out_seed["power_diag_values"].shape)  # [B, 30]
-
