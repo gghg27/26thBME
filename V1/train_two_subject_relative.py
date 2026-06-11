@@ -329,9 +329,9 @@ def validate_one_epoch_two_branch(
                 loss_graph = intra_class_graph_loss(adj_dense, y_4cls)
             else:
                 loss_graph = logits_4cls.new_tensor(0.0)
-            loss = 0.5 * loss_4cls + lambda_diag * loss_2cls + lambda_graph * loss_graph
+            loss = loss_4cls + lambda_diag * loss_2cls + lambda_graph * loss_graph
         else:
-            loss = 0.5 * loss_4cls + lambda_diag * loss_2cls
+            loss =  loss_4cls + lambda_diag * loss_2cls
 
         pred_4cls = logits_4cls.argmax(dim=1)
         pred_2cls = logits_2cls.argmax(dim=1)
@@ -653,7 +653,7 @@ def train_one_epoch_two_branch(
 
         # ── 总 loss ──
         loss = (
-            0.7*loss_4cls
+            loss_4cls
             + lambda_diag * loss_2cls
             + center_weight * loss_center
             + lambda_domain * loss_dom
