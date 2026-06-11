@@ -843,6 +843,99 @@ def _subject_weight_tensor(
     return torch.tensor(values, dtype=torch.float32, device=device)
 
 
+def clip_source_weights(
+    source_weights: dict[str, float],
+    max_weight: float = 0.0,
+    blend_uniform: float = 0.0,
+    mean_one: bool = True,
+) -> dict[str, float]:
+    """Clip and smooth source-subject weights while preserving their scale."""
+    if not source_weights:
+        return {}
+
+    keys = list(source_weights.keys())
+    values = np.asarray([float(source_weights[k]) for k in keys], dtype=np.float64)
+    if max_weight and max_weight > 0:
+        values = np.minimum(values, float(max_weight))
+    if blend_uniform and blend_uniform > 0:
+        alpha = float(max(0.0, min(1.0, blend_uniform)))
+        baseline = 1.0 if mean_one else 1.0 / max(len(keys), 1)
+        values = (1.0 - alpha) * values + alpha * baseline
+
+    target_sum = float(len(keys)) if mean_one else 1.0
+    value_sum = float(values.sum())
+    if value_sum > 0:
+        values = values * (target_sum / value_sum)
+    return {k: float(v) for k, v in zip(keys, values)}
+
+
+def stage2_subject_ranking_loss(
+    mix_prob: torch.Tensor,
+    labels: torch.Tensor,
+    subject_ids: torch.Tensor,
+    trial_ids: torch.Tensor,
+    sample_weight: Optional[torch.Tensor] = None,
+    margin: float = 0.2,
+    max_pairs_per_subject: int = 128,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Subject-wise trial ranking loss aligned with final soft top-k inference.
+
+    The score is log-odds of positive emotion. Window scores are averaged to a
+    trial score before pairwise ranking positive trials above neutral trials.
+    """
+    score_pos = torch.log(mix_prob[:, 1].clamp_min(eps)) - torch.log(mix_prob[:, 0].clamp_min(eps))
+    labels = labels.reshape(-1).long()
+    subject_ids = subject_ids.reshape(-1)
+    trial_ids = trial_ids.reshape(-1)
+    sample_weight = sample_weight.reshape(-1) if sample_weight is not None else None
+
+    loss_terms = []
+    for sid in torch.unique(subject_ids):
+        sub_mask = subject_ids == sid
+        sub_scores = score_pos[sub_mask]
+        sub_labels = labels[sub_mask]
+        sub_trials = trial_ids[sub_mask]
+        sub_weights = sample_weight[sub_mask] if sample_weight is not None else None
+
+        trial_scores = []
+        trial_labels = []
+        trial_weights = []
+        for tid in torch.unique(sub_trials):
+            trial_mask = sub_trials == tid
+            trial_scores.append(sub_scores[trial_mask].mean())
+            trial_labels.append(sub_labels[trial_mask][0])
+            if sub_weights is not None:
+                trial_weights.append(sub_weights[trial_mask].mean())
+
+        if len(trial_scores) < 2:
+            continue
+
+        trial_scores = torch.stack(trial_scores)
+        trial_labels = torch.stack(trial_labels)
+        pos_scores = trial_scores[trial_labels == 1]
+        neg_scores = trial_scores[trial_labels == 0]
+        if pos_scores.numel() == 0 or neg_scores.numel() == 0:
+            continue
+
+        pair_losses = F.softplus(float(margin) - (pos_scores[:, None] - neg_scores[None, :]))
+        if trial_weights:
+            trial_weights = torch.stack(trial_weights)
+            pos_weights = trial_weights[trial_labels == 1]
+            neg_weights = trial_weights[trial_labels == 0]
+            pair_weights = torch.sqrt(pos_weights[:, None] * neg_weights[None, :]).clamp_min(eps)
+            pair_losses = pair_losses * pair_weights
+
+        if max_pairs_per_subject > 0 and pair_losses.numel() > max_pairs_per_subject:
+            pair_losses = torch.topk(pair_losses.reshape(-1), k=int(max_pairs_per_subject)).values
+        loss_terms.append(pair_losses.mean())
+
+    if not loss_terms:
+        return mix_prob.new_tensor(0.0)
+    return torch.stack(loss_terms).mean()
+
+
 def train_stage2_one_epoch(
     model: Stage2ExpertEmotionAdaptationModel,
     source_loader: DataLoader,
@@ -859,6 +952,11 @@ def train_stage2_one_epoch(
     grl_subject: float = 0.001,
     lambda_ent: float = 0.0,
     lambda_mdc: float = 0.0,
+    lambda_rank: float = 0.0,
+    rank_margin: float = 0.2,
+    rank_warmup_epochs: int = 3,
+    rank_max_pairs_per_subject: int = 128,
+    current_epoch: int = 1,
     source_de_mu: Optional[dict[str, torch.Tensor]] = None,
     source_de_std: Optional[dict[str, torch.Tensor]] = None,
     source_bio_mu: Optional[dict[str, torch.Tensor]] = None,
@@ -946,6 +1044,18 @@ def train_stage2_one_epoch(
         loss_mmd = weighted_mmd_rbf(source_out["z_mmd"], target_out["z_mmd"], source_weight=sample_weight)
         loss_ent = target_entropy_loss(target_out["mix_prob"]) if lambda_ent > 0 else source_out["z"].new_tensor(0.0)
         loss_mdc = source_out["z"].new_tensor(0.0)
+        if lambda_rank > 0 and current_epoch > rank_warmup_epochs:
+            loss_rank = stage2_subject_ranking_loss(
+                source_out["mix_prob"],
+                y_emo,
+                source_batch["subject_id"].long(),
+                source_batch["trial_id"].long(),
+                sample_weight=sample_weight,
+                margin=rank_margin,
+                max_pairs_per_subject=rank_max_pairs_per_subject,
+            )
+        else:
+            loss_rank = source_out["z"].new_tensor(0.0)
 
         loss = (
             lambda_expert * loss_expert
@@ -955,6 +1065,7 @@ def train_stage2_one_epoch(
             + lambda_subject * loss_subject_domain
             + lambda_ent * loss_ent
             + lambda_mdc * loss_mdc
+            + lambda_rank * loss_rank
         )
         loss.backward()
         optimizer.step()
@@ -982,6 +1093,7 @@ def train_stage2_one_epoch(
         totals["loss_subject_domain"] += float(loss_subject_domain.item()) * bsz
         totals["loss_ent"] += float(loss_ent.item()) * bsz
         totals["loss_mdc"] += float(loss_mdc.item()) * bsz
+        totals["loss_rank"] += float(loss_rank.item()) * bsz
         totals["mix_correct"] += int((mix_pred == y_emo).sum().item())
         totals["expert_correct"] += int((expert_pred == y_emo).sum().item())
         totals["diag_correct"] += int((diag_pred == y_diag).sum().item())
@@ -1017,6 +1129,7 @@ def train_stage2_one_epoch(
                 "exp": f"{totals['loss_expert'] / max(total_n, 1):.4f}",
                 "mix": f"{totals['loss_mix'] / max(total_n, 1):.4f}",
                 "mmd": f"{totals['loss_mmd'] / max(total_n, 1):.4f}",
+                "rank": f"{totals['loss_rank'] / max(total_n, 1):.4f}",
                 "acc": f"{totals['mix_correct'] / max(total_n, 1):.4f}",
                 "diag": f"{totals['diag_correct'] / max(total_n, 1):.4f}",
             }
@@ -1035,6 +1148,7 @@ def train_stage2_one_epoch(
         "loss_subject_domain": totals["loss_subject_domain"] / total_n,
         "loss_ent": totals["loss_ent"] / total_n,
         "loss_mdc": totals["loss_mdc"] / total_n,
+        "loss_rank": totals["loss_rank"] / total_n,
         "segment_acc": totals["mix_correct"] / total_n,
         "expert_acc": totals["expert_correct"] / total_n,
         "diag_acc": totals["diag_correct"] / total_n,
@@ -2257,6 +2371,20 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
     )
     source_weight_mode = "mean-one" if args.use_mean_one_source_weights else "sum-one"
     source_weights = vote_result["weights_mean_one"] if args.use_mean_one_source_weights else vote_result["weights"]
+    raw_source_weights = dict(source_weights)
+    source_weights = clip_source_weights(
+        source_weights,
+        max_weight=args.source_weight_clip,
+        blend_uniform=args.source_weight_blend_uniform,
+        mean_one=args.use_mean_one_source_weights,
+    )
+    if args.source_weight_clip > 0 or args.source_weight_blend_uniform > 0:
+        source_weight_mode = (
+            f"{source_weight_mode}; clip={args.source_weight_clip}; "
+            f"blend_uniform={args.source_weight_blend_uniform}"
+        )
+        raw_top_weights = sorted(raw_source_weights.items(), key=lambda kv: kv[1], reverse=True)[:8]
+        print(f"[Stage1] raw top source weights: {raw_top_weights}")
     top_weights = sorted(source_weights.items(), key=lambda kv: kv[1], reverse=True)[:8]
     print(f"[Stage1] source weight mode={source_weight_mode}; top source weights: {top_weights}")
 
@@ -2280,6 +2408,20 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
     optimizer2 = torch.optim.AdamW(stage2.parameters(), lr=args.lr_stage2, weight_decay=args.weight_decay)
     scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer2, T_max=max(args.stage2_epochs, 1))
     best_trackers = build_stage2_best_trackers()
+    stage2_early_stop_track = args.stage2_early_stop_track
+    if stage2_early_stop_track not in best_trackers:
+        print(f"[Stage2 EarlyStop] track={stage2_early_stop_track} not found, fallback to topk_trial_f1")
+        stage2_early_stop_track = "topk_trial_f1"
+    stage2_early_stop_criteria = best_trackers[stage2_early_stop_track]["criteria"]
+    stage2_early_best_metrics = None
+    stage2_early_best_epoch = None
+    stage2_bad_epochs = 0
+    print(
+        f"[Stage2 EarlyStop] enabled={not args.no_stage2_early_stop}, "
+        f"track={stage2_early_stop_track}, criteria={format_criteria(stage2_early_stop_criteria)}, "
+        f"patience={args.stage2_early_stop_patience}, warmup={args.stage2_early_stop_warmup}, "
+        f"min_delta={args.stage2_early_stop_min_delta}"
+    )
     history2 = []
     last_stage2_train_metrics = {}
     last_stage2_val_metrics = {}
@@ -2302,6 +2444,11 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
             grl_subject=args.grl_subject,
             lambda_ent=args.lambda_ent,
             lambda_mdc=args.lambda_mdc,
+            lambda_rank=args.lambda_rank,
+            rank_margin=args.rank_margin,
+            rank_warmup_epochs=args.rank_warmup_epochs,
+            rank_max_pairs_per_subject=args.rank_max_pairs_per_subject,
+            current_epoch=epoch,
             source_de_mu=source_de_mu,
             source_de_std=source_de_std,
             source_bio_mu=source_bio_mu,
@@ -2335,6 +2482,7 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
             f"[Stage2] epoch={epoch} loss={train_metrics['loss']:.4f} "
             f"train_emo_f1={train_metrics['emotion_macro_f1']:.4f} "
             f"train_diag_f1={train_metrics['diag_macro_f1']:.4f} "
+            f"rank={train_metrics.get('loss_rank', 0.0):.4f} "
             f"val_trial_f1={val_metrics['trial_macro_f1']:.4f} val_trial_acc={val_metrics['trial_acc']:.4f} "
             f"val_topk_f1={val_metrics['topk_trial_macro_f1']:.4f} val_topk_acc={val_metrics['topk_trial_acc']:.4f}"
         )
@@ -2362,6 +2510,7 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
                         extra_state={
                             "domain_mapping": domain_mapping,
                             "source_subject_weights": source_weights,
+                            "raw_source_subject_weights": raw_source_weights,
                             "source_weight_mode": source_weight_mode,
                             "source_weight_vote": vote_result,
                         },
@@ -2376,6 +2525,46 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
                         f"[Stage2] saved best_{best_name}: epoch={epoch}, "
                         f"criteria={format_criteria(criteria)}, path={ckpt_path}"
                     )
+
+        if not args.no_stage2_early_stop:
+            if epoch <= args.stage2_early_stop_warmup:
+                warmup_improved = is_better_by_criteria(
+                    val_metrics,
+                    stage2_early_best_metrics,
+                    stage2_early_stop_criteria,
+                    eps=args.stage2_early_stop_min_delta,
+                )
+                if warmup_improved:
+                    stage2_early_best_metrics = copy.deepcopy(val_metrics)
+                    stage2_early_best_epoch = epoch
+                print(
+                    f"[Stage2 EarlyStop] warmup ({epoch}/{args.stage2_early_stop_warmup}), "
+                    f"best_epoch={stage2_early_best_epoch}"
+                )
+            else:
+                improved = is_better_by_criteria(
+                    val_metrics,
+                    stage2_early_best_metrics,
+                    stage2_early_stop_criteria,
+                    eps=args.stage2_early_stop_min_delta,
+                )
+                if improved:
+                    stage2_early_best_metrics = copy.deepcopy(val_metrics)
+                    stage2_early_best_epoch = epoch
+                    stage2_bad_epochs = 0
+                else:
+                    stage2_bad_epochs += 1
+                print(
+                    f"[Stage2 EarlyStop] improved={improved}, "
+                    f"best_epoch={stage2_early_best_epoch}, "
+                    f"bad_epochs={stage2_bad_epochs}/{args.stage2_early_stop_patience}"
+                )
+                if stage2_bad_epochs >= args.stage2_early_stop_patience:
+                    print(
+                        f"[Stage2 EarlyStop] stop at epoch={epoch}; "
+                        f"best_epoch={stage2_early_best_epoch}"
+                    )
+                    break
 
     stage2_history_csv = save_dir / "stage2_history.csv"
     pd.DataFrame(history2).to_csv(stage2_history_csv, index=False, encoding="utf-8-sig")
@@ -2398,6 +2587,7 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
             extra_state={
                 "domain_mapping": domain_mapping,
                 "source_subject_weights": source_weights,
+                "raw_source_subject_weights": raw_source_weights,
                 "source_weight_mode": source_weight_mode,
                 "source_weight_vote": vote_result,
             },
@@ -2493,10 +2683,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--lr_stage1", type=float, default=1e-4)
     parser.add_argument("--lr_stage2", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=5e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-3)
     parser.add_argument("--sfreq", type=float, default=250.0)
     parser.add_argument("--topk", type=int, default=8)
-    parser.add_argument("--dropout", type=float, default=0.35)
+    parser.add_argument("--dropout", type=float, default=0.45)
     parser.add_argument("--biomarker_dim", type=int, default=57)
     parser.add_argument("--de_num_bands", type=int, default=5)
     parser.add_argument("--no_biomarkers", action="store_true")
@@ -2518,21 +2708,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vote_level", choices=["window", "trial"], default="window")
     parser.add_argument("--use_mean_one_source_weights", dest="use_mean_one_source_weights", action="store_true", default=True)
     parser.add_argument("--use_sum_one_source_weights", dest="use_mean_one_source_weights", action="store_false")
+    parser.add_argument("--source_weight_clip", type=float, default=4.0)
+    parser.add_argument("--source_weight_blend_uniform", type=float, default=0.0)
 
     parser.add_argument("--lambda_expert", type=float, default=0.5)
     parser.add_argument("--lambda_mix", type=float, default=1.0)
-    parser.add_argument("--lambda_diag", type=float, default=0.02)
+    parser.add_argument("--lambda_diag", type=float, default=0.01)
     parser.add_argument("--stage2_lambda_mmd", type=float, default=0.0003)
     parser.add_argument("--lambda_subject", type=float, default=0.0003)
     parser.add_argument("--grl_subject", type=float, default=0.001)
     parser.add_argument("--lambda_ent", type=float, default=0.0)
     parser.add_argument("--lambda_mdc", type=float, default=0.0)
-    parser.add_argument("--shared_mix_alpha", type=float, default=0.5)
+    parser.add_argument("--lambda_rank", type=float, default=0.1)
+    parser.add_argument("--rank_margin", type=float, default=0.2)
+    parser.add_argument("--rank_warmup_epochs", type=int, default=3)
+    parser.add_argument("--rank_max_pairs_per_subject", type=int, default=128)
+    parser.add_argument("--shared_mix_alpha", type=float, default=0.7)
     parser.add_argument("--no_stage1_init", action="store_true")
+    parser.add_argument("--no_stage2_early_stop", action="store_true")
+    parser.add_argument("--stage2_early_stop_track", type=str, default="topk_trial_f1")
+    parser.add_argument("--stage2_early_stop_patience", type=int, default=5)
+    parser.add_argument("--stage2_early_stop_warmup", type=int, default=3)
+    parser.add_argument("--stage2_early_stop_min_delta", type=float, default=1e-6)
 
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--predict_test", action="store_true")
-    parser.add_argument("--predict_best_name", type=str, default="combined")
+    parser.add_argument("--predict_best_name", type=str, default="topk_trial_f1")
     parser.add_argument(
         "--test_vote_method",
         choices=["prob", "soft_threshold", "hard", "soft_topk", "topk"],

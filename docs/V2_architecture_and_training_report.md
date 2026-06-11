@@ -13,12 +13,13 @@
 3. [第一阶段模型：源域选择与适配 (Stage 1: SSAS)](#3-第一阶段模型源域选择与适配-stage-1-ssas)
 4. [第二阶段模型：专家情绪适配 (Stage 2: Expert Emotion Adaptation)](#4-第二阶段模型专家情绪适配-stage-2-expert-emotion-adaptation)
 5. [核心模块详解](#5-核心模块详解)
-6. [损失函数设计](#6-损失函数设计)
-7. [两阶段训练策略](#7-两阶段训练策略)
-8. [数据流与域划分](#8-数据流与域划分)
-9. [评估指标体系](#9-评估指标体系)
-10. [超参数配置](#10-超参数配置)
-11. [关键创新点总结](#11-关键创新点总结)
+6. [被试相对特征归一化 (Subject-Relative Normalization)](#6-被试相对特征归一化-subject-relative-normalization)
+7. [损失函数设计](#7-损失函数设计)
+8. [两阶段训练策略](#8-两阶段训练策略)
+9. [数据流与域划分](#9-数据流与域划分)
+10. [评估指标体系](#10-评估指标体系)
+11. [超参数配置](#11-超参数配置)
+12. [关键创新点总结](#12-关键创新点总结)
 
 ---
 
@@ -353,9 +354,270 @@ GRL 在前向传播时不做任何变换，反向传播时将梯度乘以 $-\lam
 
 ---
 
-## 6. 损失函数设计
+## 6. 被试相对特征归一化 (Subject-Relative Normalization)
 
-### 6.1 阶段一损失函数
+### 6.1 设计动机
+
+跨被试 EEG 情绪识别面临的核心挑战之一是**个体差异**——不同被试的 EEG 信号在绝对幅值、频带能量分布上存在显著差异，这种差异往往大于情绪状态引起的差异。传统的批量归一化（BatchNorm）或层归一化（LayerNorm）仅基于当前批次统计量，无法建模跨被试的系统性偏移。
+
+本框架引入**被试相对特征归一化**（Subject-Relative Normalization），通过对每个被试独立估计其 DE 特征和 biomarker 特征的均值（$\mu$）与标准差（$\sigma$），将绝对特征转换为相对特征，从而：
+
+- **消除个体基线偏移**：不同被试的 EEG 绝对能量差异被部分消除
+- **保留情绪相关信息**：被试内相对变化（偏离自身基线的程度）被显式编码
+- **增强跨被试泛化**：训练时学到的模式更关注"相对于自身的变化"而非"绝对数值"
+
+### 6.2 总体架构
+
+被试相对特征分为两条并行路径：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│               Subject-Relative Normalization                    │
+│                                                                 │
+│   Input: EEG x [B,30,T] + de_feat [B,30,K]                     │
+│                                                                 │
+│   ┌─────────────────────┐    ┌─────────────────────┐           │
+│   │  DE 路径            │    │  Biomarker 路径      │           │
+│   │                     │    │                     │           │
+│   │ subject_de_mu/std   │    │ subject_bio_mu/std  │           │
+│   │   ↓                 │    │   ↓                 │           │
+│   │ de_rel = de - μ_de  │    │ bio_raw [B,57]      │           │
+│   │ de_z = de_rel/σ_de  │    │ ↓                   │           │
+│   │ ↓                   │    │ bio_rel = bio - μ   │           │
+│   │ concat(de,de_rel,   │    │ bio_z = bio_rel/σ   │           │
+│   │       de_z) → [3K]  │    │ ↓                   │           │
+│   │ ↓                   │    │ concat(α·bio,       │           │
+│   │ DEAdapter → [K]     │    │       bio_z) → [2D] │           │
+│   │ ↓                   │    │ ↓                   │           │
+│   │ de_for_model [B,C,K]│    │ Projector → [D]     │           │
+│   │                     │    │ ↓                   │           │
+│   │                     │    │ z_bio [B,57]        │           │
+│   └─────────────────────┘    └─────────────────────┘           │
+│                                                                 │
+│   注意：两种归一化均可通过开关独立控制                         │
+│   (use_subject_relative_de / use_subject_relative_bio)          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 6.3 两条路径的详细公式与实现
+
+#### 6.3.1 DE 特征被试相对归一化
+
+**步骤 1：基线统计量计算**（训练前离线完成，`compute_subject_de_baselines`）
+
+对每个被试 $s$ 的所有样本，计算 DE 特征的逐元素均值和标准差：
+
+$$\mu_s^{\text{DE}} = \frac{1}{N_s} \sum_{i \in \mathcal{D}_s} \mathbf{x}_i^{\text{DE}} \in \mathbb{R}^{C \times K}$$
+
+$$\sigma_s^{\text{DE}} = \sqrt{\frac{1}{N_s} \sum_{i \in \mathcal{D}_s} (\mathbf{x}_i^{\text{DE}} - \mu_s^{\text{DE}})^2 + \epsilon} \in \mathbb{R}^{C \times K}$$
+
+其中 $\mathcal{D}_s$ 为被试 $s$ 的所有窗口样本集合，$N_s$ 为样本数，$C=30$ 为通道数，$K=5$ 为频带数。
+
+**步骤 2：运行时相对特征构造**（在 `BrainGraphBackbone.forward()` 中）
+
+```python
+# 计算相对特征
+de_rel = de_band - subject_de_mu         # 偏离量
+de_z = de_rel / (subject_de_std + eps)   # 标准化偏离 (Z-score)
+
+# 三路拼接
+de_input = concat([de_band, de_rel, de_z], dim=-1)  # [B, C, 3K]
+
+# 通过适配器映射回原始维度
+de_for_model = DEAdapter(de_input)       # [B, C, K]
+```
+
+**特征语义：**
+
+| 特征组分 | 维度 | 物理含义 |
+|---------|------|---------|
+| `de_band` | [B, C, K] | 原始绝对 DE 特征 |
+| `de_rel = de - μ_s` | [B, C, K] | 相对于自身基线的偏离 |
+| `de_z = (de - μ_s)/σ_s` | [B, C, K] | 标准化相对偏离（Z-score） |
+
+三路拼接后 `[B, C, 3K]` → `SubjectRelativeDEAdapter` → `[B, C, K]`，适配器为一个简单的 `LayerNorm(3K) → Linear(3K, K)` 模块，将三种信息自适应融合。
+
+**容错机制：** 当 `subject_de_mu` 或 `subject_de_std` 缺失时（如测试阶段被试不在训练集中），`use_de_relative` 自动设为 `False`，退化为使用原始 `de_feat`。
+
+**`SubjectRelativeDEAdapter` 定义：**
+
+```python
+class SubjectRelativeDEAdapter(nn.Module):
+    """Map concat(de_feat, de_rel, de_z) back to original band dimension."""
+    def __init__(self, in_bands: int, out_bands: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(in_bands),       # 3K → 3K 归一化
+            nn.Linear(in_bands, out_bands), # 3K → K 线性映射
+        )
+    def forward(self, de_input):  # [B, C, 3*K] → [B, C, K]
+        return self.net(de_input)
+```
+
+#### 6.3.2 Biomarker 特征被试相对归一化
+
+**步骤 1：基线统计量计算**（`compute_subject_bio_baselines`）
+
+与 DE 基线不同，biomarker 基线需要通过一次模型前向传播来获取：
+
+```python
+@torch.no_grad()
+def compute_subject_bio_baselines(model, loader, device, ...):
+    for batch in loader:
+        # 注意：传 subject_bio_mu=None，确保输出原始 bio_raw
+        out = model(x, de_feat, subject_bio_mu=None, subject_bio_std=None)
+        bio_raw = out["bio_raw"]  # [B, 57]
+        # 按被试累积统计量
+        for key in keys:
+            sums[key] += bio_raw[i]
+            sq_sums[key] += bio_raw[i] ** 2
+            counts[key] += 1
+    # 计算 μ 和 σ
+    subject_bio_mu[key] = sums[key] / count
+    subject_bio_std[key] = sqrt(sq_sums[key]/count - mu^2 + eps)
+```
+
+此过程需要已加载 DE 基线（用于编码器前向传播），但自身以 `subject_bio_mu=None` 运行以确保输出的是未经归一化的原始 biomarker。
+
+**步骤 2：运行时相对特征构造**（在 `BiologicalMarkerExtractor.forward()` 中）
+
+```python
+# 在前向传播中
+bio_raw = concat([freq, asym, hjorth, plv, nonlinear])  # [B, 57]
+
+# 计算相对特征
+bio_raw_rel = bio_raw - subject_bio_mu       # 偏离量
+bio_raw_z = bio_raw_rel / (subject_bio_std + eps)  # 标准化偏离
+
+# 绝对值与 Z-score 拼接
+bio_input = concat([bio_abs_scale * bio_raw, bio_raw_z], dim=-1)  # [B, 114]
+
+# 通过投影器映射回原始维度
+bio_feat = self.relative_projector(bio_input)  # [B, 57]
+```
+
+**`relative_projector` 定义：**
+
+```python
+self.relative_projector = nn.Sequential(
+    nn.LayerNorm(2 * raw_dim),          # 114 → 114 归一化
+    nn.Linear(2 * raw_dim, raw_dim),    # 114 → 57 线性映射
+)
+```
+
+**`bio_abs_scale` 参数（默认 0.3）：** 控制绝对 biomarker 值在拼接中的权重。设置为小于 1 的值意味着在拼接的输入中，原始绝对值被缩小，而 Z-score 相对值占主导——鼓励模型更关注"偏离正常基线多少"而非"绝对基线水平是多少"。
+
+### 6.4 训练流程中的基线管理
+
+#### 6.4.1 基线生命周期
+
+```
+训练开始
+  │
+  ├─ 计算 DE 基线（全数据集遍历，纯统计，无需模型）
+  │   source_de_mu, source_de_std = compute_subject_de_baselines(source_dataset)
+  │   val_de_mu,    val_de_std    = compute_subject_de_baselines(val_dataset)
+  │   target_de_mu, target_de_std = compute_subject_de_baselines(target_dataset)
+  │
+  ├─ 计算 Bio 基线（需要一次模型前向传播获取 bio_raw）
+  │   source_bio_mu, source_bio_std = compute_subject_bio_baselines(stage1, source_loader, ...,
+  │                                       subject_de_mu=source_de_mu, subject_de_std=source_de_std)
+  │   val_bio_mu,    val_bio_std    = compute_subject_bio_baselines(stage1, val_loader, ...)
+  │   target_bio_mu, target_bio_std = compute_subject_bio_baselines(stage1, target_loader, ...)
+  │
+  ├─ 训练每个 batch
+  │   source_rel_kwargs = get_subject_relative_kwargs(batch, de_mu=source_de_mu, bio_mu=source_bio_mu, ...)
+  │   target_rel_kwargs = get_subject_relative_kwargs(batch, de_mu=target_de_mu, bio_mu=target_bio_mu, ...)
+  │   out = model(x, de_feat, **source_rel_kwargs)
+  │
+  └─ 测试预测（如有）
+      test_de_mu, test_de_std = compute_subject_de_baselines(test_dataset)
+      test_bio_mu, test_bio_std = compute_subject_bio_baselines(model, test_loader, ...)
+```
+
+#### 6.4.2 关键函数详解
+
+**`gather_subject_baseline(keys, baseline_dict, device, dtype)`**
+
+从预计算的被试基线字典中按样本 key 取出对应的基线张量：
+
+```python
+def gather_subject_baseline(keys, baseline_dict, device, dtype):
+    if baseline_dict is None:
+        return None
+    key_list = [str(k) for k in keys]
+    values = [torch.as_tensor(baseline_dict[k]) for k in key_list]
+    return torch.stack(values).to(device=device, dtype=dtype)
+```
+
+返回 `[B, ...]` 形状的张量，与 batch 对齐。
+
+**`get_subject_relative_kwargs(batch, device, dtype, de_mu, de_std, bio_mu, bio_std)`**
+
+为每个 batch 组装所有被试相对参数：
+
+```python
+def get_subject_relative_kwargs(batch, device, dtype, de_mu, de_std, bio_mu, bio_std):
+    keys = _batch_baseline_keys(batch)  # 如 ["source:3", "val:5", ...]
+    return {
+        "subject_de_mu": gather_subject_baseline(keys, de_mu, device, dtype),
+        "subject_de_std": gather_subject_baseline(keys, de_std, device, dtype),
+        "subject_bio_mu": gather_subject_baseline(keys, bio_mu, device, dtype),
+        "subject_bio_std": gather_subject_baseline(keys, bio_std, device, dtype),
+    }
+```
+
+#### 6.4.3 域间基线隔离
+
+三类数据集使用**独立的基线统计量**：
+
+| 数据集 | DE 基线 | Bio 基线 | key 前缀 |
+|--------|--------|---------|---------|
+| Source (训练被试) | `source_de_mu/std` | `source_bio_mu/std` | `source:{subject_id}` |
+| Val (验证被试) | `val_de_mu/std` | `val_bio_mu/std` | `val:{subject_id}` |
+| Target (目标域) | `target_de_mu/std` | `target_bio_mu/std` | `test:{user_id}` |
+
+使用 `target_key` 机制（如 `"source:3"`, `"val:5"`, `"test:P_test1"`）而非原始 `subject_id` 作为字典键，防止训练/验证/测试集间的被试 ID 冲突。
+
+### 6.5 退化行为与容错机制
+
+被试相对特征的设计遵循**优雅退化 (Graceful Degradation)** 原则：
+
+| 情况 | DE 行为 | Bio 行为 |
+|------|--------|---------|
+| 开关开启 + 基线完整 | 三路拼接 → 适配器 → `de_for_model` | concat(α·bio, bio_z) → 投影器 → `bio_feat` |
+| 开关开启 + 基线缺失 | 退化为原始 `de_feat` | 退化为原始 `bio_raw`（不经投影器） |
+| 测试集 baseline | 从测试集自身计算（仅用测试样本） | 同上 |
+| `bio_abs_scale` | N/A | α=0.3 缩绝对值，让 Z-score 主导 |
+
+**数值稳定性处理：**
+
+所有涉及除法的操作都添加了 `eps` 项（默认 `1e-6`），并在拼接后调用 `torch.nan_to_num(..., nan=0.0, posinf=0.0, neginf=0.0)` 防止数值异常。
+
+### 6.6 超参数配置
+
+| 超参数 | 默认值 | 说明 |
+|--------|--------|------|
+| `--no_subject_relative_de` | False（即默认启用） | 关闭 DE 被试相对归一化 |
+| `--no_subject_relative_bio` | False（即默认启用） | 关闭 biomarker 被试相对归一化 |
+| `--bio_abs_scale` | 0.3 | biomarker 绝对值在拼接中的缩放系数 |
+| `--relative_eps` | 1e-6 | 防止除零的微小常数 |
+| `--de_num_bands` | 5 | DE 频带数（影响适配器输入维度 3K） |
+
+### 6.7 设计要点总结
+
+1. **双边归一化**：DE 特征（低频带级精细特征）和 biomarker（高层语义特征）各自独立做被试内归一化
+2. **三路信息编码**（DE 路径）：`[绝对值, 偏离量, Z-score]` 三路拼接，让模型自适应学习最优融合
+3. **绝对值保留**（Bio 路径）：通过 `bio_abs_scale` 保留部分绝对信息，防止归一化过度导致丢失有用的全局差异
+4. **独立基线管理**：source/val/target 三类域的被试使用各自独立的基线统计量，避免数据泄露
+5. **优雅退化**：基线缺失时自动降级为原始特征，不影响正常推理流程
+6. **无额外可学习参数**（除适配器/投影器外）：基线统计量为纯数据驱动的固定值，不参与梯度更新
+
+---
+
+## 7. 损失函数设计
+
+### 7.1 阶段一损失函数
 
 $$\mathcal{L}_{\text{Stage1}} = \lambda_{\text{domain}} \mathcal{L}_{\text{domain}} + \lambda_{\text{mmd}} \mathcal{L}_{\text{MMD}} + \lambda_{\text{emo\_grl}} \mathcal{L}_{\text{emo}}^{\text{GRL}} + \lambda_{\text{diag\_grl}} \mathcal{L}_{\text{diag}}^{\text{GRL}}$$
 
@@ -368,7 +630,7 @@ $$\mathcal{L}_{\text{Stage1}} = \lambda_{\text{domain}} \mathcal{L}_{\text{domai
 
 **GRL 系数：** `grl_emo=0.01`, `grl_diag=0.01`
 
-### 6.2 阶段二损失函数
+### 7.2 阶段二损失函数
 
 $$\mathcal{L}_{\text{Stage2}} = \lambda_{\text{expert}} \mathcal{L}_{\text{expert}} + \lambda_{\text{mix}} \mathcal{L}_{\text{mix}} + \lambda_{\text{diag}} \mathcal{L}_{\text{diag}} + \lambda_{\text{mmd}} \mathcal{L}_{\text{MMD}} + \lambda_{\text{subject}} \mathcal{L}_{\text{subject}} + \lambda_{\text{ent}} \mathcal{L}_{\text{ent}}$$
 
@@ -411,9 +673,9 @@ $$\mathcal{L}_{\text{ent}} = -\frac{1}{B_t}\sum_{i=1}^{B_t} \sum_{c} P_{\text{fi
 
 ---
 
-## 7. 两阶段训练策略
+## 8. 两阶段训练策略
 
-### 7.1 训练流程总览
+### 8.1 训练流程总览
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -453,7 +715,7 @@ $$\mathcal{L}_{\text{ent}} = -\frac{1}{B_t}\sum_{i=1}^{B_t} \sum_{c} P_{\text{fi
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 训练超参数一览
+### 8.2 训练超参数一览
 
 | 超参数 | 默认值 | 说明 |
 |--------|--------|------|
@@ -466,7 +728,7 @@ $$\mathcal{L}_{\text{ent}} = -\frac{1}{B_t}\sum_{i=1}^{B_t} \sum_{c} P_{\text{fi
 | `shared_mix_alpha` | 0.5 | 共享/专家混合系数 |
 | `save_warmup_epochs` | 1 | 前N轮不触发best更新 |
 
-### 7.3 类别权重平衡
+### 8.3 类别权重平衡
 
 训练过程中对情绪和诊断损失使用类别权重：
 
@@ -474,7 +736,7 @@ $$w_c = \frac{N_{\text{total}}}{N_c} / \text{mean}\left(\frac{N_{\text{total}}}{
 
 确保少数类样本获得更高的损失权重。
 
-### 7.4 学习率调度
+### 8.4 学习率调度
 
 两阶段均使用 **CosineAnnealingLR**：
 $$\eta_t = \eta_{\min} + \frac{1}{2}(\eta_{\max} - \eta_{\min})\left(1 + \cos\left(\frac{t}{T_{\max}}\pi\right)\right)$$
@@ -483,9 +745,9 @@ $$\eta_t = \eta_{\min} + \frac{1}{2}(\eta_{\max} - \eta_{\min})\left(1 + \cos\le
 
 ---
 
-## 8. 数据流与域划分
+## 9. 数据流与域划分
 
-### 8.1 域ID映射 (Domain ID Mapping)
+### 9.1 域ID映射 (Domain ID Mapping)
 
 ```
 所有被试 → 全局域ID
@@ -501,27 +763,23 @@ $$\eta_t = \eta_{\min} + \frac{1}{2}(\eta_{\max} - \eta_{\min})\left(1 + \cos\le
 - **验证域 (val):** 验证集中的被试
 - **目标域 (test):** 测试集中的用户
 
-### 8.2 目标域数据加载器
+### 9.2 目标域数据加载器
 
 阶段一和阶段二的 `target_loader` 由 **val + test** 拼接而成：
 - 训练时：`shuffle=True, drop_last=True`（与 source batch 等长）
 - 投票时：`shuffle=False, drop_last=False`（全覆盖）
 
-### 8.3 被试相对特征 (Subject-Relative Features)
+### 9.3 被试相对特征 (Subject-Relative Features)
 
-对被试 $s$ 的 DE 特征和 biomarker 特征进行标准化：
-
-$$\tilde{x}_{\text{DE}} = \frac{x_{\text{DE}} - \mu_s^{\text{DE}}}{\sigma_s^{\text{DE}} + \epsilon}$$
-
-$$\tilde{x}_{\text{bio}} = \frac{x_{\text{bio}} - \mu_s^{\text{bio}}}{\sigma_s^{\text{bio}} + \epsilon}$$
-
-其中 $\mu_s, \sigma_s$ 为被试 $s$ 在所有样本上的均值和标准差。
+> **详见 [§6. 被试相对特征归一化](#6-被试相对特征归一化-subject-relative-normalization)**。
+>
+> 简要概述：对被试 $s$ 的 DE 特征和 biomarker 特征，使用预先计算好的被试内均值和标准差进行标准化，消除个体基线偏移。DE 路径采用三路拼接（绝对值+偏离量+Z-score）并通过 `SubjectRelativeDEAdapter` 映射回原始维度；biomarker 路径将 `concat(α·bio_raw, bio_z)` 通过 `relative_projector` 映射。两种归一化均可独立开关，基线缺失时自动优雅退化为原始特征。
 
 ---
 
-## 9. 评估指标体系
+## 10. 评估指标体系
 
-### 9.1 多层级评估
+### 10.1 多层级评估
 
 | 层级 | 指标 | 计算方式 |
 |------|------|---------|
@@ -531,7 +789,7 @@ $$\tilde{x}_{\text{bio}} = \frac{x_{\text{bio}} - \mu_s^{\text{bio}}}{\sigma_s^{
 | **诊断级** | diag_acc, diag_macro_f1 | 诊断路由准确率 |
 | **Per-Class** | precision, recall, f1, support | 每类详细指标 |
 
-### 9.2 多标准 Best Checkpoint 追踪
+### 10.2 多标准 Best Checkpoint 追踪
 
 阶段二同时追踪 8 个 best checkpoint 标准：
 
@@ -546,7 +804,7 @@ $$\tilde{x}_{\text{bio}} = \frac{x_{\text{bio}} - \mu_s^{\text{bio}}}{\sigma_s^{
 | `diag_f1` | diag_macro_f1 → acc → trial_f1 → loss | 诊断最优 |
 | `loss` | loss → trial_f1 → emo_f1 | 损失最小 |
 
-### 9.3 测试预测策略
+### 10.3 测试预测策略
 
 | 策略 | 说明 |
 |------|------|
@@ -554,7 +812,7 @@ $$\tilde{x}_{\text{bio}} = \frac{x_{\text{bio}} - \mu_s^{\text{bio}}}{\sigma_s^{
 | `soft_threshold` | prob ≥ 0.5 为正类 |
 | `hard` | trial 内多数窗口投票 |
 
-### 9.4 集成预测
+### 10.4 集成预测
 
 多折/多重复的 best checkpoints 做 **概率平均融合**：
 
@@ -562,9 +820,9 @@ $$P_{\text{ensemble}}(y|x) = \frac{1}{M}\sum_{m=1}^{M} P_m(y|x)$$
 
 ---
 
-## 10. 超参数配置
+## 11. 超参数配置
 
-### 10.1 完整命令行参数
+### 11.1 完整命令行参数
 
 | 参数组 | 参数 | 默认值 | 说明 |
 |--------|------|--------|------|
@@ -601,7 +859,7 @@ $$P_{\text{ensemble}}(y|x) = \frac{1}{M}\sum_{m=1}^{M} P_m(y|x)$$
 | | `threshold` | 0.5 | 概率阈值 |
 | | `test_vote_method` | soft_topk | 测试投票策略 |
 
-### 10.2 典型运行命令
+### 11.2 典型运行命令
 
 ```bash
 # 快速测试
@@ -616,9 +874,9 @@ python V2/train_expert_ssas_emotion.py --all_folds --all_repeats --batch_size 20
 
 ---
 
-## 11. 关键创新点总结
+## 12. 关键创新点总结
 
-### 11.1 模型架构创新
+### 12.1 模型架构创新
 
 1. **诊断条件专家混合 (Diagnosis-Conditioned Expert Mixture)**
    - 将抑郁诊断信息显式融入情绪识别：HC 和 DEP 群体使用独立的情绪专家
@@ -633,7 +891,7 @@ python V2/train_expert_ssas_emotion.py --all_folds --all_repeats --batch_size 20
    - 域分类器（显式监督）+ MMD（分布匹配）+ GRL 对抗（隐式对齐）
    - 三重机制互补，从不同角度最小化域差异
 
-### 11.2 训练策略创新
+### 12.2 训练策略创新
 
 1. **阶段一编码器初始化 → 阶段二**
    - 保证阶段二的起点已具有域不变特性
@@ -644,15 +902,21 @@ python V2/train_expert_ssas_emotion.py --all_folds --all_repeats --batch_size 20
    - Laplace 平滑避免权重过于极端
    - 支持 mean-one（保持原始损失尺度）和 sum-one 两种归一化模式
 
-3. **多标准 Best Model 追踪**
+3. **被试相对特征归一化**
+   - DE 特征和 biomarker 特征双路径的被试内标准化
+   - 三路信息编码（绝对值+偏离量+Z-score）自适应融合
+   - 域间基线隔离（source/val/target 独立统计量）
+   - 优雅退化机制保证推理时鲁棒性
+
+4. **多标准 Best Model 追踪**
    - 同时追踪 8 个不同评估标准的 best checkpoint
    - 可针对不同应用场景选择最优模型
 
-4. **跨被试集成预测**
+5. **跨被试集成预测**
    - 多折/多重复模型做概率平均
    - 支持多种投票策略（soft_topk / soft_threshold / hard）
 
-### 11.3 与 V1 的关键差异
+### 12.3 与 V1 的关键差异
 
 | 方面 | V1 (two_branch_subject_relative) | V2 (expert_ssas_emotion) |
 |------|----------------------------------|--------------------------|
@@ -661,6 +925,7 @@ python V2/train_expert_ssas_emotion.py --all_folds --all_repeats --batch_size 20
 | 诊断利用 | 作为独立分类任务 | 作为情绪专家的路由器 |
 | 域对齐 | 单头 GRL | GRL + MMD + 域分类器 |
 | 源域权重 | 无 | 阶段一投票产生 |
+| 被试相对特征 | DE基线 + Bio基线（固定归一化） | DE三路拼接 + Bio绝对值/Z-score融合 + 域间隔离 + 优雅退化 |
 | 编码器设计 | 三头并行 | 包装 V1 编码器，专注上层策略 |
 | 评估 | 简单 best model | 8标准并行追踪 |
 
