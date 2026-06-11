@@ -2289,7 +2289,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage1_epochs", type=int, default=5)
     parser.add_argument("--stage2_epochs", type=int, default=25)
     parser.add_argument("--save_warmup_epochs", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=200)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--deterministic", action="store_true")
@@ -2344,13 +2344,27 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def get_v2_seed_for_repeat(repeat: int) -> int:
+    seed_list = list(getattr(config, "V2_seed", [42]))
+    if not seed_list:
+        seed_list = [42]
+    if repeat < 0:
+        raise IndexError(f"repeat={repeat} 不能为负数。")
+    if repeat < len(seed_list):
+        return int(seed_list[repeat])
+
+    derived = int(seed_list[0]) + int(repeat) * 31
+    print(f"[config] V2 repeat={repeat} 超出预定义种子列表 {seed_list}，使用派生种子 {derived}")
+    return derived
+
+
 def main() -> None:
     args = parse_args()
     repeats = range(len(config.V2_seed)) if args.all_repeats else [args.repeat]
     folds = range(args.n_splits) if args.all_folds else [args.fold]
     results = []
     for repeat_index in repeats:
-        rand_seed = config.get_seed_for_repeat("diag", repeat_index)
+        rand_seed = get_v2_seed_for_repeat(repeat_index)
         for fold in folds:
             results.append(run_one_fold(args, fold=fold, repeat_index=repeat_index, rand_seed=rand_seed))
 
