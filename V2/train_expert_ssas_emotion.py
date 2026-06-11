@@ -17,6 +17,7 @@ import os
 import random
 import sys
 from collections import Counter, defaultdict
+from datetime import datetime
 from itertools import cycle
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -1542,6 +1543,55 @@ def load_checkpoint(path: str | Path, device: torch.device) -> dict:
         return torch.load(path, map_location=device)
 
 
+def print_checkpoint_info(path: str | Path, ckpt: dict, prefix: str = "[checkpoint]") -> None:
+    path = Path(path)
+    config_dict = ckpt.get("config", {})
+    extra_state = ckpt.get("extra_state", {})
+    val_metrics = ckpt.get("val_metrics", {})
+    train_metrics = ckpt.get("train_metrics", {})
+    saved_time = "unknown"
+    if path.exists():
+        saved_time = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _fmt(metrics: dict, key: str) -> str:
+        value = metrics.get(key, None)
+        if value is None:
+            return "NA"
+        try:
+            return f"{float(value):.4f}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    print(
+        f"{prefix} path={path} | saved={saved_time} | "
+        f"best_name={ckpt.get('best_name', extra_state.get('best_name', 'NA'))} | "
+        f"epoch={ckpt.get('epoch', 'NA')}"
+    )
+    print(f"{prefix} criteria={ckpt.get('criteria_readable', format_criteria(ckpt.get('criteria', [])))}")
+    print(
+        f"{prefix} val: topk_f1={_fmt(val_metrics, 'topk_trial_macro_f1')} "
+        f"trial_f1={_fmt(val_metrics, 'trial_macro_f1')} "
+        f"emotion_f1={_fmt(val_metrics, 'emotion_macro_f1')} "
+        f"diag_f1={_fmt(val_metrics, 'diag_macro_f1')} "
+        f"loss={_fmt(val_metrics, 'loss')}"
+    )
+    print(
+        f"{prefix} train: loss={_fmt(train_metrics, 'loss')} "
+        f"emotion_loss={_fmt(train_metrics, 'emotion_loss')} "
+        f"mix_loss={_fmt(train_metrics, 'mix_loss')} "
+        f"diag_loss={_fmt(train_metrics, 'diag_loss')}"
+    )
+    print(
+        f"{prefix} config: lr2={config_dict.get('lr_stage2', 'NA')} "
+        f"weight_decay={config_dict.get('weight_decay', 'NA')} "
+        f"dropout={config_dict.get('dropout', 'NA')} "
+        f"lambda_expert={config_dict.get('lambda_expert', 'NA')} "
+        f"lambda_mix={config_dict.get('lambda_mix', 'NA')} "
+        f"lambda_diag={config_dict.get('lambda_diag', 'NA')} "
+        f"stage2_lambda_mmd={config_dict.get('stage2_lambda_mmd', 'NA')}"
+    )
+
+
 def apply_subject_topk(trial_records: list[dict], k_pos: int = 4) -> list[dict]:
     """Apply V1-style per-subject soft top-K prediction on trial scores."""
 
@@ -1839,6 +1889,7 @@ def ensemble_test_predictions(
     for i, ckpt_path in enumerate(model_paths):
         print(f"\n[V2 ensemble] model {i + 1}/{len(model_paths)}: {ckpt_path}")
         ckpt = load_checkpoint(ckpt_path, device)
+        print_checkpoint_info(ckpt_path, ckpt, prefix=f"[V2 ensemble ckpt {i + 1}/{len(model_paths)}]")
         model, domain_mapping = build_stage2_model_from_checkpoint(ckpt, device)
         model_dir = per_model_dir / f"model_{i:02d}_{ckpt_path.stem}"
         trial_df = predict_test_trial_level(
@@ -2388,6 +2439,7 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
 
     if args.predict_test and args.test_csv and Path(args.test_csv).exists() and best_path:
         ckpt = load_checkpoint(best_path, device)
+        print_checkpoint_info(best_path, ckpt, prefix=f"[V2 predict ckpt {selected_best_name}]")
         stage2.load_state_dict(ckpt["model_state_dict"])
         trial_df = predict_test_trial_level(
             stage2,
@@ -2565,6 +2617,6 @@ def main() -> None:
 if __name__ == "__main__":
     main()
     #训练
-    # python3 V2/train_expert_ssas_emotion.py --all_folds --all_repeats --batch_size 150 --test_vote_method soft_topk --k_pos 4
+    # python3 V2/train_expert_ssas_emotion.py --all_folds --all_repeats --batch_size 200 --test_vote_method soft_topk --k_pos 4
 
-    #python3 V2/train_expert_ssas_emotion.py --all_folds --all_repeats --batch_size 150
+    #python3 V2/train_expert_ssas_emotion.py --all_folds --all_repeats --batch_size 200

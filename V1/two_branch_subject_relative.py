@@ -2133,6 +2133,9 @@ class BrainGraphBackbone(nn.Module):
             relative_eps: float = 1e-6,
     ) -> None:
         super().__init__()
+        self.sfreq = float(sfreq)
+        self.topk = int(topk)
+        self.dropout = float(dropout)
         self.use_subject_relative_de = bool(use_subject_relative_de)
         self.use_subject_relative_bio = bool(use_subject_relative_bio)
         self.bio_abs_scale = float(bio_abs_scale)
@@ -2551,6 +2554,9 @@ class TwoBranchModel(nn.Module):
             relative_eps: float = 1e-6,
     ) -> None:
         super().__init__()
+        self.sfreq = float(sfreq)
+        self.topk = int(topk)
+        self.dropout = float(dropout)
         self.use_subject_relative_de = bool(use_subject_relative_de)
         self.use_subject_relative_bio = bool(use_subject_relative_bio)
         self.bio_abs_scale = float(bio_abs_scale)

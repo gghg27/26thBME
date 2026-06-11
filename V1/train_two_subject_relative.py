@@ -24,6 +24,7 @@ import copy
 import random
 import sys
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -589,6 +590,60 @@ def validate_one_epoch_two_branch(
 # Train one epoch
 # =========================================================
 
+def subject_inbatch_ranking_loss(
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    subject_ids: torch.Tensor,
+    trial_ids: torch.Tensor,
+    margin: float = 0.2,
+    max_pairs_per_subject: int = 128,
+) -> torch.Tensor:
+    """
+    Subject-wise pair ranking loss for the final top-k inference target.
+
+    For each subject inside a batch, positive-emotion trials are encouraged to
+    have larger score_pos than neutral trials. Scores are first averaged at the
+    (subject, trial) level to avoid over-weighting trials with more windows.
+    """
+    scores = scores.reshape(-1)
+    labels = labels.reshape(-1).long()
+    subject_ids = subject_ids.reshape(-1)
+    trial_ids = trial_ids.reshape(-1)
+
+    loss_terms = []
+    for sid in torch.unique(subject_ids):
+        sub_mask = subject_ids == sid
+        sub_scores = scores[sub_mask]
+        sub_labels = labels[sub_mask]
+        sub_trials = trial_ids[sub_mask]
+
+        trial_scores = []
+        trial_labels = []
+        for tid in torch.unique(sub_trials):
+            trial_mask = sub_trials == tid
+            trial_scores.append(sub_scores[trial_mask].mean())
+            trial_labels.append(sub_labels[trial_mask][0])
+
+        if len(trial_scores) < 2:
+            continue
+
+        trial_scores = torch.stack(trial_scores)
+        trial_labels = torch.stack(trial_labels)
+        pos_scores = trial_scores[trial_labels == 1]
+        neg_scores = trial_scores[trial_labels == 0]
+        if pos_scores.numel() == 0 or neg_scores.numel() == 0:
+            continue
+
+        pair_losses = F.softplus(float(margin) - (pos_scores[:, None] - neg_scores[None, :]))
+        if max_pairs_per_subject > 0 and pair_losses.numel() > max_pairs_per_subject:
+            pair_losses = torch.topk(pair_losses.reshape(-1), k=int(max_pairs_per_subject)).values
+        loss_terms.append(pair_losses.mean())
+
+    if not loss_terms:
+        return scores.new_tensor(0.0)
+    return torch.stack(loss_terms).mean()
+
+
 def train_one_epoch_two_branch(
     model,
     loader,
@@ -603,6 +658,10 @@ def train_one_epoch_two_branch(
     lambda_group: float = 0.2,
     lambda_domain: float = 0.01,
     grl_domain: float = 0.05,
+    lambda_rank: float = 0.0,
+    rank_margin: float = 0.2,
+    rank_warmup_epochs: int = 3,
+    rank_max_pairs_per_subject: int = 128,
     # 类中心损失（作用于 z_diag）
     center_criterion=None,
     lambda_center: float = 0.0,
@@ -627,6 +686,7 @@ def train_one_epoch_two_branch(
     total_loss_group = 0.0
     total_loss_dom = 0.0
     total_loss_center = 0.0
+    total_loss_rank = 0.0
     total_correct_4cls = 0
     total_correct_2cls = 0
     total_correct_group = 0
@@ -640,6 +700,8 @@ def train_one_epoch_two_branch(
         y_2cls = (y_4cls % 2).long()                                     # 情绪二分类: 0=中性, 1=正性
         subject_id = batch["domain_id"].to(device).long()
         subject_ids_cpu = batch["subject_id"]
+        subject_ids_rank = batch["subject_id"].to(device).long()
+        trial_ids_rank = batch["trial_id"].to(device).long()
         de_feat = batch["de_feat"].to(device)
         subject_de_mu_batch = gather_subject_baseline(subject_ids_cpu, subject_de_mu, device, dtype=de_feat.dtype)
         subject_de_std_batch = gather_subject_baseline(subject_ids_cpu, subject_de_std, device, dtype=de_feat.dtype)
@@ -695,6 +757,19 @@ def train_one_epoch_two_branch(
         else:
             loss_dom = logits_4cls.new_tensor(0.0)
 
+        if lambda_rank > 0 and current_epoch > rank_warmup_epochs:
+            score_pos = logits_2cls[:, 1] - logits_2cls[:, 0]
+            loss_rank = subject_inbatch_ranking_loss(
+                scores=score_pos,
+                labels=y_2cls,
+                subject_ids=subject_ids_rank,
+                trial_ids=trial_ids_rank,
+                margin=rank_margin,
+                max_pairs_per_subject=rank_max_pairs_per_subject,
+            )
+        else:
+            loss_rank = logits_4cls.new_tensor(0.0)
+
         # ── 总 loss ──
         loss = (
             lambda_4cls * loss_4cls
@@ -702,6 +777,7 @@ def train_one_epoch_two_branch(
             + lambda_group * loss_group
             + center_weight * loss_center
             + lambda_domain * loss_dom
+            + lambda_rank * loss_rank
         )
 
         loss.backward()
@@ -718,6 +794,7 @@ def train_one_epoch_two_branch(
         total_loss_group += loss_group.item() * bsz
         total_loss_dom += loss_dom.item() * bsz
         total_loss_center += loss_center.item() * bsz
+        total_loss_rank += loss_rank.item() * bsz
         total_correct_4cls += (pred_4cls == y_4cls).sum().item()
         total_correct_2cls += (pred_2cls == y_2cls).sum().item()
         total_correct_group += (pred_group == y_group).sum().item()
@@ -730,6 +807,7 @@ def train_one_epoch_two_branch(
             "Lg": f"{total_loss_group / max(total_num, 1):.4f}",
             "dom": f"{total_loss_dom / max(total_num, 1):.4f}",
             "ctr": f"{total_loss_center / max(total_num, 1):.4f}",
+            "rank": f"{total_loss_rank / max(total_num, 1):.4f}",
             "acc4": f"{total_correct_4cls / max(total_num, 1):.4f}",
             "acc2": f"{total_correct_2cls / max(total_num, 1):.4f}",
             "grp": f"{total_correct_group / max(total_num, 1):.4f}",
@@ -745,6 +823,7 @@ def train_one_epoch_two_branch(
         "loss_group": total_loss_group / total_num,
         "loss_dom": total_loss_dom / total_num,
         "loss_center": total_loss_center / total_num,
+        "loss_rank": total_loss_rank / total_num,
         "acc_4cls": total_correct_4cls / total_num,
         "acc_2cls": total_correct_2cls / total_num,
         "acc_group": total_correct_group / total_num,
@@ -1587,6 +1666,59 @@ def save_best_checkpoint(
     return ckpt_path, json_path, csv_path
 
 
+def load_checkpoint_with_info(ckpt_path, device, prefix="[checkpoint]"):
+    ckpt_path = Path(ckpt_path)
+    try:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    except TypeError:
+        ckpt = torch.load(ckpt_path, map_location=device)
+
+    config_ckpt = ckpt.get("config", {})
+    val_metrics = ckpt.get("val_metrics", {})
+    train_metrics = ckpt.get("train_metrics", {})
+    saved_time = "unknown"
+    if ckpt_path.exists():
+        saved_time = datetime.fromtimestamp(ckpt_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _fmt_metric(metrics, key):
+        value = metrics.get(key, None)
+        if value is None:
+            return "NA"
+        try:
+            return f"{float(value):.4f}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    print(
+        f"{prefix} path={ckpt_path} | saved={saved_time} | "
+        f"best_name={ckpt.get('best_name', 'NA')} | epoch={ckpt.get('epoch', 'NA')}"
+    )
+    print(f"{prefix} criteria={ckpt.get('criteria_readable', format_criteria(ckpt.get('criteria', [])))}")
+    print(
+        f"{prefix} val: topk_f1={_fmt_metric(val_metrics, 'topk_trial_macro_f1')} "
+        f"trial_f1={_fmt_metric(val_metrics, 'trial_macro_f1')} "
+        f"seg_emo_f1={_fmt_metric(val_metrics, 'emotion_macro_f1')} "
+        f"f1_4={_fmt_metric(val_metrics, 'macro_f1')} "
+        f"loss={_fmt_metric(val_metrics, 'loss')}"
+    )
+    print(
+        f"{prefix} train: loss={_fmt_metric(train_metrics, 'loss')} "
+        f"loss_rank={_fmt_metric(train_metrics, 'loss_rank')} "
+        f"acc2={_fmt_metric(train_metrics, 'acc_2cls')} "
+        f"acc4={_fmt_metric(train_metrics, 'acc_4cls')}"
+    )
+    print(
+        f"{prefix} config: lr={config_ckpt.get('lr', 'NA')} "
+        f"weight_decay={config_ckpt.get('weight_decay', 'NA')} "
+        f"lambda_4cls={config_ckpt.get('lambda_4cls', 'NA')} "
+        f"lambda_group={config_ckpt.get('lambda_group', 'NA')} "
+        f"lambda_domain={config_ckpt.get('lambda_domain', 'NA')} "
+        f"lambda_rank={config_ckpt.get('lambda_rank', 'NA')} "
+        f"rank_margin={config_ckpt.get('rank_margin', 'NA')}"
+    )
+    return ckpt
+
+
 # =========================================================
 # Cross-subject training
 # =========================================================
@@ -1611,6 +1743,10 @@ def train_competition_cross_subject(
     lambda_domain: float = 0.01,
     grl_domain: float = 0.05,
     lambda_con: float = 0.05,
+    lambda_rank: float = 0.0,
+    rank_margin: float = 0.2,
+    rank_warmup_epochs: int = 3,
+    rank_max_pairs_per_subject: int = 128,
     device: str = "cuda",
     run_seed: int = None,
     deterministic: bool = False,
@@ -1862,6 +1998,10 @@ def train_competition_cross_subject(
         "lambda_domain": lambda_domain,
         "grl_domain": grl_domain,
         "lambda_con": lambda_con,
+        "lambda_rank": lambda_rank,
+        "rank_margin": rank_margin,
+        "rank_warmup_epochs": rank_warmup_epochs,
+        "rank_max_pairs_per_subject": rank_max_pairs_per_subject,
         "dataset": dataset,
         "early_stop_patience": early_stop_patience,
         "early_stop_warmup": early_stop_warmup,
@@ -1876,6 +2016,9 @@ def train_competition_cross_subject(
         "bio_abs_scale": bio_abs_scale,
         "relative_eps": relative_eps,
         "save_warmup_epochs": save_warmup_epochs,
+        "model_sfreq": float(getattr(model, "sfreq", 250.0)),
+        "model_topk": int(getattr(model, "topk", 6)),
+        "model_dropout": float(getattr(model, "dropout", 0.2)),
         "num_subjects": model.domain_head.num_subjects if hasattr(model, "domain_head") else 48,
     }
 
@@ -1891,7 +2034,6 @@ def train_competition_cross_subject(
                 ("trial_prob_acc", "max"),
                 ("emotion_macro_f1", "max"),
                 ("emotion_acc", "max"),
-                ("topk_subject_gap_mean", "max"),
                 ("macro_f1", "max"),
                 ("acc", "max"),
                 ("group_head_macro_f1", "max"),
@@ -1906,7 +2048,6 @@ def train_competition_cross_subject(
             "criteria": [
                 ("topk_trial_macro_f1", "max"),
                 ("topk_trial_acc", "max"),
-                ("topk_subject_gap_mean", "max"),
                 ("loss", "min"),
             ],
             "best_metrics": None,
@@ -1917,7 +2058,6 @@ def train_competition_cross_subject(
             "criteria": [
                 ("topk_trial_acc", "max"),
                 ("topk_trial_macro_f1", "max"),
-                ("topk_subject_gap_mean", "max"),
                 ("loss", "min"),
             ],
             "best_metrics": None,
@@ -2000,6 +2140,8 @@ def train_competition_cross_subject(
         f"min_delta={early_stop_min_delta}, "
         f"lambda_4cls={lambda_4cls}, "
         f"lambda_group={lambda_group}, "
+        f"lambda_rank={lambda_rank}, "
+        f"rank_margin={rank_margin}, "
         f"lambda_center={lambda_center}, "
         f"center_warmup_epochs={center_warmup_epochs}"
     )
@@ -2027,6 +2169,10 @@ def train_competition_cross_subject(
             lambda_group=lambda_group,
             lambda_domain=lambda_domain,
             grl_domain=grl_domain,
+            lambda_rank=lambda_rank,
+            rank_margin=rank_margin,
+            rank_warmup_epochs=rank_warmup_epochs,
+            rank_max_pairs_per_subject=rank_max_pairs_per_subject,
             center_criterion=center_criterion,
             lambda_center=lambda_center,
             center_warmup_epochs=center_warmup_epochs,
@@ -2456,15 +2602,19 @@ def ensemble_test_predictions(
         print(f"\n[ensemble] 模型 {i + 1}/{len(model_paths)}: {ckpt_path}")
 
         # 从 checkpoint 中读取 num_subjects
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        ckpt = load_checkpoint_with_info(
+            ckpt_path,
+            device=device,
+            prefix=f"[ensemble ckpt {i + 1}/{len(model_paths)}]",
+        )
         config_ckpt = ckpt.get("config", {})
         num_subjects = int(config_ckpt.get("num_subjects", 48))
 
         model = TwoBranchModel(
-            sfreq=250.0,
+            sfreq=float(config_ckpt.get("model_sfreq", 250.0)),
             prior_matrix=None,
-            topk=6,
-            dropout=0.2,
+            topk=int(config_ckpt.get("model_topk", 6)),
+            dropout=float(config_ckpt.get("model_dropout", 0.2)),
             num_subjects=num_subjects,
             num_classes_4=4,
             num_classes_2=2,
@@ -2550,6 +2700,7 @@ if __name__ == "__main__":
     all_fold_rows = []
     all_best_rows_long = []
     all_ckpt_paths: list[Path] = []
+    test_ensemble_best_name = "topk_trial_f1"
     combined_4cls_confusions = []
     combined_segment_emo_confusions = []
     combined_trial_emo_confusions = []
@@ -2582,7 +2733,7 @@ if __name__ == "__main__":
                 sfreq=250.0,
                 prior_matrix=None,
                 topk=6,
-                dropout=0.35,
+                dropout=0.45,
                 num_subjects=_total_subjects,
                 num_classes_4=4,
                 num_classes_2=2,
@@ -2599,24 +2750,28 @@ if __name__ == "__main__":
                 save_dir=os.path.join(model_params_root, f"two_branch_reapt{repeat}_fold{fold}"),
                 dataset="com",
                 n_splits=n_splits,
-                epochs=30,
+                epochs=25,
                 batch_size=_bs,
                 lr=1e-4,
                 rand=rand,
-                weight_decay=5e-4,
+                weight_decay=1e-3,
                 num_workers=4,
-                lambda_4cls=0.1,
+                lambda_4cls=0.05,
                 lambda_diag=1.0,
-                lambda_group=0.2,
+                lambda_group=0.1,
                 lambda_graph=0.0,
-                lambda_domain=0.01,
+                lambda_domain=0.005,
                 grl_domain=0.05,
                 lambda_con=0.0,
+                lambda_rank=0.1,
+                rank_margin=0.2,
+                rank_warmup_epochs=3,
+                rank_max_pairs_per_subject=128,
                 device=device,
                 run_seed=run_seed,
                 deterministic=False,
-                early_stop_track="combined",
-                early_stop_patience=8,
+                early_stop_track="topk_trial_f1",
+                early_stop_patience=5,
                 early_stop_warmup=3,
                 early_stop_min_delta=1e-6,
                 use_subject_relative_de=True,
@@ -2641,8 +2796,20 @@ if __name__ == "__main__":
             all_fold_rows.append(fold_row)
             seed_combined_rows.append(fold_row)
 
-            if combined_tracker["checkpoint_path"]:
+            prediction_tracker = result["best_models"].get(test_ensemble_best_name, combined_tracker)
+            if prediction_tracker["checkpoint_path"]:
+                all_ckpt_paths.append(Path(prediction_tracker["checkpoint_path"]))
+                print(
+                    f"[Test Ensemble] fold={fold} use best_{test_ensemble_best_name}: "
+                    f"epoch={prediction_tracker['best_epoch']} path={prediction_tracker['checkpoint_path']}"
+                )
+            elif combined_tracker["checkpoint_path"]:
                 all_ckpt_paths.append(Path(combined_tracker["checkpoint_path"]))
+                print(
+                    f"[Test Ensemble] fold={fold} best_{test_ensemble_best_name} missing, "
+                    f"fallback combined: epoch={combined_tracker['best_epoch']} "
+                    f"path={combined_tracker['checkpoint_path']}"
+                )
 
             for best_name, tracker in result["best_models"].items():
                 row = {
