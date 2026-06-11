@@ -1534,6 +1534,14 @@ def save_final_checkpoint(
     return str(ckpt_path), str(json_path), str(csv_path)
 
 
+def load_checkpoint(path: str | Path, device: torch.device) -> dict:
+    path = Path(path)
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
 def apply_subject_topk(trial_records: list[dict], k_pos: int = 4) -> list[dict]:
     """Apply V1-style per-subject soft top-K prediction on trial scores."""
 
@@ -1654,8 +1662,9 @@ def predict_test_trial_level(
     threshold: float = 0.5,
     vote_method: str = "prob",
     k_pos: int = 4,
+    normalize: bool = True,
 ) -> pd.DataFrame:
-    dataset = UnlabeledTargetDataset(test_csv, domain_mapping=domain_mapping, root=ROOT, normalize=True)
+    dataset = UnlabeledTargetDataset(test_csv, domain_mapping=domain_mapping, root=ROOT, normalize=normalize)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -1771,6 +1780,142 @@ def predict_test_trial_level(
         f"selected={vote_method}: {n_selected}/{len(submission)} positive"
     )
     return trial_df
+
+
+def build_stage2_model_from_checkpoint(ckpt: dict, device: torch.device) -> tuple[Stage2ExpertEmotionAdaptationModel, dict]:
+    config_dict = ckpt.get("config", {}) or {}
+    extra_state = ckpt.get("extra_state", {}) or {}
+    domain_mapping = extra_state.get("domain_mapping") or ckpt.get("domain_mapping")
+    if domain_mapping is None:
+        raise KeyError("Checkpoint is missing domain_mapping; cannot rebuild target domain ids for test prediction.")
+
+    use_biomarkers = not bool(config_dict.get("no_biomarkers", False))
+    use_subject_relative_de = not bool(config_dict.get("no_subject_relative_de", False))
+    use_subject_relative_bio = (
+        (not bool(config_dict.get("no_subject_relative_bio", False)))
+        and use_biomarkers
+    )
+
+    model = Stage2ExpertEmotionAdaptationModel(
+        num_domains=int(domain_mapping["num_domains"]),
+        sfreq=float(config_dict.get("sfreq", 250.0)),
+        topk=int(config_dict.get("topk", 8)),
+        dropout=float(config_dict.get("dropout", 0.35)),
+        use_biomarkers=use_biomarkers,
+        biomarker_dim=int(config_dict.get("biomarker_dim", 57)),
+        use_subject_relative_de=use_subject_relative_de,
+        use_subject_relative_bio=use_subject_relative_bio,
+        bio_abs_scale=float(config_dict.get("bio_abs_scale", 0.3)),
+        relative_eps=float(config_dict.get("relative_eps", 1e-6)),
+        de_num_bands=int(config_dict.get("de_num_bands", 5)),
+        shared_mix_alpha=float(config_dict.get("shared_mix_alpha", 0.5)),
+    ).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    return model, domain_mapping
+
+
+@torch.no_grad()
+def ensemble_test_predictions(
+    model_paths: list[str | Path],
+    test_csv: str,
+    device: torch.device,
+    save_dir: str | Path,
+    batch_size: int = 128,
+    num_workers: int = 0,
+    threshold: float = 0.5,
+    vote_method: str = "soft_topk",
+    k_pos: int = 4,
+    normalize: bool = True,
+) -> pd.DataFrame:
+    model_paths = [Path(p) for p in model_paths if p and Path(p).exists()]
+    if not model_paths:
+        raise ValueError("No valid checkpoint paths for V2 test ensemble.")
+
+    save_dir = Path(save_dir)
+    per_model_dir = save_dir / "per_model"
+    per_model_dir.mkdir(parents=True, exist_ok=True)
+    all_trial_probs = []
+
+    for i, ckpt_path in enumerate(model_paths):
+        print(f"\n[V2 ensemble] model {i + 1}/{len(model_paths)}: {ckpt_path}")
+        ckpt = load_checkpoint(ckpt_path, device)
+        model, domain_mapping = build_stage2_model_from_checkpoint(ckpt, device)
+        model_dir = per_model_dir / f"model_{i:02d}_{ckpt_path.stem}"
+        trial_df = predict_test_trial_level(
+            model,
+            test_csv,
+            domain_mapping,
+            device,
+            model_dir,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            threshold=threshold,
+            vote_method=vote_method,
+            k_pos=k_pos,
+            normalize=normalize,
+        )
+        trial_df = trial_df[["user_id", "trial_id", "prob_pos", "score_pos"]].copy()
+        trial_df.rename(
+            columns={
+                "prob_pos": f"prob_model_{i}",
+                "score_pos": f"score_model_{i}",
+            },
+            inplace=True,
+        )
+        all_trial_probs.append(trial_df)
+
+    merged = all_trial_probs[0]
+    for df in all_trial_probs[1:]:
+        merged = merged.merge(df, on=["user_id", "trial_id"], how="inner")
+
+    prob_cols = [c for c in merged.columns if c.startswith("prob_model_")]
+    score_cols = [c for c in merged.columns if c.startswith("score_model_")]
+    merged["prob_pos_ensemble"] = merged[prob_cols].mean(axis=1)
+    merged["score_pos_ensemble"] = merged[score_cols].mean(axis=1)
+    merged["n_models"] = len(prob_cols)
+    merged["pred_soft_threshold"] = (merged["prob_pos_ensemble"] >= threshold).astype(int)
+
+    topk_records = apply_subject_topk(
+        merged[["user_id", "trial_id", "prob_pos_ensemble", "score_pos_ensemble"]]
+        .rename(columns={"prob_pos_ensemble": "prob_pos", "score_pos_ensemble": "score_pos"})
+        .to_dict("records"),
+        k_pos=k_pos,
+    )
+    topk_df = pd.DataFrame(topk_records)[["user_id", "trial_id", "Emotion_label"]].rename(
+        columns={"Emotion_label": "pred_soft_topk"}
+    )
+    merged = merged.merge(topk_df, on=["user_id", "trial_id"], how="left")
+    merged["pred_soft_topk"] = merged["pred_soft_topk"].fillna(0).astype(int)
+
+    if vote_method in {"soft_topk", "topk"}:
+        merged["Emotion_label"] = merged["pred_soft_topk"]
+    elif vote_method in {"prob", "soft_threshold", "hard"}:
+        merged["Emotion_label"] = merged["pred_soft_threshold"]
+    else:
+        raise ValueError(f"Unknown vote_method={vote_method}")
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+    probs_path = save_dir / "test_ensemble_probs.csv"
+    merged.to_csv(probs_path, index=False, encoding="utf-8-sig")
+
+    sub_soft_threshold = merged[["user_id", "trial_id", "pred_soft_threshold"]].copy()
+    sub_soft_threshold.rename(columns={"pred_soft_threshold": "Emotion_label"}, inplace=True)
+    sub_soft_threshold.to_csv(save_dir / "submission_soft_threshold_ensemble.csv", index=False, encoding="utf-8-sig")
+
+    sub_soft_topk = merged[["user_id", "trial_id", "pred_soft_topk"]].copy()
+    sub_soft_topk.rename(columns={"pred_soft_topk": "Emotion_label"}, inplace=True)
+    sub_soft_topk.to_csv(save_dir / "submission_soft_topk_ensemble.csv", index=False, encoding="utf-8-sig")
+
+    submission = merged[["user_id", "trial_id", "Emotion_label"]].copy()
+    submission_path = save_dir / "submission_test_ensemble.csv"
+    submission.to_csv(submission_path, index=False, encoding="utf-8-sig")
+
+    n_total = len(submission)
+    n_pos = int(submission["Emotion_label"].sum())
+    print(f"\n[V2 ensemble] probabilities saved: {probs_path}")
+    print(f"[V2 ensemble] submission saved: {submission_path}")
+    print(f"[V2 ensemble] selected={vote_method}, positives={n_pos}/{n_total} ({100 * n_pos / max(n_total, 1):.1f}%)")
+    return merged
 
 
 def load_stage1_encoder_into_stage2(
@@ -2242,7 +2387,7 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
         best_val = last_stage2_val_metrics
 
     if args.predict_test and args.test_csv and Path(args.test_csv).exists() and best_path:
-        ckpt = torch.load(best_path, map_location=device)
+        ckpt = load_checkpoint(best_path, device)
         stage2.load_state_dict(ckpt["model_state_dict"])
         trial_df = predict_test_trial_level(
             stage2,
@@ -2255,6 +2400,7 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
             threshold=args.threshold,
             vote_method=args.test_vote_method,
             k_pos=args.k_pos,
+            normalize=not args.no_normalize,
         )
         print(f"[test] saved predictions, trials={len(trial_df)}")
 
@@ -2341,6 +2487,8 @@ def parse_args() -> argparse.Namespace:
         default="soft_topk",
     )
     parser.add_argument("--k_pos", type=int, default=4)
+    parser.add_argument("--no_test_ensemble", action="store_true")
+    parser.add_argument("--test_ensemble_dir", type=str, default="test_ensemble")
     return parser.parse_args()
 
 
@@ -2390,8 +2538,33 @@ def main() -> None:
     pd.DataFrame(summary_rows).to_csv(save_root / "all_fold_summary.csv", index=False, encoding="utf-8-sig")
     print(f"[done] summary saved to {save_root / 'all_fold_summary.csv'}")
 
+    if not args.no_test_ensemble and args.test_csv and Path(args.test_csv).exists():
+        model_paths = [result.get("best_path") for result in results if result.get("best_path")]
+        model_paths = [p for p in model_paths if Path(p).exists()]
+        if model_paths:
+            device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+            ensemble_dir = save_root / args.test_ensemble_dir
+            ensemble_test_predictions(
+                model_paths=model_paths,
+                test_csv=args.test_csv,
+                device=device,
+                save_dir=ensemble_dir,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                threshold=args.threshold,
+                vote_method=args.test_vote_method,
+                k_pos=args.k_pos,
+                normalize=not args.no_normalize,
+            )
+        else:
+            print("[V2 ensemble] no valid best checkpoints found; skip test ensemble.")
+    elif args.no_test_ensemble:
+        print("[V2 ensemble] skipped by --no_test_ensemble.")
+
 
 if __name__ == "__main__":
     main()
     #训练
-    # python3 V2/train_expert_ssas_emotion.py --all_folds --all_repeats --batch_size 150 --predict_test --test_vote_method soft_topk --k_pos 4
+    # python3 V2/train_expert_ssas_emotion.py --all_folds --all_repeats --batch_size 150 --test_vote_method soft_topk --k_pos 4
+
+    #python3 V2/train_expert_ssas_emotion.py --all_folds --all_repeats --batch_size 150

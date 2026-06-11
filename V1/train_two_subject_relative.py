@@ -2535,7 +2535,7 @@ def ensemble_test_predictions(
 if __name__ == "__main__":
     import argparse
     _parser = argparse.ArgumentParser()
-    _parser.add_argument("--batch_size", type=int, default=32)
+    _parser.add_argument("--batch_size", type=int, default=256)
     _parser.add_argument("--n_splits", type=int, default=10)
     _args, _ = _parser.parse_known_args()
     _bs = _args.batch_size
