@@ -12,7 +12,7 @@ Loss:
         + λ_domain × L_domain + λ_center × L_center
 
 数据划分：
-    90% 训练 / 10% 验证，按诊断标签分层随机划分。
+    默认 10 折交叉验证，按被试分组并按 DEP/HC 分层。
 
 注意：
     二分类头做的是情绪正/负性分类（从 label4 % 2 推算），不是抑郁症诊断。
@@ -41,7 +41,6 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     f1_score,
     confusion_matrix,
@@ -58,6 +57,7 @@ from dataloader import (
     comp4_collate_fn,
 )
 from two_branch_subject_relative import TwoBranchModel
+from utils.folds import get_unified_subject_split
 
 # =========================================================
 # Random seed utilities
@@ -1546,7 +1546,7 @@ def train_competition_cross_subject(
     save_dir: str,
     dataset,
     rand,
-    n_splits: int = 5,
+    n_splits: int = 10,
     epochs: int = 50,
     batch_size: int = 256,
     lr: float = 1e-4,
@@ -1576,7 +1576,7 @@ def train_competition_cross_subject(
     save_warmup_epochs: int = 10,
 ):
     """
-    双任务训练（TwoBranchModel），90/10 随机划分。
+    双任务训练（TwoBranchModel），按被试做分层 K 折交叉验证。
 
     L = L_4cls(z, label4) + λ_diag × L_2cls(z, emotion_binary)
         + λ_domain × L_domain + λ_center × L_center
@@ -1601,20 +1601,18 @@ def train_competition_cross_subject(
     print(f"[Seed] rand={rand}, fold={fold}, run_seed={run_seed}, deterministic={deterministic}")
 
     # -------- subject-level split --------
-    # 90% 训练 / 10% 验证，按诊断标签分层
-    _df = pd.read_csv(index_csv)
-    _sub_df = _df[["subject_id", "label4"]].drop_duplicates("subject_id")
-    _sub_df["group_binary"] = (_sub_df["label4"].astype(int) >= 2).astype(int)  # 0=DEP, 1=HC
-    _all_subjects = _sub_df["subject_id"].astype(str).tolist()
-    _all_groups = _sub_df["group_binary"].tolist()
-    split_seed = config.make_run_seed(rand, fold)
-    train_subjects, val_subjects = train_test_split(
-        _all_subjects, test_size=0.1, stratify=_all_groups, random_state=split_seed,
+    # StratifiedGroupKFold: subject-level K-fold split, stratified by DEP/HC.
+    split_seed = config.make_run_seed(rand, 0)
+    split = get_unified_subject_split(
+        index_csv=index_csv,
+        fold=fold,
+        n_splits=n_splits,
+        seed=split_seed,
     )
-    train_subjects = [str(s) for s in train_subjects]
-    val_subjects = [str(s) for s in val_subjects]
+    train_subjects = [str(s) for s in split["train_all"]]
+    val_subjects = [str(s) for s in split["val_all"]]
 
-    print(f"Fold {fold} (90/10 split, rand={rand}, split_seed={split_seed})")
+    print(f"Fold {fold} ({n_splits}-fold CV, rand={rand}, split_seed={split_seed})")
     print("train subjects:", len(train_subjects), train_subjects)
     print("val subjects:", len(val_subjects), val_subjects)
 
@@ -2440,8 +2438,10 @@ if __name__ == "__main__":
     import argparse
     _parser = argparse.ArgumentParser()
     _parser.add_argument("--batch_size", type=int, default=32)
+    _parser.add_argument("--n_splits", type=int, default=10)
     _args, _ = _parser.parse_known_args()
     _bs = _args.batch_size
+    _n_splits = int(_args.n_splits)
 
     device = "cuda:0"
     version = "two_branch"
@@ -2456,18 +2456,18 @@ if __name__ == "__main__":
     combined_segment_emo_confusions = []
     combined_trial_emo_confusions = []
 
-    # 多随机种子 × 多次 90/10 随机划分
+    # 多随机种子 × K 折交叉验证
     for repeat, rand in enumerate(config.TEST_SEED):
         print(f"\n{'#' * 70}")
-        print(f"开始 random seed = {rand} 的 {5} 次 90/10 随机划分训练")
+        print(f"开始 random seed = {rand} 的 {_n_splits} 折交叉验证训练")
         print(f"{'#' * 70}")
 
         seed_combined_rows = []
-        n_splits = 5
+        n_splits = _n_splits
 
         for fold in range(n_splits):
             print(f"\n{'=' * 50}")
-            print(f"开始训练第 {fold + 1}/{n_splits} 次划分 | seed={rand}")
+            print(f"开始训练第 {fold + 1}/{n_splits} 折 | seed={rand}")
             print(f"{'=' * 50}")
 
             # 关键：模型初始化前设置 seed
@@ -2572,7 +2572,7 @@ if __name__ == "__main__":
             print(f"val_topk_subject_gap = {combined_metrics['topk_subject_gap_mean']:.4f}")
 
         seed_df = pd.DataFrame(seed_combined_rows)
-        seed_csv = os.path.join(version, f"seed{rand}_combined_5fold_results.csv")
+        seed_csv = os.path.join(version, f"seed{rand}_combined_{n_splits}fold_results.csv")
         seed_df.to_csv(seed_csv, index=False, encoding="utf-8-sig")
 
         metric_cols = [
@@ -2595,7 +2595,7 @@ if __name__ == "__main__":
         ]
         summary_lines = []
         print(f"\n{'=' * 50}")
-        print(f"Random seed {rand} 的 5 折 optimal 平均结果:")
+        print(f"Random seed {rand} 的 {n_splits} 折 optimal 平均结果:")
         print(f"{'=' * 50}")
         for col in metric_cols:
             if col in seed_df.columns:
@@ -2604,8 +2604,8 @@ if __name__ == "__main__":
                 print(f"{col}: {mean_v:.4f} ± {std_v:.4f}")
                 summary_lines.append(f"{col}: {mean_v:.4f} ± {std_v:.4f}\n")
 
-        with open(os.path.join(version, f"seed{rand}_combined_5fold_summary.txt"), "w", encoding="utf-8") as f:
-            f.write(f"Random seed {rand} combined 5折交叉验证结果\n")
+        with open(os.path.join(version, f"seed{rand}_combined_{n_splits}fold_summary.txt"), "w", encoding="utf-8") as f:
+            f.write(f"Random seed {rand} combined {n_splits}折交叉验证结果\n")
             f.writelines(summary_lines)
             f.write(f"\n详细结果 CSV: {seed_csv}\n")
 

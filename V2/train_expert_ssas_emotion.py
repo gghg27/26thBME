@@ -116,6 +116,158 @@ def move_batch_to_device(batch: dict, device: torch.device) -> dict:
     return moved
 
 
+def _baseline_key(value: Any) -> str:
+    if torch.is_tensor(value):
+        if value.numel() != 1:
+            raise ValueError(f"Expected scalar tensor baseline key, got shape={tuple(value.shape)}")
+        return str(int(value.detach().cpu().item()))
+    return str(value)
+
+
+def _batch_baseline_keys(batch: dict, key_field: str = "target_key") -> list[str]:
+    if key_field in batch:
+        values = batch[key_field]
+    else:
+        values = batch["subject_id"]
+
+    if torch.is_tensor(values):
+        return [str(int(v)) for v in values.detach().cpu().view(-1).tolist()]
+    return [_baseline_key(v) for v in values]
+
+
+def gather_subject_baseline(
+    keys,
+    baseline_dict: Optional[dict[str, torch.Tensor]],
+    device: torch.device,
+    dtype: Optional[torch.dtype] = None,
+) -> Optional[torch.Tensor]:
+    """Gather per-sample subject-relative baseline tensors.
+
+    Keys are usually target_key values such as source:3, val:3, test:P_test1.
+    This avoids collisions between competition subject_id and test subject_number.
+    """
+
+    if baseline_dict is None:
+        return None
+    if torch.is_tensor(keys):
+        key_list = [str(int(v)) for v in keys.detach().cpu().view(-1).tolist()]
+    else:
+        key_list = [_baseline_key(v) for v in keys]
+
+    values = []
+    for key in key_list:
+        if key not in baseline_dict:
+            return None
+        values.append(torch.as_tensor(baseline_dict[key]))
+    out = torch.stack(values, dim=0).to(device=device)
+    if dtype is not None:
+        out = out.to(dtype=dtype)
+    return out
+
+
+def get_subject_relative_kwargs(
+    batch: dict,
+    device: torch.device,
+    dtype: torch.dtype,
+    de_mu: Optional[dict[str, torch.Tensor]] = None,
+    de_std: Optional[dict[str, torch.Tensor]] = None,
+    bio_mu: Optional[dict[str, torch.Tensor]] = None,
+    bio_std: Optional[dict[str, torch.Tensor]] = None,
+    key_field: str = "target_key",
+) -> dict:
+    keys = _batch_baseline_keys(batch, key_field=key_field)
+    return {
+        "subject_de_mu": gather_subject_baseline(keys, de_mu, device, dtype=dtype),
+        "subject_de_std": gather_subject_baseline(keys, de_std, device, dtype=dtype),
+        "subject_bio_mu": gather_subject_baseline(keys, bio_mu, device, dtype=dtype),
+        "subject_bio_std": gather_subject_baseline(keys, bio_std, device, dtype=dtype),
+    }
+
+
+def compute_subject_de_baselines(dataset: Dataset, key_field: str = "target_key", eps: float = 1e-6) -> tuple[dict, dict]:
+    sums: dict[str, torch.Tensor] = {}
+    sq_sums: dict[str, torch.Tensor] = {}
+    counts: dict[str, int] = defaultdict(int)
+
+    for idx in tqdm(range(len(dataset)), desc="DE baseline", leave=False):
+        item = dataset[idx]
+        key = _baseline_key(item[key_field] if key_field in item else item["subject_id"])
+        de_feat = torch.as_tensor(item["de_feat"], dtype=torch.float32)
+        if key not in sums:
+            sums[key] = torch.zeros_like(de_feat)
+            sq_sums[key] = torch.zeros_like(de_feat)
+        sums[key] += de_feat
+        sq_sums[key] += de_feat * de_feat
+        counts[key] += 1
+
+    subject_de_mu: dict[str, torch.Tensor] = {}
+    subject_de_std: dict[str, torch.Tensor] = {}
+    for key, total in sums.items():
+        count = max(int(counts[key]), 1)
+        mu = total / count
+        var = sq_sums[key] / count - mu * mu
+        std = torch.sqrt(torch.clamp(var, min=0.0) + eps)
+        subject_de_mu[key] = mu
+        subject_de_std[key] = std
+    return subject_de_mu, subject_de_std
+
+
+@torch.no_grad()
+def compute_subject_bio_baselines(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    subject_de_mu: Optional[dict[str, torch.Tensor]] = None,
+    subject_de_std: Optional[dict[str, torch.Tensor]] = None,
+    key_field: str = "target_key",
+    eps: float = 1e-6,
+) -> tuple[dict, dict]:
+    model.eval()
+    sums: dict[str, torch.Tensor] = {}
+    sq_sums: dict[str, torch.Tensor] = {}
+    counts: dict[str, int] = defaultdict(int)
+
+    for batch in tqdm(loader, desc="Bio baseline", leave=False):
+        x = batch["x"].to(device, non_blocking=True)
+        de_feat = batch["de_feat"].to(device, non_blocking=True)
+        keys = _batch_baseline_keys(batch, key_field=key_field)
+        de_mu_batch = gather_subject_baseline(keys, subject_de_mu, device, dtype=de_feat.dtype)
+        de_std_batch = gather_subject_baseline(keys, subject_de_std, device, dtype=de_feat.dtype)
+
+        out = model(
+            x,
+            de_feat,
+            subject_de_mu=de_mu_batch,
+            subject_de_std=de_std_batch,
+            subject_bio_mu=None,
+            subject_bio_std=None,
+        )
+        bio_raw = out.get("bio_raw", None)
+        if bio_raw is None:
+            raise RuntimeError("Model forward did not return bio_raw; cannot compute bio baselines.")
+        bio_raw = bio_raw.detach().cpu().float()
+
+        for i, key in enumerate(keys):
+            feat = bio_raw[i]
+            if key not in sums:
+                sums[key] = torch.zeros_like(feat)
+                sq_sums[key] = torch.zeros_like(feat)
+            sums[key] += feat
+            sq_sums[key] += feat * feat
+            counts[key] += 1
+
+    subject_bio_mu: dict[str, torch.Tensor] = {}
+    subject_bio_std: dict[str, torch.Tensor] = {}
+    for key, total in sums.items():
+        count = max(int(counts[key]), 1)
+        mu = total / count
+        var = sq_sums[key] / count - mu * mu
+        std = torch.sqrt(torch.clamp(var, min=0.0) + eps)
+        subject_bio_mu[key] = mu
+        subject_bio_std[key] = std
+    return subject_bio_mu, subject_bio_std
+
+
 class DomainAwareCompetitionDataset(Competition4ClassDataset):
     """Labeled source/val dataset with global train/val/test domain ids."""
 
@@ -411,6 +563,14 @@ def train_stage1_one_epoch(
     lambda_weight_reg: float = 0.0,
     emotion_class_weight: Optional[torch.Tensor] = None,
     diag_class_weight: Optional[torch.Tensor] = None,
+    source_de_mu: Optional[dict[str, torch.Tensor]] = None,
+    source_de_std: Optional[dict[str, torch.Tensor]] = None,
+    source_bio_mu: Optional[dict[str, torch.Tensor]] = None,
+    source_bio_std: Optional[dict[str, torch.Tensor]] = None,
+    target_de_mu: Optional[dict[str, torch.Tensor]] = None,
+    target_de_std: Optional[dict[str, torch.Tensor]] = None,
+    target_bio_mu: Optional[dict[str, torch.Tensor]] = None,
+    target_bio_std: Optional[dict[str, torch.Tensor]] = None,
 ) -> dict:
     model.train()
     target_iter = cycle(target_loader)
@@ -426,13 +586,38 @@ def train_stage1_one_epoch(
         target_batch = move_batch_to_device(target_batch, device)
 
         optimizer.zero_grad(set_to_none=True)
+        source_rel_kwargs = get_subject_relative_kwargs(
+            source_batch,
+            device,
+            dtype=source_batch["de_feat"].dtype,
+            de_mu=source_de_mu,
+            de_std=source_de_std,
+            bio_mu=source_bio_mu,
+            bio_std=source_bio_std,
+        )
+        target_rel_kwargs = get_subject_relative_kwargs(
+            target_batch,
+            device,
+            dtype=target_batch["de_feat"].dtype,
+            de_mu=target_de_mu,
+            de_std=target_de_std,
+            bio_mu=target_bio_mu,
+            bio_std=target_bio_std,
+        )
         source_out = model(
             source_batch["x"],
             source_batch["de_feat"],
             lambda_emo=grl_emo,
             lambda_diag=grl_diag,
+            **source_rel_kwargs,
         )
-        target_out = model(target_batch["x"], target_batch["de_feat"], lambda_emo=0.0, lambda_diag=0.0)
+        target_out = model(
+            target_batch["x"],
+            target_batch["de_feat"],
+            lambda_emo=0.0,
+            lambda_diag=0.0,
+            **target_rel_kwargs,
+        )
 
         domain_logits = torch.cat([source_out["domain_logits"], target_out["domain_logits"]], dim=0)
         domain_labels = torch.cat([source_batch["domain_id"].long(), target_batch["domain_id"].long()], dim=0)
@@ -489,6 +674,14 @@ def validate_stage1(
     source_loader: DataLoader,
     target_loader: DataLoader,
     device: torch.device,
+    source_de_mu: Optional[dict[str, torch.Tensor]] = None,
+    source_de_std: Optional[dict[str, torch.Tensor]] = None,
+    source_bio_mu: Optional[dict[str, torch.Tensor]] = None,
+    source_bio_std: Optional[dict[str, torch.Tensor]] = None,
+    target_de_mu: Optional[dict[str, torch.Tensor]] = None,
+    target_de_std: Optional[dict[str, torch.Tensor]] = None,
+    target_bio_mu: Optional[dict[str, torch.Tensor]] = None,
+    target_bio_std: Optional[dict[str, torch.Tensor]] = None,
 ) -> dict:
     model.eval()
     totals = defaultdict(float)
@@ -499,8 +692,26 @@ def validate_stage1(
     for _ in tqdm(range(steps), desc="Stage1-Val", leave=False):
         source_batch = move_batch_to_device(next(iterator), device)
         target_batch = move_batch_to_device(next(target_iter), device)
-        source_out = model(source_batch["x"], source_batch["de_feat"])
-        target_out = model(target_batch["x"], target_batch["de_feat"])
+        source_rel_kwargs = get_subject_relative_kwargs(
+            source_batch,
+            device,
+            dtype=source_batch["de_feat"].dtype,
+            de_mu=source_de_mu,
+            de_std=source_de_std,
+            bio_mu=source_bio_mu,
+            bio_std=source_bio_std,
+        )
+        target_rel_kwargs = get_subject_relative_kwargs(
+            target_batch,
+            device,
+            dtype=target_batch["de_feat"].dtype,
+            de_mu=target_de_mu,
+            de_std=target_de_std,
+            bio_mu=target_bio_mu,
+            bio_std=target_bio_std,
+        )
+        source_out = model(source_batch["x"], source_batch["de_feat"], **source_rel_kwargs)
+        target_out = model(target_batch["x"], target_batch["de_feat"], **target_rel_kwargs)
 
         domain_logits = torch.cat([source_out["domain_logits"], target_out["domain_logits"]], dim=0)
         domain_labels = torch.cat([source_batch["domain_id"].long(), target_batch["domain_id"].long()], dim=0)
@@ -532,6 +743,10 @@ def compute_source_weights_by_classification_voting(
     save_dir: str | Path,
     smooth: float = 1.0,
     vote_level: str = "window",
+    target_de_mu: Optional[dict[str, torch.Tensor]] = None,
+    target_de_std: Optional[dict[str, torch.Tensor]] = None,
+    target_bio_mu: Optional[dict[str, torch.Tensor]] = None,
+    target_bio_std: Optional[dict[str, torch.Tensor]] = None,
 ) -> dict:
     model.eval()
     source_subjects = [str(s) for s in domain_mapping["source_subjects"]]
@@ -544,7 +759,16 @@ def compute_source_weights_by_classification_voting(
 
     for batch in tqdm(target_loader, desc="Stage1-Voting", leave=False):
         batch = move_batch_to_device(batch, device)
-        out = model(batch["x"], batch["de_feat"])
+        target_rel_kwargs = get_subject_relative_kwargs(
+            batch,
+            device,
+            dtype=batch["de_feat"].dtype,
+            de_mu=target_de_mu,
+            de_std=target_de_std,
+            bio_mu=target_bio_mu,
+            bio_std=target_bio_std,
+        )
+        out = model(batch["x"], batch["de_feat"], **target_rel_kwargs)
         source_logits = out["domain_logits"].index_select(dim=1, index=source_domain_indices)
         source_prob = torch.softmax(source_logits, dim=1)
         pred_local = source_prob.argmax(dim=1)
@@ -630,6 +854,14 @@ def train_stage2_one_epoch(
     grl_subject: float = 0.001,
     lambda_ent: float = 0.0,
     lambda_mdc: float = 0.0,
+    source_de_mu: Optional[dict[str, torch.Tensor]] = None,
+    source_de_std: Optional[dict[str, torch.Tensor]] = None,
+    source_bio_mu: Optional[dict[str, torch.Tensor]] = None,
+    source_bio_std: Optional[dict[str, torch.Tensor]] = None,
+    target_de_mu: Optional[dict[str, torch.Tensor]] = None,
+    target_de_std: Optional[dict[str, torch.Tensor]] = None,
+    target_bio_mu: Optional[dict[str, torch.Tensor]] = None,
+    target_bio_std: Optional[dict[str, torch.Tensor]] = None,
 ) -> dict:
     model.train()
     target_iter = cycle(target_loader)
@@ -650,8 +882,36 @@ def train_stage2_one_epoch(
         target_batch = move_batch_to_device(target_batch, device)
 
         optimizer.zero_grad(set_to_none=True)
-        source_out = model(source_batch["x"], source_batch["de_feat"], lambda_subject=grl_subject)
-        target_out = model(target_batch["x"], target_batch["de_feat"], lambda_subject=grl_subject)
+        source_rel_kwargs = get_subject_relative_kwargs(
+            source_batch,
+            device,
+            dtype=source_batch["de_feat"].dtype,
+            de_mu=source_de_mu,
+            de_std=source_de_std,
+            bio_mu=source_bio_mu,
+            bio_std=source_bio_std,
+        )
+        target_rel_kwargs = get_subject_relative_kwargs(
+            target_batch,
+            device,
+            dtype=target_batch["de_feat"].dtype,
+            de_mu=target_de_mu,
+            de_std=target_de_std,
+            bio_mu=target_bio_mu,
+            bio_std=target_bio_std,
+        )
+        source_out = model(
+            source_batch["x"],
+            source_batch["de_feat"],
+            lambda_subject=grl_subject,
+            **source_rel_kwargs,
+        )
+        target_out = model(
+            target_batch["x"],
+            target_batch["de_feat"],
+            lambda_subject=grl_subject,
+            **target_rel_kwargs,
+        )
 
         y_emo = source_batch["emotion_label"].long()
         y_diag = source_batch["diagnosis_label"].long()
@@ -898,6 +1158,10 @@ def validate_stage2_trial_level(
     val_loader: DataLoader,
     device: torch.device,
     threshold: float = 0.5,
+    val_de_mu: Optional[dict[str, torch.Tensor]] = None,
+    val_de_std: Optional[dict[str, torch.Tensor]] = None,
+    val_bio_mu: Optional[dict[str, torch.Tensor]] = None,
+    val_bio_std: Optional[dict[str, torch.Tensor]] = None,
 ) -> dict:
     model.eval()
     total_loss = 0.0
@@ -908,7 +1172,16 @@ def validate_stage2_trial_level(
 
     for batch in tqdm(val_loader, desc="Stage2-Val", leave=False):
         batch = move_batch_to_device(batch, device)
-        out = model(batch["x"], batch["de_feat"], lambda_subject=0.0)
+        val_rel_kwargs = get_subject_relative_kwargs(
+            batch,
+            device,
+            dtype=batch["de_feat"].dtype,
+            de_mu=val_de_mu,
+            de_std=val_de_std,
+            bio_mu=val_bio_mu,
+            bio_std=val_bio_std,
+        )
+        out = model(batch["x"], batch["de_feat"], lambda_subject=0.0, **val_rel_kwargs)
         y_emo = batch["emotion_label"].long()
         y_diag = batch["diagnosis_label"].long()
 
@@ -1303,11 +1576,36 @@ def predict_test_trial_level(
         pin_memory=True,
         collate_fn=dict_collate,
     )
+    test_de_mu = test_de_std = None
+    test_bio_mu = test_bio_std = None
+    if getattr(model, "use_subject_relative_de", False) or getattr(model, "use_subject_relative_bio", False):
+        print("[test] computing subject-relative test baselines from test windows...")
+        if getattr(model, "use_subject_relative_de", False):
+            test_de_mu, test_de_std = compute_subject_de_baselines(dataset, key_field="target_key")
+        if getattr(model, "use_subject_relative_bio", False):
+            test_bio_mu, test_bio_std = compute_subject_bio_baselines(
+                model,
+                loader,
+                device,
+                subject_de_mu=test_de_mu,
+                subject_de_std=test_de_std,
+                key_field="target_key",
+            )
+
     model.eval()
     rows = []
     for batch in tqdm(loader, desc="Test-Predict", leave=False):
         batch = move_batch_to_device(batch, device)
-        out = model(batch["x"], batch["de_feat"], lambda_subject=0.0)
+        test_rel_kwargs = get_subject_relative_kwargs(
+            batch,
+            device,
+            dtype=batch["de_feat"].dtype,
+            de_mu=test_de_mu,
+            de_std=test_de_std,
+            bio_mu=test_bio_mu,
+            bio_std=test_bio_std,
+        )
+        out = model(batch["x"], batch["de_feat"], lambda_subject=0.0, **test_rel_kwargs)
         mix_prob = out["mix_prob"].clamp_min(1e-8)
         prob_pos_tensor = mix_prob[:, 1]
         score_pos_tensor = torch.log(mix_prob[:, 1]) - torch.log(mix_prob[:, 0])
@@ -1461,6 +1759,37 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
         normalize_test=not args.no_normalize,
     )
 
+    use_subject_relative_de = bool(not args.no_subject_relative_de)
+    use_subject_relative_bio = bool((not args.no_subject_relative_bio) and (not args.no_biomarkers))
+    print(
+        f"[Subject Relative] DE={use_subject_relative_de}, "
+        f"bio={use_subject_relative_bio}, bio_abs_scale={args.bio_abs_scale}, eps={args.relative_eps}"
+    )
+
+    source_de_mu = source_de_std = None
+    val_de_mu = val_de_std = None
+    target_de_mu = target_de_std = None
+    source_bio_mu = source_bio_std = None
+    val_bio_mu = val_bio_std = None
+    target_bio_mu = target_bio_std = None
+
+    if use_subject_relative_de:
+        print("[Subject Relative] computing source/val/target DE baselines...")
+        source_de_mu, source_de_std = compute_subject_de_baselines(source_dataset, eps=args.relative_eps)
+        val_de_mu, val_de_std = compute_subject_de_baselines(val_dataset, eps=args.relative_eps)
+        target_de_mu, target_de_std = compute_subject_de_baselines(target_vote_dataset, eps=args.relative_eps)
+
+    source_baseline_loader = DataLoader(
+        source_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=dict_collate,
+        worker_init_fn=seed_worker,
+    )
+
     stage1 = Stage1SSASSourceSelectionModel(
         num_domains=domain_mapping["num_domains"],
         sfreq=args.sfreq,
@@ -1468,8 +1797,39 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
         dropout=args.dropout,
         use_biomarkers=not args.no_biomarkers,
         biomarker_dim=args.biomarker_dim,
+        use_subject_relative_de=use_subject_relative_de,
+        use_subject_relative_bio=use_subject_relative_bio,
+        bio_abs_scale=args.bio_abs_scale,
+        relative_eps=args.relative_eps,
         de_num_bands=args.de_num_bands,
     ).to(device)
+    if use_subject_relative_bio:
+        print("[Subject Relative] computing source/val/target bio baselines with Stage1 encoder...")
+        source_bio_mu, source_bio_std = compute_subject_bio_baselines(
+            stage1,
+            source_baseline_loader,
+            device,
+            subject_de_mu=source_de_mu,
+            subject_de_std=source_de_std,
+            eps=args.relative_eps,
+        )
+        val_bio_mu, val_bio_std = compute_subject_bio_baselines(
+            stage1,
+            val_loader,
+            device,
+            subject_de_mu=val_de_mu,
+            subject_de_std=val_de_std,
+            eps=args.relative_eps,
+        )
+        target_bio_mu, target_bio_std = compute_subject_bio_baselines(
+            stage1,
+            target_vote_loader,
+            device,
+            subject_de_mu=target_de_mu,
+            subject_de_std=target_de_std,
+            eps=args.relative_eps,
+        )
+
     optimizer1 = torch.optim.AdamW(stage1.parameters(), lr=args.lr_stage1, weight_decay=args.weight_decay)
     scheduler1 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer1, T_max=max(args.stage1_epochs, 1))
     emotion_weights = build_emotion_class_weights(source_dataset)
@@ -1497,8 +1857,29 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
             lambda_weight_reg=args.lambda_weight_reg,
             emotion_class_weight=emotion_weights,
             diag_class_weight=diag_weights,
+            source_de_mu=source_de_mu,
+            source_de_std=source_de_std,
+            source_bio_mu=source_bio_mu,
+            source_bio_std=source_bio_std,
+            target_de_mu=target_de_mu,
+            target_de_std=target_de_std,
+            target_bio_mu=target_bio_mu,
+            target_bio_std=target_bio_std,
         )
-        val_stage1 = validate_stage1(stage1, source_loader, target_train_loader, device)
+        val_stage1 = validate_stage1(
+            stage1,
+            source_loader,
+            target_train_loader,
+            device,
+            source_de_mu=source_de_mu,
+            source_de_std=source_de_std,
+            source_bio_mu=source_bio_mu,
+            source_bio_std=source_bio_std,
+            target_de_mu=target_de_mu,
+            target_de_std=target_de_std,
+            target_bio_mu=target_bio_mu,
+            target_bio_std=target_bio_std,
+        )
         scheduler1.step()
         row = {"epoch": epoch, "lr": optimizer1.param_groups[0]["lr"]}
         row.update(flatten_metrics_for_csv("train", train_metrics))
@@ -1584,6 +1965,10 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
         save_dir,
         smooth=args.vote_smooth,
         vote_level=args.vote_level,
+        target_de_mu=target_de_mu,
+        target_de_std=target_de_std,
+        target_bio_mu=target_bio_mu,
+        target_bio_std=target_bio_std,
     )
     source_weights = vote_result["weights_mean_one"] if args.use_mean_one_source_weights else vote_result["weights"]
     top_weights = sorted(source_weights.items(), key=lambda kv: kv[1], reverse=True)[:8]
@@ -1596,6 +1981,10 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
         dropout=args.dropout,
         use_biomarkers=not args.no_biomarkers,
         biomarker_dim=args.biomarker_dim,
+        use_subject_relative_de=use_subject_relative_de,
+        use_subject_relative_bio=use_subject_relative_bio,
+        bio_abs_scale=args.bio_abs_scale,
+        relative_eps=args.relative_eps,
         de_num_bands=args.de_num_bands,
     ).to(device)
     if not args.no_stage1_init:
@@ -1626,8 +2015,25 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
             grl_subject=args.grl_subject,
             lambda_ent=args.lambda_ent,
             lambda_mdc=args.lambda_mdc,
+            source_de_mu=source_de_mu,
+            source_de_std=source_de_std,
+            source_bio_mu=source_bio_mu,
+            source_bio_std=source_bio_std,
+            target_de_mu=target_de_mu,
+            target_de_std=target_de_std,
+            target_bio_mu=target_bio_mu,
+            target_bio_std=target_bio_std,
         )
-        val_metrics = validate_stage2_trial_level(stage2, val_loader, device, threshold=args.threshold)
+        val_metrics = validate_stage2_trial_level(
+            stage2,
+            val_loader,
+            device,
+            threshold=args.threshold,
+            val_de_mu=val_de_mu,
+            val_de_std=val_de_std,
+            val_bio_mu=val_bio_mu,
+            val_bio_std=val_bio_std,
+        )
         scheduler2.step()
         row = {"epoch": epoch, "lr": optimizer2.param_groups[0]["lr"]}
         row.update(flatten_metrics_for_csv("train", train_metrics))
@@ -1801,6 +2207,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--de_num_bands", type=int, default=5)
     parser.add_argument("--no_biomarkers", action="store_true")
     parser.add_argument("--no_normalize", action="store_true")
+    parser.add_argument("--no_subject_relative_de", action="store_true")
+    parser.add_argument("--no_subject_relative_bio", action="store_true")
+    parser.add_argument("--bio_abs_scale", type=float, default=0.3)
+    parser.add_argument("--relative_eps", type=float, default=1e-6)
     parser.add_argument("--use_raw_diagnosis_label", action="store_true")
 
     parser.add_argument("--lambda_domain", type=float, default=1.0)
@@ -1838,7 +2248,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    repeats = range(len(config.DIAG_REPEAT_SEEDS)) if args.all_repeats else [args.repeat]
+    repeats = range(len(config.V2_seed)) if args.all_repeats else [args.repeat]
     folds = range(args.n_splits) if args.all_folds else [args.fold]
     results = []
     for repeat_index in repeats:
@@ -1872,4 +2282,4 @@ def main() -> None:
 if __name__ == "__main__":
     main()
     #训练
-    # python3 V2/train_expert_ssas_emotion.py --all_folds --all_repeats --stage1_epochs 20 --stage2_epochs 100 --batch_size 128 --predict_test --test_vote_method soft_topk --k_pos 4
+    # python3 V2/train_expert_ssas_emotion.py --all_folds --all_repeats --stage1_epochs 20 --stage2_epochs 50 --batch_size 150 --predict_test --test_vote_method soft_topk --k_pos 4

@@ -171,9 +171,17 @@ class Stage1SSASSourceSelectionModel(nn.Module):
         mmd_dim: int = 64,
         use_biomarkers: bool = True,
         biomarker_dim: int = 57,
+        use_subject_relative_de: bool = False,
+        use_subject_relative_bio: bool = False,
+        bio_abs_scale: float = 0.3,
+        relative_eps: float = 1e-6,
         de_num_bands: int = 5,
     ) -> None:
         super().__init__()
+        self.use_subject_relative_de = bool(use_subject_relative_de)
+        self.use_subject_relative_bio = bool(use_subject_relative_bio)
+        self.bio_abs_scale = float(bio_abs_scale)
+        self.relative_eps = float(relative_eps)
         self.shared_encoder = ThreeBranchEncoderWrapper(
             sfreq=sfreq,
             topk=topk,
@@ -181,6 +189,10 @@ class Stage1SSASSourceSelectionModel(nn.Module):
             prior_matrix=prior_matrix,
             use_biomarkers=use_biomarkers,
             biomarker_dim=biomarker_dim,
+            use_subject_relative_de=self.use_subject_relative_de,
+            use_subject_relative_bio=self.use_subject_relative_bio,
+            bio_abs_scale=self.bio_abs_scale,
+            relative_eps=self.relative_eps,
             de_num_bands=de_num_bands,
         )
         in_dim = self.shared_encoder.out_dim
@@ -253,9 +265,17 @@ class Stage2ExpertEmotionAdaptationModel(nn.Module):
         mmd_dim: int = 64,
         use_biomarkers: bool = True,
         biomarker_dim: int = 57,
+        use_subject_relative_de: bool = False,
+        use_subject_relative_bio: bool = False,
+        bio_abs_scale: float = 0.3,
+        relative_eps: float = 1e-6,
         de_num_bands: int = 5,
     ) -> None:
         super().__init__()
+        self.use_subject_relative_de = bool(use_subject_relative_de)
+        self.use_subject_relative_bio = bool(use_subject_relative_bio)
+        self.bio_abs_scale = float(bio_abs_scale)
+        self.relative_eps = float(relative_eps)
         self.shared_encoder = ThreeBranchEncoderWrapper(
             sfreq=sfreq,
             topk=topk,
@@ -263,6 +283,10 @@ class Stage2ExpertEmotionAdaptationModel(nn.Module):
             prior_matrix=prior_matrix,
             use_biomarkers=use_biomarkers,
             biomarker_dim=biomarker_dim,
+            use_subject_relative_de=self.use_subject_relative_de,
+            use_subject_relative_bio=self.use_subject_relative_bio,
+            bio_abs_scale=self.bio_abs_scale,
+            relative_eps=self.relative_eps,
             de_num_bands=de_num_bands,
         )
         in_dim = self.shared_encoder.out_dim
@@ -446,4 +470,3 @@ def weighted_mmd_rbf(
 def target_entropy_loss(mix_prob: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     entropy = -(mix_prob.clamp_min(eps) * torch.log(mix_prob.clamp_min(eps))).sum(dim=1)
     return entropy.mean()
-
