@@ -270,12 +270,14 @@ class Stage2ExpertEmotionAdaptationModel(nn.Module):
         bio_abs_scale: float = 0.3,
         relative_eps: float = 1e-6,
         de_num_bands: int = 5,
+        shared_mix_alpha: float = 0.5,
     ) -> None:
         super().__init__()
         self.use_subject_relative_de = bool(use_subject_relative_de)
         self.use_subject_relative_bio = bool(use_subject_relative_bio)
         self.bio_abs_scale = float(bio_abs_scale)
         self.relative_eps = float(relative_eps)
+        self.shared_mix_alpha = float(max(0.0, min(1.0, shared_mix_alpha)))
         self.shared_encoder = ThreeBranchEncoderWrapper(
             sfreq=sfreq,
             topk=topk,
@@ -294,6 +296,12 @@ class Stage2ExpertEmotionAdaptationModel(nn.Module):
         self.diagnosis_router = MLPHead(
             in_dim=in_dim,
             out_dim=diagnosis_classes,
+            hidden_dim=64,
+            dropout=dropout,
+        )
+        self.shared_emotion_head = MLPHead(
+            in_dim=in_dim,
+            out_dim=emotion_classes,
             hidden_dim=64,
             dropout=dropout,
         )
@@ -333,15 +341,19 @@ class Stage2ExpertEmotionAdaptationModel(nn.Module):
         z = enc["z"]
 
         diag_logits = self.diagnosis_router(z)
+        shared_logits = self.shared_emotion_head(z)
         hc_logits = self.hc_emotion_expert(z)
         dep_logits = self.dep_emotion_expert(z)
 
         diag_prob = torch.softmax(diag_logits, dim=1)
+        prob_shared = torch.softmax(shared_logits, dim=1)
         prob_dep = torch.softmax(dep_logits, dim=1)
         prob_hc = torch.softmax(hc_logits, dim=1)
         p_dep = diag_prob[:, 0:1]
         p_hc = diag_prob[:, 1:2]
-        mix_prob = p_dep * prob_dep + p_hc * prob_hc
+        expert_mix_prob = p_dep * prob_dep + p_hc * prob_hc
+        expert_mix_prob = expert_mix_prob / expert_mix_prob.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        mix_prob = self.shared_mix_alpha * prob_shared + (1.0 - self.shared_mix_alpha) * expert_mix_prob
         mix_prob = mix_prob / mix_prob.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
         out = dict(enc)
@@ -350,13 +362,16 @@ class Stage2ExpertEmotionAdaptationModel(nn.Module):
                 "z": z,
                 "z_mmd": self.mmd_head(z),
                 "diag_logits": diag_logits,
+                "shared_logits": shared_logits,
                 "hc_logits": hc_logits,
                 "dep_logits": dep_logits,
                 "mix_prob": mix_prob,
+                "expert_mix_prob": expert_mix_prob,
                 "subject_domain_logits": self.subject_domain_head(
                     z,
                     lambda_grl=lambda_subject,
                 ),
+                "prob_shared": prob_shared,
                 "prob_hc": prob_hc,
                 "prob_dep": prob_dep,
                 "diag_prob": diag_prob,

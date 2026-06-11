@@ -833,7 +833,11 @@ def _subject_weight_tensor(
     num_source_subjects: int,
     device: torch.device,
 ) -> torch.Tensor:
-    default = 1.0 / max(num_source_subjects, 1)
+    default = (
+        float(np.mean([float(v) for v in source_weights.values()]))
+        if source_weights
+        else 1.0 / max(num_source_subjects, 1)
+    )
     values = [float(source_weights.get(str(int(s)), default)) for s in subject_ids.detach().cpu()]
     return torch.tensor(values, dtype=torch.float32, device=device)
 
@@ -846,11 +850,11 @@ def train_stage2_one_epoch(
     device: torch.device,
     source_subject_weights: dict[str, float],
     num_source_subjects: int,
-    lambda_expert: float = 1.0,
-    lambda_mix: float = 0.5,
-    lambda_diag: float = 0.1,
-    lambda_mmd: float = 0.001,
-    lambda_subject: float = 0.001,
+    lambda_expert: float = 0.5,
+    lambda_mix: float = 1.0,
+    lambda_diag: float = 0.02,
+    lambda_mmd: float = 0.0003,
+    lambda_subject: float = 0.0003,
     grl_subject: float = 0.001,
     lambda_ent: float = 0.0,
     lambda_mdc: float = 0.0,
@@ -1152,12 +1156,69 @@ def compute_trial_level_metrics(segment_records: list[dict], threshold: float = 
     }
 
 
+def compute_trial_topk_metrics(segment_records: list[dict], k_pos: int = 4) -> dict:
+    """Validation-time V1-style per-subject soft top-K trial metrics."""
+
+    trial_dict = defaultdict(list)
+    for row in segment_records:
+        subject_key = str(row.get("user_id", row["subject_id"]))
+        trial_dict[(subject_key, int(row["trial_id"]))].append(row)
+
+    trial_records = []
+    for (subject_key, trial_id), records in trial_dict.items():
+        probs = [float(r["prob_pos"]) for r in records]
+        scores = [float(r.get("score_pos", 0.0)) for r in records]
+        labels = [int(r["label_emo"]) for r in records]
+        trial_records.append(
+            {
+                "user_id": subject_key,
+                "trial_id": int(trial_id),
+                "prob_pos": float(np.mean(probs)),
+                "score_pos": float(np.mean(scores)),
+                "label_emo": int(np.bincount(labels, minlength=2).argmax()),
+            }
+        )
+
+    if not trial_records:
+        return {
+            "topk_trial_acc": 0.0,
+            "topk_trial_macro_f1": 0.0,
+            "topk_trial_confusion_matrix": np.zeros((2, 2), dtype=int),
+            "topk_trial_keys": [],
+            "topk_trial_preds": [],
+            "topk_trial_labels": [],
+            "topk_k_pos": int(k_pos),
+        }
+
+    topk_records = apply_subject_topk(trial_records, k_pos=k_pos)
+    trial_keys = [(str(r["user_id"]), int(r["trial_id"])) for r in topk_records]
+    trial_preds = [int(r["Emotion_label"]) for r in topk_records]
+    trial_labels = [int(r["label_emo"]) for r in topk_records]
+    return {
+        "topk_trial_acc": accuracy_score(trial_labels, trial_preds),
+        "topk_trial_macro_f1": f1_score(
+            trial_labels,
+            trial_preds,
+            average="macro",
+            labels=[0, 1],
+            zero_division=0,
+        ),
+        "topk_trial_confusion_matrix": confusion_matrix(trial_labels, trial_preds, labels=[0, 1]),
+        "topk_trial_keys": trial_keys,
+        "topk_trial_preds": trial_preds,
+        "topk_trial_labels": trial_labels,
+        "topk_k_pos": int(k_pos),
+    }
+
+
 @torch.no_grad()
 def validate_stage2_trial_level(
     model: Stage2ExpertEmotionAdaptationModel,
     val_loader: DataLoader,
     device: torch.device,
     threshold: float = 0.5,
+    k_pos: int = 4,
+    lambda_diag: float = 0.02,
     val_de_mu: Optional[dict[str, torch.Tensor]] = None,
     val_de_std: Optional[dict[str, torch.Tensor]] = None,
     val_bio_mu: Optional[dict[str, torch.Tensor]] = None,
@@ -1187,12 +1248,14 @@ def validate_stage2_trial_level(
 
         loss_mix = mixture_emotion_nll_loss(out["mix_prob"], y_emo)
         loss_diag = F.cross_entropy(out["diag_logits"], y_diag)
-        loss = loss_mix + 0.1 * loss_diag
+        loss = loss_mix + float(lambda_diag) * loss_diag
         bsz = batch["x"].size(0)
         total_loss += float(loss.item()) * bsz
         total_n += bsz
 
-        prob_pos = out["mix_prob"][:, 1]
+        mix_prob = out["mix_prob"].clamp_min(1e-8)
+        prob_pos = mix_prob[:, 1]
+        score_pos = torch.log(mix_prob[:, 1]) - torch.log(mix_prob[:, 0])
         pred = out["mix_prob"].argmax(dim=1)
         diag_pred = out["diag_logits"].argmax(dim=1)
         all_preds.extend(pred.detach().cpu().tolist())
@@ -1204,8 +1267,10 @@ def validate_stage2_trial_level(
             segment_records.append(
                 {
                     "subject_id": int(batch["subject_id"][i].detach().cpu()),
+                    "user_id": str(batch["user_id"][i]) if "user_id" in batch else str(int(batch["subject_id"][i].detach().cpu())),
                     "trial_id": int(batch["trial_id"][i].detach().cpu()),
                     "prob_pos": float(prob_pos[i].detach().cpu()),
+                    "score_pos": float(score_pos[i].detach().cpu()),
                     "pred_emo": int(pred[i].detach().cpu()),
                     "label_emo": int(y_emo[i].detach().cpu()),
                     "pred_diag": int(diag_pred[i].detach().cpu()),
@@ -1232,6 +1297,7 @@ def validate_stage2_trial_level(
         for i, cls in enumerate([0, 1])
     }
     trial_metrics = compute_trial_level_metrics(segment_records, threshold=threshold, vote_method="hard")
+    topk_trial_metrics = compute_trial_topk_metrics(segment_records, k_pos=k_pos)
 
     metrics = {
         "loss": total_loss / max(total_n, 1),
@@ -1246,6 +1312,7 @@ def validate_stage2_trial_level(
         "segment_records": segment_records,
     }
     metrics.update(trial_metrics)
+    metrics.update(topk_trial_metrics)
 
     # V1-compatible aliases for checkpoint criteria and summary tables.
     metrics["emotion_acc"] = metrics["segment_acc"]
@@ -1254,6 +1321,8 @@ def validate_stage2_trial_level(
     metrics["macro_f1"] = metrics["segment_macro_f1"]
     metrics["trial_emotion_acc"] = metrics["trial_acc"]
     metrics["trial_emotion_macro_f1"] = metrics["trial_macro_f1"]
+    metrics["topk_trial_emotion_acc"] = metrics["topk_trial_acc"]
+    metrics["topk_trial_emotion_macro_f1"] = metrics["topk_trial_macro_f1"]
     return metrics
 
 
@@ -1502,12 +1571,32 @@ def build_stage2_best_trackers() -> dict:
     return {
         "combined": tracker(
             [
+                ("topk_trial_macro_f1", "max"),
+                ("topk_trial_acc", "max"),
                 ("trial_macro_f1", "max"),
                 ("trial_acc", "max"),
                 ("emotion_macro_f1", "max"),
                 ("emotion_acc", "max"),
                 ("diag_macro_f1", "max"),
                 ("diag_acc", "max"),
+                ("loss", "min"),
+            ]
+        ),
+        "topk_trial_f1": tracker(
+            [
+                ("topk_trial_macro_f1", "max"),
+                ("topk_trial_acc", "max"),
+                ("trial_macro_f1", "max"),
+                ("emotion_macro_f1", "max"),
+                ("loss", "min"),
+            ]
+        ),
+        "topk_trial_acc": tracker(
+            [
+                ("topk_trial_acc", "max"),
+                ("topk_trial_macro_f1", "max"),
+                ("trial_acc", "max"),
+                ("emotion_acc", "max"),
                 ("loss", "min"),
             ]
         ),
@@ -1970,9 +2059,10 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
         target_bio_mu=target_bio_mu,
         target_bio_std=target_bio_std,
     )
+    source_weight_mode = "mean-one" if args.use_mean_one_source_weights else "sum-one"
     source_weights = vote_result["weights_mean_one"] if args.use_mean_one_source_weights else vote_result["weights"]
     top_weights = sorted(source_weights.items(), key=lambda kv: kv[1], reverse=True)[:8]
-    print(f"[Stage1] top source weights: {top_weights}")
+    print(f"[Stage1] source weight mode={source_weight_mode}; top source weights: {top_weights}")
 
     stage2 = Stage2ExpertEmotionAdaptationModel(
         num_domains=domain_mapping["num_domains"],
@@ -1986,6 +2076,7 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
         bio_abs_scale=args.bio_abs_scale,
         relative_eps=args.relative_eps,
         de_num_bands=args.de_num_bands,
+        shared_mix_alpha=args.shared_mix_alpha,
     ).to(device)
     if not args.no_stage1_init:
         load_stage1_encoder_into_stage2(stage1, stage2)
@@ -2029,6 +2120,8 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
             val_loader,
             device,
             threshold=args.threshold,
+            k_pos=args.k_pos,
+            lambda_diag=args.lambda_diag,
             val_de_mu=val_de_mu,
             val_de_std=val_de_std,
             val_bio_mu=val_bio_mu,
@@ -2046,7 +2139,8 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
             f"[Stage2] epoch={epoch} loss={train_metrics['loss']:.4f} "
             f"train_emo_f1={train_metrics['emotion_macro_f1']:.4f} "
             f"train_diag_f1={train_metrics['diag_macro_f1']:.4f} "
-            f"val_trial_f1={val_metrics['trial_macro_f1']:.4f} val_trial_acc={val_metrics['trial_acc']:.4f}"
+            f"val_trial_f1={val_metrics['trial_macro_f1']:.4f} val_trial_acc={val_metrics['trial_acc']:.4f} "
+            f"val_topk_f1={val_metrics['topk_trial_macro_f1']:.4f} val_topk_acc={val_metrics['topk_trial_acc']:.4f}"
         )
 
         if epoch <= args.save_warmup_epochs:
@@ -2072,6 +2166,7 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
                         extra_state={
                             "domain_mapping": domain_mapping,
                             "source_subject_weights": source_weights,
+                            "source_weight_mode": source_weight_mode,
                             "source_weight_vote": vote_result,
                         },
                     )
@@ -2107,6 +2202,7 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
             extra_state={
                 "domain_mapping": domain_mapping,
                 "source_subject_weights": source_weights,
+                "source_weight_mode": source_weight_mode,
                 "source_weight_vote": vote_result,
             },
         )
@@ -2190,19 +2286,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n_splits", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=0)
     parser.add_argument("--all_repeats", action="store_true")
-    parser.add_argument("--stage1_epochs", type=int, default=20)
-    parser.add_argument("--stage2_epochs", type=int, default=100)
-    parser.add_argument("--save_warmup_epochs", type=int, default=10)
+    parser.add_argument("--stage1_epochs", type=int, default=5)
+    parser.add_argument("--stage2_epochs", type=int, default=25)
+    parser.add_argument("--save_warmup_epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--lr_stage1", type=float, default=1e-4)
     parser.add_argument("--lr_stage2", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=5e-4)
     parser.add_argument("--sfreq", type=float, default=250.0)
     parser.add_argument("--topk", type=int, default=8)
-    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--dropout", type=float, default=0.35)
     parser.add_argument("--biomarker_dim", type=int, default=57)
     parser.add_argument("--de_num_bands", type=int, default=5)
     parser.add_argument("--no_biomarkers", action="store_true")
@@ -2220,18 +2316,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda_diag_grl", type=float, default=0.001)
     parser.add_argument("--grl_diag", type=float, default=0.01)
     parser.add_argument("--lambda_weight_reg", type=float, default=0.0)
-    parser.add_argument("--vote_smooth", type=float, default=1.0)
+    parser.add_argument("--vote_smooth", type=float, default=5.0)
     parser.add_argument("--vote_level", choices=["window", "trial"], default="window")
-    parser.add_argument("--use_mean_one_source_weights", action="store_true")
+    parser.add_argument("--use_mean_one_source_weights", dest="use_mean_one_source_weights", action="store_true", default=True)
+    parser.add_argument("--use_sum_one_source_weights", dest="use_mean_one_source_weights", action="store_false")
 
-    parser.add_argument("--lambda_expert", type=float, default=1.0)
-    parser.add_argument("--lambda_mix", type=float, default=0.5)
-    parser.add_argument("--lambda_diag", type=float, default=0.1)
-    parser.add_argument("--stage2_lambda_mmd", type=float, default=0.001)
-    parser.add_argument("--lambda_subject", type=float, default=0.001)
+    parser.add_argument("--lambda_expert", type=float, default=0.5)
+    parser.add_argument("--lambda_mix", type=float, default=1.0)
+    parser.add_argument("--lambda_diag", type=float, default=0.02)
+    parser.add_argument("--stage2_lambda_mmd", type=float, default=0.0003)
+    parser.add_argument("--lambda_subject", type=float, default=0.0003)
     parser.add_argument("--grl_subject", type=float, default=0.001)
     parser.add_argument("--lambda_ent", type=float, default=0.0)
     parser.add_argument("--lambda_mdc", type=float, default=0.0)
+    parser.add_argument("--shared_mix_alpha", type=float, default=0.5)
     parser.add_argument("--no_stage1_init", action="store_true")
 
     parser.add_argument("--threshold", type=float, default=0.5)
@@ -2282,4 +2380,4 @@ def main() -> None:
 if __name__ == "__main__":
     main()
     #训练
-    # python3 V2/train_expert_ssas_emotion.py --all_folds --all_repeats --stage1_epochs 20 --stage2_epochs 50 --batch_size 150 --predict_test --test_vote_method soft_topk --k_pos 4
+    # python3 V2/train_expert_ssas_emotion.py --all_folds --all_repeats --batch_size 150 --predict_test --test_vote_method soft_topk --k_pos 4

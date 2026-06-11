@@ -2484,12 +2484,17 @@ if __name__ == "__main__":
             set_global_seed(run_seed, deterministic=False)
             print(f"[Main Seed] rand={rand}, fold={fold}, run_seed={run_seed}")
 
+            # 动态获取被试总数，匹配域对抗头的输出类别数
+            _index_df = pd.read_csv("com_index_sub_2s.csv")
+            _total_subjects = _index_df["subject_id"].nunique()
+            print(f"[Info] index_csv 中共有 {_total_subjects} 个被试")
+
             model = TwoBranchModel(
                 sfreq=250.0,
                 prior_matrix=None,
                 topk=6,
                 dropout=0.35,
-                num_subjects=48,
+                num_subjects=_total_subjects,
                 num_classes_4=4,
                 num_classes_2=2,
                 use_subject_relative_de=True,
