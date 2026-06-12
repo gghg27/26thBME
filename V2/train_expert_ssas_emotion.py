@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import os
 import random
 import sys
@@ -742,21 +743,64 @@ def compute_source_weights_by_classification_voting(
     domain_mapping: dict,
     device: torch.device,
     save_dir: str | Path,
-    smooth: float = 1.0,
-    vote_level: str = "window",
+    smooth: float = 5.0,
+    vote_level: str = "trial",
+    vote_mode: str = "soft",
+    tau_vote: float = 1.0,
+    confidence_power: float = 1.0,
+    save_topk_probs: int = 5,
     target_de_mu: Optional[dict[str, torch.Tensor]] = None,
     target_de_std: Optional[dict[str, torch.Tensor]] = None,
     target_bio_mu: Optional[dict[str, torch.Tensor]] = None,
     target_bio_std: Optional[dict[str, torch.Tensor]] = None,
 ) -> dict:
+    """
+    Compute target-to-source subject weights with SSAS voting.
+
+    vote_mode="hard" keeps the original SSAS-style hard voting behavior.
+    vote_mode="soft" uses the source-subject probability vector as a soft vote.
+    vote_mode="soft_conf" further weights soft votes by normalized confidence.
+    Trial-level soft voting averages window probabilities first so each target
+    trial contributes once, matching the final trial-level submission target.
+    """
+    if vote_level not in {"window", "trial"}:
+        raise ValueError(f"Unknown vote_level={vote_level}; expected 'window' or 'trial'.")
+    if vote_mode not in {"hard", "soft", "soft_conf"}:
+        raise ValueError(f"Unknown vote_mode={vote_mode}; expected 'hard', 'soft' or 'soft_conf'.")
+    tau_vote = max(float(tau_vote), 1e-6)
+    save_topk_probs = max(1, int(save_topk_probs))
+
     model.eval()
     source_subjects = [str(s) for s in domain_mapping["source_subjects"]]
+    num_source_subjects = len(source_subjects)
     source_domain_indices = torch.tensor(domain_mapping["source_domain_indices"], dtype=torch.long, device=device)
     domain_to_source = {
         int(domain_mapping["source_subject_to_domain"][s]): str(s)
         for s in source_subjects
     }
-    rows = []
+    source_domains = [int(domain_mapping["source_subject_to_domain"][s]) for s in source_subjects]
+    eps = 1e-12
+    log_num_sources = math.log(max(num_source_subjects, 2))
+    topk = min(save_topk_probs, num_source_subjects)
+    window_rows = []
+    window_records = []
+
+    def _topk_columns(prob_vec: np.ndarray) -> dict:
+        if prob_vec.size == 0:
+            return {}
+        top_idx = np.argsort(-prob_vec)[:topk]
+        data = {}
+        for rank, idx in enumerate(top_idx, start=1):
+            data[f"top{rank}_subject"] = source_subjects[int(idx)]
+            data[f"top{rank}_domain"] = source_domains[int(idx)]
+            data[f"top{rank}_prob"] = float(prob_vec[int(idx)])
+        return data
+
+    def _confidence(prob_vec: np.ndarray) -> float:
+        entropy = -float(np.sum(prob_vec * np.log(prob_vec + eps)))
+        conf = 1.0 - entropy / log_num_sources
+        conf = max(0.0, min(1.0, conf))
+        return float(conf ** float(confidence_power))
 
     for batch in tqdm(target_loader, desc="Stage1-Voting", leave=False):
         batch = move_batch_to_device(batch, device)
@@ -771,60 +815,134 @@ def compute_source_weights_by_classification_voting(
         )
         out = model(batch["x"], batch["de_feat"], **target_rel_kwargs)
         source_logits = out["domain_logits"].index_select(dim=1, index=source_domain_indices)
-        source_prob = torch.softmax(source_logits, dim=1)
+        source_prob = torch.softmax(source_logits / tau_vote, dim=1)
         pred_local = source_prob.argmax(dim=1)
-        conf = source_prob.max(dim=1).values
+        prob_np = source_prob.detach().cpu().numpy()
         pred_domain = source_domain_indices[pred_local].detach().cpu().tolist()
         pred_subjects = [domain_to_source[int(d)] for d in pred_domain]
 
         for i, pred_subject in enumerate(pred_subjects):
-            rows.append(
-                {
-                    "target_key": batch["target_key"][i],
-                    "user_id": batch["user_id"][i],
-                    "trial_id": int(batch["trial_id"][i].detach().cpu()),
-                    "pred_source_subject": pred_subject,
-                    "pred_source_domain": int(pred_domain[i]),
-                    "confidence": float(conf[i].detach().cpu()),
-                }
-            )
+            prob_vec = prob_np[i].astype(np.float64)
+            confidence = _confidence(prob_vec)
+            row = {
+                "target_key": batch["target_key"][i],
+                "user_id": batch["user_id"][i],
+                "trial_id": int(batch["trial_id"][i].detach().cpu()),
+                "pred_source_subject": pred_subject,
+                "pred_source_domain": int(pred_domain[i]),
+                "confidence": confidence,
+            }
+            row.update(_topk_columns(prob_vec))
+            window_rows.append(row)
+            window_records.append({**row, "_source_prob": prob_vec})
+
+    vote_vec = np.zeros(num_source_subjects, dtype=np.float64)
+    trial_rows = []
 
     if vote_level == "trial":
-        trial_votes = []
         grouped = defaultdict(list)
-        for row in rows:
+        for row in window_records:
             grouped[(row["target_key"], row["trial_id"])].append(row)
-        for (_target_key, _trial_id), records in grouped.items():
-            subject_counts = Counter(r["pred_source_subject"] for r in records)
-            pred_subject = sorted(
-                subject_counts.items(),
-                key=lambda kv: (-kv[1], natural_key(kv[0])),
-            )[0][0]
-            trial_votes.append(pred_subject)
-        counts = Counter(trial_votes)
-    elif vote_level == "window":
-        counts = Counter(row["pred_source_subject"] for row in rows)
-    else:
-        raise ValueError(f"Unknown vote_level={vote_level}")
+        for (target_key, trial_id), records in grouped.items():
+            prob_stack = np.stack([r["_source_prob"] for r in records], axis=0)
+            trial_prob = prob_stack.mean(axis=0)
+            pred_local = int(np.argmax(trial_prob))
+            confidence = _confidence(trial_prob)
 
-    count_values = np.array([counts.get(s, 0) + float(smooth) for s in source_subjects], dtype=np.float64)
-    weights = count_values / count_values.sum()
-    weights_mean_one = weights * len(source_subjects)
+            if vote_mode == "hard":
+                vote_vec[pred_local] += 1.0
+            elif vote_mode == "soft":
+                vote_vec += trial_prob
+            else:
+                vote_vec += confidence * trial_prob
+
+            first = records[0]
+            row = {
+                "target_key": target_key,
+                "user_id": first["user_id"],
+                "trial_id": int(trial_id),
+                "n_windows": len(records),
+                "pred_source_subject": source_subjects[pred_local],
+                "pred_source_domain": source_domains[pred_local],
+                "confidence": confidence,
+            }
+            row.update(_topk_columns(trial_prob))
+            trial_rows.append(row)
+    elif vote_level == "window":
+        for record in window_records:
+            prob_vec = record["_source_prob"]
+            pred_local = int(np.argmax(prob_vec))
+            confidence = float(record["confidence"])
+            if vote_mode == "hard":
+                vote_vec[pred_local] += 1.0
+            elif vote_mode == "soft":
+                vote_vec += prob_vec
+            else:
+                vote_vec += confidence * prob_vec
+
+    smoothed_votes = vote_vec + float(smooth)
+    weights = smoothed_votes / smoothed_votes.sum()
+    weights_mean_one = weights * num_source_subjects
+    vote_probs = vote_vec / max(float(vote_vec.sum()), eps)
+    vote_entropy = -float(np.sum(vote_probs * np.log(vote_probs + eps)))
+    confidences = (
+        [float(r["confidence"]) for r in trial_rows]
+        if vote_level == "trial"
+        else [float(r["confidence"]) for r in window_rows]
+    )
     result = {
         "type": "source_classification_voting",
         "vote_level": vote_level,
+        "vote_mode": vote_mode,
+        "tau_vote": float(tau_vote),
+        "confidence_power": float(confidence_power),
         "smooth": float(smooth),
         "source_subjects": source_subjects,
-        "counts": {s: int(counts.get(s, 0)) for s in source_subjects},
+        "votes": {s: float(v) for s, v in zip(source_subjects, vote_vec)},
+        "counts": {s: int(round(v)) for s, v in zip(source_subjects, vote_vec)} if vote_mode == "hard" else {},
         "weights": {s: float(w) for s, w in zip(source_subjects, weights)},
         "weights_mean_one": {s: float(w) for s, w in zip(source_subjects, weights_mean_one)},
+        "vote_entropy": vote_entropy,
+        "num_target_windows": len(window_rows),
+        "num_target_trials": len(trial_rows) if vote_level == "trial" else None,
     }
+    if confidences:
+        result["confidence_mean"] = float(np.mean(confidences))
+        result["confidence_min"] = float(np.min(confidences))
+        result["confidence_max"] = float(np.max(confidences))
 
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     save_json(save_dir / "source_subject_weights.json", result)
-    pd.DataFrame(rows).to_csv(save_dir / "source_subject_votes.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(window_rows).to_csv(save_dir / "source_subject_votes.csv", index=False, encoding="utf-8-sig")
+    if vote_level == "trial":
+        pd.DataFrame(trial_rows).to_csv(save_dir / "source_subject_trial_votes.csv", index=False, encoding="utf-8-sig")
+    else:
+        pd.DataFrame([]).to_csv(save_dir / "source_subject_trial_votes.csv", index=False, encoding="utf-8-sig")
     save_json(save_dir / "domain_id_mapping.json", domain_mapping)
+
+    print(f"[Stage1 Voting] vote_level={vote_level}, vote_mode={vote_mode}, tau_vote={tau_vote}")
+    if vote_level == "trial":
+        print(f"[Stage1 Voting] total target trials = {len(trial_rows)}")
+    else:
+        print(f"[Stage1 Voting] total target windows = {len(window_rows)}")
+    print(f"[Stage1 Voting] vote entropy = {vote_entropy:.4f}")
+    if vote_mode == "soft_conf" and confidences:
+        print(
+            f"[Stage1 Voting] confidence mean/min/max = "
+            f"{np.mean(confidences):.4f}/{np.min(confidences):.4f}/{np.max(confidences):.4f}"
+        )
+    print("[Stage1 Voting] top source weights:")
+    top_vote_rows = sorted(
+        zip(source_subjects, vote_vec, weights, weights_mean_one),
+        key=lambda item: item[1],
+        reverse=True,
+    )[:8]
+    for subject, vote, weight, weight_mean_one in top_vote_rows:
+        print(
+            f"    {subject}, vote={vote:.4f}, "
+            f"weight={weight:.6f}, weight_mean_one={weight_mean_one:.4f}"
+        )
     return result
 
 
@@ -2364,6 +2482,10 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
         save_dir,
         smooth=args.vote_smooth,
         vote_level=args.vote_level,
+        vote_mode=args.vote_mode,
+        tau_vote=args.tau_vote,
+        confidence_power=args.confidence_power,
+        save_topk_probs=args.save_topk_probs,
         target_de_mu=target_de_mu,
         target_de_std=target_de_std,
         target_bio_mu=target_bio_mu,
@@ -2705,7 +2827,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grl_diag", type=float, default=0.01)
     parser.add_argument("--lambda_weight_reg", type=float, default=0.0)
     parser.add_argument("--vote_smooth", type=float, default=5.0)
-    parser.add_argument("--vote_level", choices=["window", "trial"], default="window")
+    parser.add_argument("--vote_level", choices=["window", "trial"], default="trial")
+    parser.add_argument("--vote_mode", choices=["hard", "soft", "soft_conf"], default="soft")
+    parser.add_argument("--tau_vote", type=float, default=1.0)
+    parser.add_argument("--confidence_power", type=float, default=1.0)
+    parser.add_argument("--save_topk_probs", type=int, default=5)
     parser.add_argument("--use_mean_one_source_weights", dest="use_mean_one_source_weights", action="store_true", default=True)
     parser.add_argument("--use_sum_one_source_weights", dest="use_mean_one_source_weights", action="store_false")
     parser.add_argument("--source_weight_clip", type=float, default=4.0)
