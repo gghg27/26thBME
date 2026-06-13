@@ -2,10 +2,10 @@
 """Train two-stage SSAS + three-branch encoder + HC/DEP emotion experts.
 
 Typical quick run:
-    python V3/train_expert_ssas_emotion.py --fold 0 --stage1_epochs 2 --stage2_epochs 2
+    python V5/train_expert_ssas_emotion.py --fold 0 --stage1_epochs 2 --stage2_epochs 2
 
 Full 5-fold run:
-    python V3/train_expert_ssas_emotion.py --all_folds --stage1_epochs 20 --stage2_epochs 100
+    python V5/train_expert_ssas_emotion.py --all_folds --stage1_epochs 20 --stage2_epochs 100
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ import config
 from dataloader import Competition4ClassDataset
 from utils.data import expand_window_index, resolve_data_path
 from utils.folds import get_unified_subject_split
-from V3.expert_ssas_emotion_model import (
+from V5.expert_ssas_emotion_model import (
     Stage1SSASSourceSelectionModel,
     Stage2ExpertEmotionAdaptationModel,
     hard_expert_emotion_loss,
@@ -544,11 +544,80 @@ def build_diag_class_weights(source_dataset: DomainAwareCompetitionDataset, use_
     return torch.tensor(weights, dtype=torch.float32)
 
 
-def _weighted_ce(logits: torch.Tensor, labels: torch.Tensor, sample_weight: Optional[torch.Tensor] = None) -> torch.Tensor:
-    loss = F.cross_entropy(logits, labels.long(), reduction="none")
+def _weighted_ce(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    sample_weight: Optional[torch.Tensor] = None,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    loss = F.cross_entropy(
+        logits,
+        labels.long(),
+        reduction="none",
+        label_smoothing=float(label_smoothing),
+    )
     if sample_weight is not None:
         loss = loss * sample_weight.to(device=loss.device, dtype=loss.dtype)
     return loss.mean()
+
+
+def _scalar_stat(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return None
+        return float(value.detach().float().mean().cpu().item())
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_arch_output_stats(out: dict) -> dict[str, float]:
+    stats: dict[str, float] = {}
+    gates = out.get("fusion_gates") or {}
+    gate_names = {
+        "temporal": "fusion_gate_temporal",
+        "graph": "fusion_gate_graph",
+        "core": "fusion_gate_core",
+        "bio": "fusion_gate_bio",
+    }
+    for gate_key, metric_key in gate_names.items():
+        value = _scalar_stat(gates.get(gate_key))
+        if value is not None:
+            stats[metric_key] = value
+
+    beta = _scalar_stat(out.get("graph_beta"))
+    if beta is not None:
+        stats["graph_beta"] = beta
+
+    adj_learnable = out.get("adj_learnable")
+    if torch.is_tensor(adj_learnable) and adj_learnable.numel() > 0:
+        adj_learnable_float = adj_learnable.detach().float()
+        stats["learnable_graph_mean"] = float(adj_learnable_float.mean().cpu().item())
+        stats["learnable_graph_std"] = float(adj_learnable_float.std(unbiased=False).cpu().item())
+
+    adj_dense = out.get("adj_dense")
+    if torch.is_tensor(adj_dense) and adj_dense.numel() > 0 and beta is not None:
+        stats["adj_final_mean"] = float(adj_dense.detach().float().mean().cpu().item())
+    return stats
+
+
+def format_stage2_arch_stats(metrics: dict) -> str:
+    parts = []
+    aliases = [
+        ("gate_t", "fusion_gate_temporal"),
+        ("gate_g", "fusion_gate_graph"),
+        ("gate_core", "fusion_gate_core"),
+        ("gate_bio", "fusion_gate_bio"),
+        ("graph_beta", "graph_beta"),
+    ]
+    for label, key in aliases:
+        value = metrics.get(key)
+        if value is not None:
+            parts.append(f"{label}={float(value):.4f}")
+    return (" " + " ".join(parts)) if parts else ""
 
 
 def train_stage1_one_epoch(
@@ -1279,6 +1348,16 @@ def ema_update_source_weights(
     return normalize_source_weight_dict(updated, keys=keys, mean_one=mean_one)
 
 
+def attention_pool_scores_torch(scores: torch.Tensor, tau: float = 1.0) -> torch.Tensor:
+    if scores.numel() == 0:
+        return scores.new_tensor(0.0)
+    if scores.numel() == 1:
+        return scores.reshape(-1)[0]
+    tau = max(float(tau), 1e-6)
+    alpha = torch.softmax(scores.abs() / tau, dim=0)
+    return (alpha * scores).sum()
+
+
 def stage2_subject_ranking_loss(
     mix_prob: torch.Tensor,
     labels: torch.Tensor,
@@ -1287,14 +1366,18 @@ def stage2_subject_ranking_loss(
     sample_weight: Optional[torch.Tensor] = None,
     margin: float = 0.2,
     max_pairs_per_subject: int = 128,
+    trial_pooling: str = "mean",
+    trial_attn_tau: float = 1.0,
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """
     Subject-wise trial ranking loss aligned with final soft top-k inference.
 
-    The score is log-odds of positive emotion. Window scores are averaged to a
+    The score is log-odds of positive emotion. Window scores are pooled to a
     trial score before pairwise ranking positive trials above neutral trials.
     """
+    if trial_pooling not in {"mean", "attn_conf"}:
+        raise ValueError(f"Unknown ranking trial_pooling={trial_pooling}; expected 'mean' or 'attn_conf'.")
     score_pos = torch.log(mix_prob[:, 1].clamp_min(eps)) - torch.log(mix_prob[:, 0].clamp_min(eps))
     labels = labels.reshape(-1).long()
     subject_ids = subject_ids.reshape(-1)
@@ -1314,7 +1397,10 @@ def stage2_subject_ranking_loss(
         trial_weights = []
         for tid in torch.unique(sub_trials):
             trial_mask = sub_trials == tid
-            trial_scores.append(sub_scores[trial_mask].mean())
+            if trial_pooling == "attn_conf":
+                trial_scores.append(attention_pool_scores_torch(sub_scores[trial_mask], tau=trial_attn_tau))
+            else:
+                trial_scores.append(sub_scores[trial_mask].mean())
             trial_labels.append(sub_labels[trial_mask][0])
             if sub_weights is not None:
                 trial_weights.append(sub_weights[trial_mask].mean())
@@ -1357,6 +1443,7 @@ def train_stage2_one_epoch(
     lambda_expert: float = 0.5,
     lambda_mix: float = 1.0,
     lambda_diag: float = 0.02,
+    diag_label_smoothing: float = 0.0,
     lambda_mmd: float = 0.0003,
     lambda_cond_mmd: float = 0.0,
     cond_mmd_warmup_epochs: int = 5,
@@ -1370,6 +1457,8 @@ def train_stage2_one_epoch(
     rank_margin: float = 0.2,
     rank_warmup_epochs: int = 3,
     rank_max_pairs_per_subject: int = 128,
+    rank_trial_pooling: str = "mean",
+    trial_attn_tau: float = 1.0,
     current_epoch: int = 1,
     source_de_mu: Optional[dict[str, torch.Tensor]] = None,
     source_de_std: Optional[dict[str, torch.Tensor]] = None,
@@ -1403,6 +1492,7 @@ def train_stage2_one_epoch(
     ]
     default_cond_mmd_stats = {key: 0.0 for key in cond_mmd_stat_keys}
     default_cond_mmd_stats["cond_mmd_valid_classes"] = 0
+    arch_stat_keys: set[str] = set()
 
     pbar = tqdm(source_loader, desc="Stage2-Train", leave=False)
     for source_batch in pbar:
@@ -1459,7 +1549,12 @@ def train_stage2_one_epoch(
             sample_weight=sample_weight,
         )
         loss_mix = mixture_emotion_nll_loss(source_out["mix_prob"], y_emo, sample_weight=sample_weight)
-        loss_diag = _weighted_ce(source_out["diag_logits"], y_diag, sample_weight=sample_weight)
+        loss_diag = _weighted_ce(
+            source_out["diag_logits"],
+            y_diag,
+            sample_weight=sample_weight,
+            label_smoothing=diag_label_smoothing,
+        )
 
         domain_logits = torch.cat(
             [source_out["subject_domain_logits"], target_out["subject_domain_logits"]],
@@ -1493,9 +1588,13 @@ def train_stage2_one_epoch(
                 sample_weight=sample_weight,
                 margin=rank_margin,
                 max_pairs_per_subject=rank_max_pairs_per_subject,
+                trial_pooling=rank_trial_pooling,
+                trial_attn_tau=trial_attn_tau,
             )
         else:
             loss_rank = source_out["z"].new_tensor(0.0)
+        arch_stats = extract_arch_output_stats(source_out)
+        arch_stat_keys.update(arch_stats.keys())
 
         loss = (
             lambda_expert * loss_expert
@@ -1558,6 +1657,8 @@ def train_stage2_one_epoch(
         totals["pred_hc_diag"] += int((diag_pred == 1).sum().item())
         totals["true_hc_diag"] += int((y_diag == 1).sum().item())
         totals["sample_weight_sum"] += float(sample_weight.sum().item())
+        for key, value in arch_stats.items():
+            totals[key] += float(value) * bsz
 
         all_mix_preds.extend(mix_pred.detach().cpu().tolist())
         all_expert_preds.extend(expert_pred.detach().cpu().tolist())
@@ -1610,6 +1711,8 @@ def train_stage2_one_epoch(
         "sample_weight_mean": totals["sample_weight_sum"] / total_n,
     }
     for key in cond_mmd_stat_keys:
+        metrics[key] = totals[key] / total_n
+    for key in sorted(arch_stat_keys):
         metrics[key] = totals[key] / total_n
 
     metrics["emotion_macro_f1"] = f1_score(
@@ -1680,27 +1783,121 @@ def train_stage2_one_epoch(
     return metrics
 
 
-def compute_trial_level_metrics(segment_records: list[dict], threshold: float = 0.5, vote_method: str = "hard") -> dict:
+def stable_softmax_np(x, tau: float = 1.0) -> np.ndarray:
+    values = np.asarray(x, dtype=np.float64).reshape(-1)
+    if values.size == 0:
+        return values
+    tau = max(float(tau), 1e-6)
+    logits = values / tau
+    logits = logits - np.max(logits)
+    exp_logits = np.exp(logits)
+    denom = float(exp_logits.sum())
+    if not np.isfinite(denom) or denom <= 0:
+        return np.full(values.shape, 1.0 / max(values.size, 1), dtype=np.float64)
+    return exp_logits / denom
+
+
+def _record_prob_score_pred(record: dict, threshold: float = 0.5) -> tuple[float, float, int]:
+    prob = record.get("prob_pos", record.get("prob_window", None))
+    score = record.get("score_pos", record.get("score_window", None))
+    if prob is None and score is None:
+        raise KeyError("Window record must contain prob_pos/prob_window or score_pos/score_window.")
+    if prob is None:
+        score_float = float(score)
+        prob_float = float(1.0 / (1.0 + math.exp(-max(min(score_float, 60.0), -60.0))))
+    else:
+        prob_float = float(prob)
+    if score is None:
+        prob_clip = float(np.clip(prob_float, 1e-8, 1.0 - 1e-8))
+        score_float = float(math.log(prob_clip) - math.log(1.0 - prob_clip))
+    else:
+        score_float = float(score)
+    pred = record.get("pred_emo", record.get("pred_window", None))
+    pred_int = int(pred) if pred is not None else int(prob_float >= threshold)
+    return prob_float, score_float, pred_int
+
+
+def aggregate_window_records(
+    records: list[dict],
+    threshold: float = 0.5,
+    pooling: str = "attn_conf",
+    tau: float = 1.0,
+) -> dict:
+    if pooling not in {"mean", "attn_conf"}:
+        raise ValueError(f"Unknown trial pooling={pooling}; expected 'mean' or 'attn_conf'.")
+    if not records:
+        return {
+            "prob_pos": 0.0,
+            "score_pos": 0.0,
+            "hard_mean": 0.0,
+            "pred_soft_threshold": 0,
+            "pred_hard_threshold": 0,
+            "attention_entropy": 0.0,
+            "attn_max": 0.0,
+            "n_windows": 0,
+        }
+
+    parsed = [_record_prob_score_pred(record, threshold=threshold) for record in records]
+    probs = np.asarray([item[0] for item in parsed], dtype=np.float64)
+    scores = np.asarray([item[1] for item in parsed], dtype=np.float64)
+    preds = np.asarray([item[2] for item in parsed], dtype=np.float64)
+
+    if pooling == "mean":
+        alpha = np.full(probs.shape, 1.0 / max(probs.size, 1), dtype=np.float64)
+    else:
+        alpha = stable_softmax_np(np.abs(scores), tau=tau)
+
+    prob_pos = float(np.sum(alpha * probs))
+    score_pos = float(np.sum(alpha * scores))
+    hard_mean = float(np.mean(preds)) if preds.size else 0.0
+    pred_soft_threshold = int(prob_pos >= threshold)
+    pred_hard_threshold = int(hard_mean >= 0.5)
+    attention_entropy = -float(np.sum(alpha * np.log(alpha + 1e-12))) if alpha.size else 0.0
+    attn_max = float(np.max(alpha)) if alpha.size else 0.0
+
+    out = {
+        "prob_pos": prob_pos,
+        "score_pos": score_pos,
+        "hard_mean": hard_mean,
+        "pred_soft_threshold": pred_soft_threshold,
+        "pred_hard_threshold": pred_hard_threshold,
+        "attention_entropy": attention_entropy,
+        "attn_max": attn_max,
+        "n_windows": int(len(records)),
+        "trial_prob": prob_pos,
+    }
+    labels = [int(record["label_emo"]) for record in records if "label_emo" in record]
+    if labels:
+        out["label_emo"] = int(np.bincount(labels, minlength=2).argmax())
+    return out
+
+
+def compute_trial_level_metrics(
+    segment_records: list[dict],
+    threshold: float = 0.5,
+    vote_method: str = "hard",
+    pooling: str = "attn_conf",
+    tau: float = 1.0,
+) -> dict:
     trial_dict = defaultdict(list)
     for row in segment_records:
         trial_dict[(str(row["subject_id"]), int(row["trial_id"]))].append(row)
 
     trial_keys, trial_probs, trial_preds, trial_labels = [], [], [], []
     for key, records in trial_dict.items():
-        probs = [float(r["prob_pos"]) for r in records]
         preds = [int(r["pred_emo"]) for r in records]
-        labels = [int(r["label_emo"]) for r in records]
-        mean_prob = float(np.mean(probs))
-        label = int(np.bincount(labels, minlength=2).argmax())
+        agg = aggregate_window_records(records, threshold=threshold, pooling=pooling, tau=tau)
+        prob_pos = float(agg["prob_pos"])
+        label = int(agg.get("label_emo", 0))
         if vote_method == "prob":
-            pred = int(mean_prob >= threshold)
+            pred = int(prob_pos >= threshold)
         elif vote_method == "hard":
             counts = np.bincount(preds, minlength=2)
-            pred = int(counts[1] > counts[0]) if counts[0] != counts[1] else int(mean_prob >= threshold)
+            pred = int(counts[1] > counts[0]) if counts[0] != counts[1] else int(prob_pos >= threshold)
         else:
             raise ValueError(f"Unknown vote_method={vote_method}")
         trial_keys.append(key)
-        trial_probs.append(mean_prob)
+        trial_probs.append(prob_pos)
         trial_preds.append(pred)
         trial_labels.append(label)
 
@@ -1719,7 +1916,12 @@ def compute_trial_level_metrics(segment_records: list[dict], threshold: float = 
     }
 
 
-def compute_trial_topk_metrics(segment_records: list[dict], k_pos: int = 4) -> dict:
+def compute_trial_topk_metrics(
+    segment_records: list[dict],
+    k_pos: int = 4,
+    pooling: str = "attn_conf",
+    tau: float = 1.0,
+) -> dict:
     """Validation-time V1-style per-subject soft top-K trial metrics."""
 
     trial_dict = defaultdict(list)
@@ -1729,16 +1931,18 @@ def compute_trial_topk_metrics(segment_records: list[dict], k_pos: int = 4) -> d
 
     trial_records = []
     for (subject_key, trial_id), records in trial_dict.items():
-        probs = [float(r["prob_pos"]) for r in records]
-        scores = [float(r.get("score_pos", 0.0)) for r in records]
-        labels = [int(r["label_emo"]) for r in records]
+        agg = aggregate_window_records(records, pooling=pooling, tau=tau)
         trial_records.append(
             {
                 "user_id": subject_key,
                 "trial_id": int(trial_id),
-                "prob_pos": float(np.mean(probs)),
-                "score_pos": float(np.mean(scores)),
-                "label_emo": int(np.bincount(labels, minlength=2).argmax()),
+                "prob_pos": float(agg["prob_pos"]),
+                "score_pos": float(agg["score_pos"]),
+                "label_emo": int(agg.get("label_emo", 0)),
+                "hard_mean": float(agg["hard_mean"]),
+                "n_windows": int(agg["n_windows"]),
+                "attention_entropy": float(agg["attention_entropy"]),
+                "attn_max": float(agg["attn_max"]),
             }
         )
 
@@ -1782,6 +1986,9 @@ def validate_stage2_trial_level(
     threshold: float = 0.5,
     k_pos: int = 4,
     lambda_diag: float = 0.02,
+    diag_label_smoothing: float = 0.0,
+    trial_pooling: str = "attn_conf",
+    trial_attn_tau: float = 1.0,
     val_de_mu: Optional[dict[str, torch.Tensor]] = None,
     val_de_std: Optional[dict[str, torch.Tensor]] = None,
     val_bio_mu: Optional[dict[str, torch.Tensor]] = None,
@@ -1810,7 +2017,11 @@ def validate_stage2_trial_level(
         y_diag = batch["diagnosis_label"].long()
 
         loss_mix = mixture_emotion_nll_loss(out["mix_prob"], y_emo)
-        loss_diag = F.cross_entropy(out["diag_logits"], y_diag)
+        loss_diag = _weighted_ce(
+            out["diag_logits"],
+            y_diag,
+            label_smoothing=diag_label_smoothing,
+        )
         loss = loss_mix + float(lambda_diag) * loss_diag
         bsz = batch["x"].size(0)
         total_loss += float(loss.item()) * bsz
@@ -1859,11 +2070,24 @@ def validate_stage2_trial_level(
         }
         for i, cls in enumerate([0, 1])
     }
-    trial_metrics = compute_trial_level_metrics(segment_records, threshold=threshold, vote_method="hard")
-    topk_trial_metrics = compute_trial_topk_metrics(segment_records, k_pos=k_pos)
+    trial_metrics = compute_trial_level_metrics(
+        segment_records,
+        threshold=threshold,
+        vote_method="hard",
+        pooling=trial_pooling,
+        tau=trial_attn_tau,
+    )
+    topk_trial_metrics = compute_trial_topk_metrics(
+        segment_records,
+        k_pos=k_pos,
+        pooling=trial_pooling,
+        tau=trial_attn_tau,
+    )
 
     metrics = {
         "loss": total_loss / max(total_n, 1),
+        "trial_pooling": trial_pooling,
+        "trial_attn_tau": float(trial_attn_tau),
         "segment_acc": segment_acc,
         "segment_macro_f1": segment_macro_f1,
         "segment_confusion_matrix": segment_cm,
@@ -2275,6 +2499,8 @@ def predict_test_trial_level(
     vote_method: str = "prob",
     k_pos: int = 4,
     normalize: bool = True,
+    trial_pooling: str = "attn_conf",
+    trial_attn_tau: float = 1.0,
 ) -> pd.DataFrame:
     dataset = UnlabeledTargetDataset(test_csv, domain_mapping=domain_mapping, root=ROOT, normalize=normalize)
     loader = DataLoader(
@@ -2333,19 +2559,32 @@ def predict_test_trial_level(
                 }
             )
     pred_df = pd.DataFrame(rows)
-    trial_df = (
-        pred_df.groupby(["user_id", "trial_id"], as_index=False)
-        .agg(
-            prob_pos=("prob_window", "mean"),
-            score_pos=("score_window", "mean"),
-            hard_mean=("pred_window", "mean"),
-            n_windows=("prob_window", "count"),
+    trial_rows = []
+    for (user_id, trial_id), group in pred_df.groupby(["user_id", "trial_id"], sort=True):
+        agg = aggregate_window_records(
+            group.to_dict("records"),
+            threshold=threshold,
+            pooling=trial_pooling,
+            tau=trial_attn_tau,
         )
-        .sort_values(["user_id", "trial_id"])
-    )
-    trial_df["trial_prob"] = trial_df["prob_pos"]
-    trial_df["pred_soft_threshold"] = (trial_df["prob_pos"] >= threshold).astype(int)
-    trial_df["pred_hard_threshold"] = (trial_df["hard_mean"] >= 0.5).astype(int)
+        trial_rows.append(
+            {
+                "user_id": user_id,
+                "trial_id": int(trial_id),
+                "prob_pos": float(agg["prob_pos"]),
+                "score_pos": float(agg["score_pos"]),
+                "hard_mean": float(agg["hard_mean"]),
+                "n_windows": int(agg["n_windows"]),
+                "attention_entropy": float(agg["attention_entropy"]),
+                "attn_max": float(agg["attn_max"]),
+                "trial_prob": float(agg["trial_prob"]),
+                "pred_soft_threshold": int(agg["pred_soft_threshold"]),
+                "pred_hard_threshold": int(agg["pred_hard_threshold"]),
+            }
+        )
+    trial_df = pd.DataFrame(trial_rows).sort_values(["user_id", "trial_id"]).reset_index(drop=True)
+    trial_df["trial_pooling"] = trial_pooling
+    trial_df["trial_attn_tau"] = float(trial_attn_tau)
 
     topk_records = apply_subject_topk(
         trial_df[["user_id", "trial_id", "prob_pos", "score_pos"]].to_dict("records"),
@@ -2408,19 +2647,43 @@ def build_stage2_model_from_checkpoint(ckpt: dict, device: torch.device) -> tupl
         and use_biomarkers
     )
 
+    def _cfg_float(key: str, default: float) -> float:
+        value = config_dict.get(key, default)
+        return float(default if value is None else value)
+
+    def _cfg_int(key: str, default: int) -> int:
+        value = config_dict.get(key, default)
+        return int(default if value is None else value)
+
+    def _cfg_bool(key: str, default: bool) -> bool:
+        value = config_dict.get(key, default)
+        return bool(default if value is None else value)
+
     model = Stage2ExpertEmotionAdaptationModel(
         num_domains=int(domain_mapping["num_domains"]),
-        sfreq=float(config_dict.get("sfreq", 250.0)),
-        topk=int(config_dict.get("topk", 8)),
-        dropout=float(config_dict.get("dropout", 0.35)),
+        sfreq=_cfg_float("sfreq", 250.0),
+        topk=_cfg_int("topk", 8),
+        dropout=_cfg_float("dropout", 0.35),
         use_biomarkers=use_biomarkers,
-        biomarker_dim=int(config_dict.get("biomarker_dim", 57)),
+        biomarker_dim=_cfg_int("biomarker_dim", 57),
         use_subject_relative_de=use_subject_relative_de,
         use_subject_relative_bio=use_subject_relative_bio,
-        bio_abs_scale=float(config_dict.get("bio_abs_scale", 0.3)),
-        relative_eps=float(config_dict.get("relative_eps", 1e-6)),
-        de_num_bands=int(config_dict.get("de_num_bands", 5)),
-        shared_mix_alpha=float(config_dict.get("shared_mix_alpha", 0.5)),
+        bio_abs_scale=_cfg_float("bio_abs_scale", 0.3),
+        relative_eps=_cfg_float("relative_eps", 1e-6),
+        de_num_bands=_cfg_int("de_num_bands", 5),
+        shared_mix_alpha=_cfg_float("shared_mix_alpha", 0.5),
+        router_temperature=_cfg_float("router_temperature", 1.0),
+        shared_expert_trunk=_cfg_bool("shared_expert_trunk", False),
+        expert_hidden_dim=_cfg_int("expert_hidden_dim", 64),
+        fusion_mode=config_dict.get("fusion_mode") or "concat",
+        bio_gate_init=_cfg_float("bio_gate_init", -2.0),
+        core_gate_init=_cfg_float("core_gate_init", 0.0),
+        temporal_gate_init=_cfg_float("temporal_gate_init", 0.0),
+        graph_gate_init=_cfg_float("graph_gate_init", 0.0),
+        learnable_graph=_cfg_bool("learnable_graph", False),
+        learnable_graph_rank=_cfg_int("learnable_graph_rank", 4),
+        graph_mix_logit_init=_cfg_float("graph_mix_logit_init", 2.0),
+        learnable_graph_dropout=_cfg_float("learnable_graph_dropout", 0.0),
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     return model, domain_mapping
@@ -2438,10 +2701,12 @@ def ensemble_test_predictions(
     vote_method: str = "soft_topk",
     k_pos: int = 4,
     normalize: bool = True,
+    trial_pooling: str = "attn_conf",
+    trial_attn_tau: float = 1.0,
 ) -> pd.DataFrame:
     model_paths = [Path(p) for p in model_paths if p and Path(p).exists()]
     if not model_paths:
-        raise ValueError("No valid checkpoint paths for V3 test ensemble.")
+        raise ValueError("No valid checkpoint paths for V5 test ensemble.")
 
     save_dir = Path(save_dir)
     per_model_dir = save_dir / "per_model"
@@ -2449,9 +2714,9 @@ def ensemble_test_predictions(
     all_trial_probs = []
 
     for i, ckpt_path in enumerate(model_paths):
-        print(f"\n[V3 ensemble] model {i + 1}/{len(model_paths)}: {ckpt_path}")
+        print(f"\n[V5 ensemble] model {i + 1}/{len(model_paths)}: {ckpt_path}")
         ckpt = load_checkpoint(ckpt_path, device)
-        print_checkpoint_info(ckpt_path, ckpt, prefix=f"[V3 ensemble ckpt {i + 1}/{len(model_paths)}]")
+        print_checkpoint_info(ckpt_path, ckpt, prefix=f"[V5 ensemble ckpt {i + 1}/{len(model_paths)}]")
         model, domain_mapping = build_stage2_model_from_checkpoint(ckpt, device)
         model_dir = per_model_dir / f"model_{i:02d}_{ckpt_path.stem}"
         trial_df = predict_test_trial_level(
@@ -2466,6 +2731,8 @@ def ensemble_test_predictions(
             vote_method=vote_method,
             k_pos=k_pos,
             normalize=normalize,
+            trial_pooling=trial_pooling,
+            trial_attn_tau=trial_attn_tau,
         )
         trial_df = trial_df[["user_id", "trial_id", "prob_pos", "score_pos"]].copy()
         trial_df.rename(
@@ -2525,9 +2792,9 @@ def ensemble_test_predictions(
 
     n_total = len(submission)
     n_pos = int(submission["Emotion_label"].sum())
-    print(f"\n[V3 ensemble] probabilities saved: {probs_path}")
-    print(f"[V3 ensemble] submission saved: {submission_path}")
-    print(f"[V3 ensemble] selected={vote_method}, positives={n_pos}/{n_total} ({100 * n_pos / max(n_total, 1):.1f}%)")
+    print(f"\n[V5 ensemble] probabilities saved: {probs_path}")
+    print(f"[V5 ensemble] submission saved: {submission_path}")
+    print(f"[V5 ensemble] selected={vote_method}, positives={n_pos}/{n_total} ({100 * n_pos / max(n_total, 1):.1f}%)")
     return merged
 
 
@@ -2556,6 +2823,7 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
         f"[fold] repeat={repeat_index} fold={fold} seed={rand_seed} run_seed={run_seed} "
         f"source_subjects={len(split['train_all'])} val_subjects={len(split['val_all'])} domains={domain_mapping['num_domains']}"
     )
+    print_arch_config(args)
     config_dict = vars(args).copy()
     config_dict.update({"fold": fold, "repeat_index": repeat_index, "rand_seed": rand_seed, "run_seed": run_seed})
     print(
@@ -2649,6 +2917,15 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
         bio_abs_scale=args.bio_abs_scale,
         relative_eps=args.relative_eps,
         de_num_bands=args.de_num_bands,
+        fusion_mode=args.fusion_mode,
+        bio_gate_init=args.bio_gate_init,
+        core_gate_init=args.core_gate_init,
+        temporal_gate_init=args.temporal_gate_init,
+        graph_gate_init=args.graph_gate_init,
+        learnable_graph=args.learnable_graph,
+        learnable_graph_rank=args.learnable_graph_rank,
+        graph_mix_logit_init=args.graph_mix_logit_init,
+        learnable_graph_dropout=args.learnable_graph_dropout,
     ).to(device)
     if use_subject_relative_bio:
         print("[Subject Relative] computing source/val/target bio baselines with Stage1 encoder...")
@@ -2863,7 +3140,23 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
         relative_eps=args.relative_eps,
         de_num_bands=args.de_num_bands,
         shared_mix_alpha=args.shared_mix_alpha,
+        router_temperature=args.router_temperature,
+        shared_expert_trunk=args.shared_expert_trunk,
+        expert_hidden_dim=args.expert_hidden_dim,
+        fusion_mode=args.fusion_mode,
+        bio_gate_init=args.bio_gate_init,
+        core_gate_init=args.core_gate_init,
+        temporal_gate_init=args.temporal_gate_init,
+        graph_gate_init=args.graph_gate_init,
+        learnable_graph=args.learnable_graph,
+        learnable_graph_rank=args.learnable_graph_rank,
+        graph_mix_logit_init=args.graph_mix_logit_init,
+        learnable_graph_dropout=args.learnable_graph_dropout,
     ).to(device)
+    print(
+        f"[Stage2 Model] shared_expert_trunk={args.shared_expert_trunk}, "
+        f"expert_hidden_dim={args.expert_hidden_dim}"
+    )
     if not args.no_stage1_init:
         load_stage1_encoder_into_stage2(stage1, stage2)
 
@@ -2901,6 +3194,7 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
             lambda_expert=args.lambda_expert,
             lambda_mix=args.lambda_mix,
             lambda_diag=args.lambda_diag,
+            diag_label_smoothing=args.diag_label_smoothing,
             lambda_mmd=args.stage2_lambda_mmd,
             lambda_cond_mmd=args.lambda_cond_mmd,
             cond_mmd_warmup_epochs=args.cond_mmd_warmup_epochs,
@@ -2914,6 +3208,8 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
             rank_margin=args.rank_margin,
             rank_warmup_epochs=args.rank_warmup_epochs,
             rank_max_pairs_per_subject=args.rank_max_pairs_per_subject,
+            rank_trial_pooling=args.rank_trial_pooling,
+            trial_attn_tau=args.trial_attn_tau,
             current_epoch=epoch,
             source_de_mu=source_de_mu,
             source_de_std=source_de_std,
@@ -2931,6 +3227,9 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
             threshold=args.threshold,
             k_pos=args.k_pos,
             lambda_diag=args.lambda_diag,
+            diag_label_smoothing=args.diag_label_smoothing,
+            trial_pooling=args.trial_pooling,
+            trial_attn_tau=args.trial_attn_tau,
             val_de_mu=val_de_mu,
             val_de_std=val_de_std,
             val_bio_mu=val_bio_mu,
@@ -2954,6 +3253,7 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
             f"rank={train_metrics.get('loss_rank', 0.0):.4f} "
             f"val_trial_f1={val_metrics['trial_macro_f1']:.4f} val_trial_acc={val_metrics['trial_acc']:.4f} "
             f"val_topk_f1={val_metrics['topk_trial_macro_f1']:.4f} val_topk_acc={val_metrics['topk_trial_acc']:.4f}"
+            f"{format_stage2_arch_stats(train_metrics)}"
         )
 
         weight_stats = summarize_source_weights(source_weights)
@@ -3074,6 +3374,8 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
                         scheduler=scheduler2,
                         extra_state={
                             "domain_mapping": domain_mapping,
+                            "arch_variant": args.arch_variant,
+                            "resolved_arch": resolved_arch_state(args),
                             "source_subject_weights": source_weights,
                             "raw_source_subject_weights": raw_source_weights,
                             "initial_stage1_source_weights": stage1_prior_source_weights,
@@ -3156,6 +3458,8 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
             scheduler=scheduler2,
             extra_state={
                 "domain_mapping": domain_mapping,
+                "arch_variant": args.arch_variant,
+                "resolved_arch": resolved_arch_state(args),
                 "source_subject_weights": source_weights,
                 "raw_source_subject_weights": raw_source_weights,
                 "initial_stage1_source_weights": stage1_prior_source_weights,
@@ -3204,7 +3508,7 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
 
     if args.predict_test and args.test_csv and Path(args.test_csv).exists() and best_path:
         ckpt = load_checkpoint(best_path, device)
-        print_checkpoint_info(best_path, ckpt, prefix=f"[V3 predict ckpt {selected_best_name}]")
+        print_checkpoint_info(best_path, ckpt, prefix=f"[V5 predict ckpt {selected_best_name}]")
         stage2.load_state_dict(ckpt["model_state_dict"])
         trial_df = predict_test_trial_level(
             stage2,
@@ -3218,6 +3522,8 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
             vote_method=args.test_vote_method,
             k_pos=args.k_pos,
             normalize=not args.no_normalize,
+            trial_pooling=args.trial_pooling,
+            trial_attn_tau=args.trial_attn_tau,
         )
         print(f"[test] saved predictions, trials={len(trial_df)}")
 
@@ -3239,11 +3545,75 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
     }
 
 
+def resolve_arch_variant_args(args: argparse.Namespace) -> argparse.Namespace:
+    variant_defaults = {
+        "base": {
+            "router_temperature": 1.0,
+            "diag_label_smoothing": 0.0,
+            "shared_expert_trunk": False,
+            "fusion_mode": "concat",
+            "learnable_graph": False,
+        },
+        "A": {
+            "router_temperature": 1.5,
+            "diag_label_smoothing": 0.05,
+            "shared_expert_trunk": False,
+            "fusion_mode": "concat",
+            "learnable_graph": False,
+        },
+        "B": {
+            "router_temperature": 1.5,
+            "diag_label_smoothing": 0.05,
+            "shared_expert_trunk": True,
+            "fusion_mode": "concat",
+            "learnable_graph": False,
+        },
+        "C": {
+            "router_temperature": 1.5,
+            "diag_label_smoothing": 0.05,
+            "shared_expert_trunk": True,
+            "fusion_mode": "scalar_gated",
+            "learnable_graph": False,
+        },
+        "D": {
+            "router_temperature": 1.5,
+            "diag_label_smoothing": 0.05,
+            "shared_expert_trunk": True,
+            "fusion_mode": "scalar_gated",
+            "learnable_graph": True,
+        },
+    }
+    defaults = variant_defaults[args.arch_variant]
+    for key, value in defaults.items():
+        if getattr(args, key, None) is None:
+            setattr(args, key, value)
+    return args
+
+
+def resolved_arch_state(args: argparse.Namespace) -> dict:
+    return {
+        "router_temperature": args.router_temperature,
+        "diag_label_smoothing": args.diag_label_smoothing,
+        "shared_expert_trunk": args.shared_expert_trunk,
+        "fusion_mode": args.fusion_mode,
+        "learnable_graph": args.learnable_graph,
+    }
+
+
+def print_arch_config(args: argparse.Namespace) -> None:
+    print(f"[Arch] variant={args.arch_variant}")
+    print(f"[Arch] router_temperature={args.router_temperature}")
+    print(f"[Arch] diag_label_smoothing={args.diag_label_smoothing}")
+    print(f"[Arch] shared_expert_trunk={args.shared_expert_trunk}")
+    print(f"[Arch] fusion_mode={args.fusion_mode}")
+    print(f"[Arch] learnable_graph={args.learnable_graph}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--index_csv", type=str, default="com_index_sub_2s.csv")
     parser.add_argument("--test_csv", type=str, default="com_test_trial_index_2s.csv")
-    parser.add_argument("--save_root", type=str, default="model_params/V3_expert_ssas")
+    parser.add_argument("--save_root", type=str, default="model_params/V5_expert_ssas")
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument("--all_folds", action="store_true")
     parser.add_argument("--n_splits", type=int, default=10)
@@ -3271,6 +3641,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bio_abs_scale", type=float, default=0.3)
     parser.add_argument("--relative_eps", type=float, default=1e-6)
     parser.add_argument("--use_raw_diagnosis_label", action="store_true")
+    parser.add_argument(
+        "--arch_variant",
+        choices=["base", "A", "B", "C", "D"],
+        default="D",
+        help="Architecture ablation variant: base/A/B/C/D. V5 defaults to D.",
+    )
+    parser.add_argument("--router_temperature", type=float, default=None)
+    parser.add_argument("--diag_label_smoothing", type=float, default=None)
+    parser.add_argument("--shared_expert_trunk", action="store_true")
+    parser.add_argument("--no_shared_expert_trunk", dest="shared_expert_trunk", action="store_false")
+    parser.add_argument("--expert_hidden_dim", type=int, default=64)
+    parser.add_argument(
+        "--fusion_mode",
+        choices=["concat", "scalar_gated"],
+        default=None,
+    )
+    parser.add_argument("--bio_gate_init", type=float, default=-2.0)
+    parser.add_argument("--core_gate_init", type=float, default=0.0)
+    parser.add_argument("--graph_gate_init", type=float, default=0.0)
+    parser.add_argument("--temporal_gate_init", type=float, default=0.0)
+    parser.add_argument("--learnable_graph", action="store_true")
+    parser.add_argument("--no_learnable_graph", dest="learnable_graph", action="store_false")
+    parser.add_argument("--learnable_graph_rank", type=int, default=4)
+    parser.add_argument("--graph_mix_logit_init", type=float, default=2.0)
+    parser.add_argument("--learnable_graph_dropout", type=float, default=0.0)
+    parser.set_defaults(shared_expert_trunk=None)
+    parser.set_defaults(learnable_graph=None)
 
     parser.add_argument("--lambda_domain", type=float, default=1.0)
     parser.add_argument("--stage1_lambda_mmd", type=float, default=0.03)
@@ -3307,6 +3704,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rank_margin", type=float, default=0.2)
     parser.add_argument("--rank_warmup_epochs", type=int, default=3)
     parser.add_argument("--rank_max_pairs_per_subject", type=int, default=128)
+    parser.add_argument("--rank_trial_pooling", choices=["mean", "attn_conf"], default="mean")
     parser.add_argument("--shared_mix_alpha", type=float, default=0.7)
     parser.add_argument("--no_stage1_init", action="store_true")
     parser.add_argument("--no_stage2_early_stop", action="store_true")
@@ -3327,6 +3725,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dynamic_max_target_samples", type=int, default=4096)
 
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--trial_pooling", choices=["mean", "attn_conf"], default="attn_conf")
+    parser.add_argument("--trial_attn_tau", type=float, default=1.0)
     parser.add_argument("--predict_test", action="store_true")
     parser.add_argument("--predict_best_name", type=str, default="topk_trial_f1")
     parser.add_argument(
@@ -3337,11 +3737,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--k_pos", type=int, default=4)
     parser.add_argument("--no_test_ensemble", action="store_true")
     parser.add_argument("--test_ensemble_dir", type=str, default="test_ensemble")
-    return parser.parse_args()
+    return resolve_arch_variant_args(parser.parse_args())
 
 
-def get_v3_seed_for_repeat(repeat: int) -> int:
-    seed_list = list(getattr(config, "V3_seed", getattr(config, "V2_seed", [42])))
+def get_v5_seed_for_repeat(repeat: int) -> int:
+    seed_list = list(getattr(config, "V5_seed", getattr(config, "V4_seed", getattr(config, "V3_seed", getattr(config, "V2_seed", [42])))))
     if not seed_list:
         seed_list = [42]
     if repeat < 0:
@@ -3350,18 +3750,18 @@ def get_v3_seed_for_repeat(repeat: int) -> int:
         return int(seed_list[repeat])
 
     derived = int(seed_list[0]) + int(repeat) * 31
-    print(f"[config] V3 repeat={repeat} 超出预定义种子列表 {seed_list}，使用派生种子 {derived}")
+    print(f"[config] V5 repeat={repeat} 超出预定义种子列表 {seed_list}，使用派生种子 {derived}")
     return derived
 
 
 def main() -> None:
     args = parse_args()
-    seed_list = list(getattr(config, "V3_seed", getattr(config, "V2_seed", [42])))
+    seed_list = list(getattr(config, "V5_seed", getattr(config, "V4_seed", getattr(config, "V3_seed", getattr(config, "V2_seed", [42])))))
     repeats = range(len(seed_list)) if args.all_repeats else [args.repeat]
     folds = range(args.n_splits) if args.all_folds else [args.fold]
     results = []
     for repeat_index in repeats:
-        rand_seed = get_v3_seed_for_repeat(repeat_index)
+        rand_seed = get_v5_seed_for_repeat(repeat_index)
         for fold in folds:
             results.append(run_one_fold(args, fold=fold, repeat_index=repeat_index, rand_seed=rand_seed))
 
@@ -3404,16 +3804,18 @@ def main() -> None:
                 vote_method=args.test_vote_method,
                 k_pos=args.k_pos,
                 normalize=not args.no_normalize,
+                trial_pooling=args.trial_pooling,
+                trial_attn_tau=args.trial_attn_tau,
             )
         else:
-            print("[V3 ensemble] no valid best checkpoints found; skip test ensemble.")
+            print("[V5 ensemble] no valid best checkpoints found; skip test ensemble.")
     elif args.no_test_ensemble:
-        print("[V3 ensemble] skipped by --no_test_ensemble.")
+        print("[V5 ensemble] skipped by --no_test_ensemble.")
 
 
 if __name__ == "__main__":
     main()
     #训练
-    # python3 V3/train_expert_ssas_emotion.py --all_folds --all_repeats --batch_size 200 --test_vote_method soft_topk --k_pos 4
+    # python3 V5/train_expert_ssas_emotion.py --all_folds --all_repeats --batch_size 200 --test_vote_method soft_topk --k_pos 4
 
-    #python3 V4/train_expert_ssas_emotion.py --all_folds --all_repeats --batch_size 200 --arch_variant B
+    #python3 V5/train_expert_ssas_emotion.py --all_folds --all_repeats --batch_size 200
