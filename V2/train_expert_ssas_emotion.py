@@ -47,6 +47,14 @@ from V2.expert_ssas_emotion_model import (
     target_entropy_loss,
     weighted_mmd_rbf,
 )
+from V2.trial_supcon import (
+    BalancedTrialBatchSampler,
+    HierarchicalWeightedSupConLoss,
+    TrialWindowDataset,
+    confidence_weighted_aggregate,
+    flatten_trial_batch,
+    trial_weight_entropy,
+)
 
 
 def set_global_seed(seed: int, deterministic: bool = False) -> None:
@@ -488,6 +496,49 @@ def create_val_loader(
         worker_init_fn=seed_worker,
     )
     return dataset, loader
+
+
+def create_trial_loader_from_window_dataset(
+    window_dataset: DomainAwareCompetitionDataset,
+    num_windows_per_trial: int,
+    num_workers: int,
+    train: bool,
+    trial_batch_per_class: int = 2,
+    seed: int = 42,
+) -> tuple[TrialWindowDataset, DataLoader]:
+    trial_dataset = TrialWindowDataset(
+        window_dataset,
+        num_windows_per_trial=num_windows_per_trial,
+        train=train,
+    )
+    if train:
+        batch_sampler = BalancedTrialBatchSampler(
+            trial_dataset,
+            trials_per_class=trial_batch_per_class,
+            num_classes=4,
+            seed=seed,
+        )
+        loader = DataLoader(
+            trial_dataset,
+            batch_sampler=batch_sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+            collate_fn=dict_collate,
+            worker_init_fn=seed_worker,
+        )
+    else:
+        batch_size = max(1, int(trial_batch_per_class) * 4)
+        loader = DataLoader(
+            trial_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            collate_fn=dict_collate,
+            worker_init_fn=seed_worker,
+        )
+    return trial_dataset, loader
 
 
 def create_target_loader(
@@ -1058,6 +1109,380 @@ def stage2_subject_ranking_loss(
     if not loss_terms:
         return mix_prob.new_tensor(0.0)
     return torch.stack(loss_terms).mean()
+
+
+def supcon_lambda_for_epoch(
+    epoch: int,
+    lambda_supcon: float,
+    warmup_epochs: int,
+    ramp_epochs: int,
+) -> float:
+    if int(epoch) <= int(warmup_epochs):
+        return 0.0
+    progress = min(1.0, (int(epoch) - int(warmup_epochs)) / max(int(ramp_epochs), 1))
+    return float(lambda_supcon) * float(progress)
+
+
+def _trial_supcon_metrics_from_lists(
+    *,
+    losses: dict[str, float],
+    total_trials: int,
+    all_trial_labels: list[int],
+    all_trial_preds: list[int],
+    all_window_labels: list[int],
+    all_window_preds: list[int],
+    all_diag_labels: list[int],
+    all_diag_preds: list[int],
+    conf_sum: float,
+    conf_count: int,
+    max_conf: float,
+    weight_entropy_sum: float,
+) -> dict:
+    trial_cm = confusion_matrix(all_trial_labels, all_trial_preds, labels=[0, 1]) if all_trial_labels else np.zeros((2, 2), dtype=int)
+    window_cm = confusion_matrix(all_window_labels, all_window_preds, labels=[0, 1]) if all_window_labels else np.zeros((2, 2), dtype=int)
+    diag_cm = confusion_matrix(all_diag_labels, all_diag_preds, labels=[0, 1]) if all_diag_labels else np.zeros((2, 2), dtype=int)
+    p, r, f1, support = precision_recall_fscore_support(
+        all_trial_labels,
+        all_trial_preds,
+        labels=[0, 1],
+        zero_division=0,
+    )
+    per_class = {
+        int(cls): {
+            "precision": float(p[i]),
+            "recall": float(r[i]),
+            "f1": float(f1[i]),
+            "support": int(support[i]),
+        }
+        for i, cls in enumerate([0, 1])
+    }
+    trial_acc = accuracy_score(all_trial_labels, all_trial_preds) if all_trial_labels else 0.0
+    trial_macro_f1 = f1_score(all_trial_labels, all_trial_preds, average="macro", labels=[0, 1], zero_division=0) if all_trial_labels else 0.0
+    window_acc = accuracy_score(all_window_labels, all_window_preds) if all_window_labels else 0.0
+    window_macro_f1 = f1_score(all_window_labels, all_window_preds, average="macro", labels=[0, 1], zero_division=0) if all_window_labels else 0.0
+    diag_acc = accuracy_score(all_diag_labels, all_diag_preds) if all_diag_labels else 0.0
+    diag_macro_f1 = f1_score(all_diag_labels, all_diag_preds, average="macro", labels=[0, 1], zero_division=0) if all_diag_labels else 0.0
+
+    metrics = {
+        key: value / max(total_trials, 1)
+        for key, value in losses.items()
+    }
+    metrics.update(
+        {
+            "trial_acc": trial_acc,
+            "trial_macro_f1": trial_macro_f1,
+            "trial_confusion_matrix": trial_cm,
+            "window_acc": window_acc,
+            "window_macro_f1": window_macro_f1,
+            "window_confusion_matrix": window_cm,
+            "diag_acc": diag_acc,
+            "diag_macro_f1": diag_macro_f1,
+            "diag_confusion_matrix": diag_cm,
+            "mean_conf": conf_sum / max(conf_count, 1),
+            "max_conf": max_conf,
+            "mean_trial_weight_entropy": weight_entropy_sum / max(total_trials, 1),
+            "per_class_emo": per_class,
+        }
+    )
+    # Compatibility aliases for existing history, checkpoint and print code.
+    metrics["segment_acc"] = metrics["window_acc"]
+    metrics["segment_macro_f1"] = metrics["window_macro_f1"]
+    metrics["segment_confusion_matrix"] = metrics["window_confusion_matrix"]
+    metrics["emotion_acc"] = metrics["trial_acc"]
+    metrics["emotion_macro_f1"] = metrics["trial_macro_f1"]
+    metrics["acc"] = metrics["trial_acc"]
+    metrics["acc_2cls"] = metrics["trial_acc"]
+    metrics["macro_f1"] = metrics["trial_macro_f1"]
+    metrics["trial_emotion_acc"] = metrics["trial_acc"]
+    metrics["trial_emotion_macro_f1"] = metrics["trial_macro_f1"]
+    metrics["topk_trial_acc"] = metrics["trial_acc"]
+    metrics["topk_trial_macro_f1"] = metrics["trial_macro_f1"]
+    metrics["topk_trial_confusion_matrix"] = metrics["trial_confusion_matrix"]
+    return metrics
+
+
+def train_stage2_trial_supcon_one_epoch(
+    model: Stage2ExpertEmotionAdaptationModel,
+    source_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    supcon_loss_fn: HierarchicalWeightedSupConLoss,
+    current_epoch: int,
+    tau_conf: float = 0.5,
+    conf_gamma: float = 0.6,
+    detach_conf: bool = True,
+    lambda_trial_ce: float = 1.0,
+    lambda_window_ce: float = 0.3,
+    lambda_diag_ce: float = 0.3,
+    lambda_supcon: float = 0.03,
+    supcon_warmup_epochs: int = 5,
+    supcon_ramp_epochs: int = 5,
+    source_de_mu: Optional[dict[str, torch.Tensor]] = None,
+    source_de_std: Optional[dict[str, torch.Tensor]] = None,
+    source_bio_mu: Optional[dict[str, torch.Tensor]] = None,
+    source_bio_std: Optional[dict[str, torch.Tensor]] = None,
+) -> dict:
+    model.train()
+    supcon_loss_fn.train()
+    sampler = getattr(source_loader, "batch_sampler", None)
+    if hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(current_epoch)
+
+    lambda_supcon_current = supcon_lambda_for_epoch(
+        current_epoch,
+        lambda_supcon=lambda_supcon,
+        warmup_epochs=supcon_warmup_epochs,
+        ramp_epochs=supcon_ramp_epochs,
+    )
+    losses = defaultdict(float)
+    total_trials = 0
+    conf_sum = 0.0
+    conf_count = 0
+    max_conf = 0.0
+    weight_entropy_sum = 0.0
+    all_trial_labels: list[int] = []
+    all_trial_preds: list[int] = []
+    all_window_labels: list[int] = []
+    all_window_preds: list[int] = []
+    all_diag_labels: list[int] = []
+    all_diag_preds: list[int] = []
+
+    pbar = tqdm(source_loader, desc="Stage2-TrialSupCon-Train", leave=False)
+    for source_batch in pbar:
+        source_batch = move_batch_to_device(source_batch, device)
+        flat_batch, bsz, num_windows = flatten_trial_batch(source_batch)
+
+        optimizer.zero_grad(set_to_none=True)
+        source_rel_kwargs = get_subject_relative_kwargs(
+            flat_batch,
+            device,
+            dtype=flat_batch["de_feat"].dtype,
+            de_mu=source_de_mu,
+            de_std=source_de_std,
+            bio_mu=source_bio_mu,
+            bio_std=source_bio_std,
+        )
+        out = model(
+            flat_batch["x"],
+            flat_batch["de_feat"],
+            lambda_subject=0.0,
+            **source_rel_kwargs,
+        )
+
+        emotion_label = source_batch["emotion_label"].long()
+        diagnosis_label = source_batch["diagnosis_label"].long()
+        label4 = source_batch["label4"].long()
+        subject_id = source_batch["subject_id"].long()
+        emotion_label_window = emotion_label.repeat_interleave(num_windows)
+        diagnosis_label_window = diagnosis_label.repeat_interleave(num_windows)
+
+        z_emo_flat = out["z_emo"]
+        window_logits_flat = out["emotion_logits"]
+        diag_logits_flat = out["diagnosis_logits"]
+        z_window = z_emo_flat.reshape(bsz, num_windows, z_emo_flat.size(-1))
+        logits_window = window_logits_flat.reshape(bsz, num_windows, window_logits_flat.size(-1))
+
+        z_trial, trial_weight, trial_conf = confidence_weighted_aggregate(
+            z_window,
+            logits_window,
+            tau_conf=tau_conf,
+            gamma=conf_gamma,
+            detach_conf=detach_conf,
+        )
+        trial_logits = model.trial_emotion_head(z_trial)
+
+        loss_trial_ce = F.cross_entropy(trial_logits, emotion_label)
+        loss_window_ce = F.cross_entropy(window_logits_flat, emotion_label_window)
+        loss_diag_ce = F.cross_entropy(diag_logits_flat, diagnosis_label_window)
+        if lambda_supcon_current > 0:
+            loss_supcon = supcon_loss_fn(
+                z_trial=z_trial,
+                label4=label4,
+                emotion_label=emotion_label,
+                diagnosis_label=diagnosis_label,
+                subject_id=subject_id,
+            )
+        else:
+            loss_supcon = z_trial.new_tensor(0.0)
+        loss = (
+            float(lambda_trial_ce) * loss_trial_ce
+            + float(lambda_window_ce) * loss_window_ce
+            + float(lambda_diag_ce) * loss_diag_ce
+            + float(lambda_supcon_current) * loss_supcon
+        )
+        loss.backward()
+        optimizer.step()
+
+        with torch.no_grad():
+            trial_pred = trial_logits.argmax(dim=1)
+            window_pred = window_logits_flat.argmax(dim=1)
+            diag_pred = diag_logits_flat.argmax(dim=1)
+            entropy = trial_weight_entropy(trial_weight)
+
+        total_trials += bsz
+        for key, value in {
+            "loss": loss,
+            "loss_trial_ce": loss_trial_ce,
+            "loss_window_ce": loss_window_ce,
+            "loss_diag_ce": loss_diag_ce,
+            "loss_supcon": loss_supcon,
+        }.items():
+            losses[key] += float(value.item()) * bsz
+        losses["lambda_supcon_current"] += float(lambda_supcon_current) * bsz
+        conf_sum += float(trial_conf.sum().item())
+        conf_count += int(trial_conf.numel())
+        max_conf = max(max_conf, float(trial_conf.max().item()))
+        weight_entropy_sum += float(entropy.sum().item())
+
+        all_trial_labels.extend(emotion_label.detach().cpu().tolist())
+        all_trial_preds.extend(trial_pred.detach().cpu().tolist())
+        all_window_labels.extend(emotion_label_window.detach().cpu().tolist())
+        all_window_preds.extend(window_pred.detach().cpu().tolist())
+        all_diag_labels.extend(diagnosis_label_window.detach().cpu().tolist())
+        all_diag_preds.extend(diag_pred.detach().cpu().tolist())
+
+        pbar.set_postfix(
+            {
+                "loss": f"{losses['loss'] / max(total_trials, 1):.4f}",
+                "trial": f"{losses['loss_trial_ce'] / max(total_trials, 1):.4f}",
+                "win": f"{losses['loss_window_ce'] / max(total_trials, 1):.4f}",
+                "sup": f"{losses['loss_supcon'] / max(total_trials, 1):.4f}",
+                "lam": f"{lambda_supcon_current:.4f}",
+            }
+        )
+
+    if total_trials == 0:
+        raise RuntimeError("Stage2 trial source loader is empty: total_trials == 0.")
+    return _trial_supcon_metrics_from_lists(
+        losses=dict(losses),
+        total_trials=total_trials,
+        all_trial_labels=all_trial_labels,
+        all_trial_preds=all_trial_preds,
+        all_window_labels=all_window_labels,
+        all_window_preds=all_window_preds,
+        all_diag_labels=all_diag_labels,
+        all_diag_preds=all_diag_preds,
+        conf_sum=conf_sum,
+        conf_count=conf_count,
+        max_conf=max_conf,
+        weight_entropy_sum=weight_entropy_sum,
+    )
+
+
+@torch.no_grad()
+def validate_stage2_trial_supcon(
+    model: Stage2ExpertEmotionAdaptationModel,
+    val_loader: DataLoader,
+    device: torch.device,
+    tau_conf: float = 0.5,
+    conf_gamma: float = 0.6,
+    detach_conf: bool = True,
+    lambda_trial_ce: float = 1.0,
+    lambda_window_ce: float = 0.3,
+    lambda_diag_ce: float = 0.3,
+    val_de_mu: Optional[dict[str, torch.Tensor]] = None,
+    val_de_std: Optional[dict[str, torch.Tensor]] = None,
+    val_bio_mu: Optional[dict[str, torch.Tensor]] = None,
+    val_bio_std: Optional[dict[str, torch.Tensor]] = None,
+) -> dict:
+    model.eval()
+    losses = defaultdict(float)
+    total_trials = 0
+    conf_sum = 0.0
+    conf_count = 0
+    max_conf = 0.0
+    weight_entropy_sum = 0.0
+    all_trial_labels: list[int] = []
+    all_trial_preds: list[int] = []
+    all_window_labels: list[int] = []
+    all_window_preds: list[int] = []
+    all_diag_labels: list[int] = []
+    all_diag_preds: list[int] = []
+
+    for batch in tqdm(val_loader, desc="Stage2-TrialSupCon-Val", leave=False):
+        batch = move_batch_to_device(batch, device)
+        flat_batch, bsz, num_windows = flatten_trial_batch(batch)
+        val_rel_kwargs = get_subject_relative_kwargs(
+            flat_batch,
+            device,
+            dtype=flat_batch["de_feat"].dtype,
+            de_mu=val_de_mu,
+            de_std=val_de_std,
+            bio_mu=val_bio_mu,
+            bio_std=val_bio_std,
+        )
+        out = model(flat_batch["x"], flat_batch["de_feat"], lambda_subject=0.0, **val_rel_kwargs)
+
+        emotion_label = batch["emotion_label"].long()
+        diagnosis_label = batch["diagnosis_label"].long()
+        emotion_label_window = emotion_label.repeat_interleave(num_windows)
+        diagnosis_label_window = diagnosis_label.repeat_interleave(num_windows)
+
+        z_emo_flat = out["z_emo"]
+        window_logits_flat = out["emotion_logits"]
+        diag_logits_flat = out["diagnosis_logits"]
+        z_window = z_emo_flat.reshape(bsz, num_windows, z_emo_flat.size(-1))
+        logits_window = window_logits_flat.reshape(bsz, num_windows, window_logits_flat.size(-1))
+        z_trial, trial_weight, trial_conf = confidence_weighted_aggregate(
+            z_window,
+            logits_window,
+            tau_conf=tau_conf,
+            gamma=conf_gamma,
+            detach_conf=detach_conf,
+        )
+        trial_logits = model.trial_emotion_head(z_trial)
+
+        loss_trial_ce = F.cross_entropy(trial_logits, emotion_label)
+        loss_window_ce = F.cross_entropy(window_logits_flat, emotion_label_window)
+        loss_diag_ce = F.cross_entropy(diag_logits_flat, diagnosis_label_window)
+        loss_supcon = z_trial.new_tensor(0.0)
+        loss = (
+            float(lambda_trial_ce) * loss_trial_ce
+            + float(lambda_window_ce) * loss_window_ce
+            + float(lambda_diag_ce) * loss_diag_ce
+        )
+
+        trial_pred = trial_logits.argmax(dim=1)
+        window_pred = window_logits_flat.argmax(dim=1)
+        diag_pred = diag_logits_flat.argmax(dim=1)
+        entropy = trial_weight_entropy(trial_weight)
+
+        total_trials += bsz
+        for key, value in {
+            "loss": loss,
+            "loss_trial_ce": loss_trial_ce,
+            "loss_window_ce": loss_window_ce,
+            "loss_diag_ce": loss_diag_ce,
+            "loss_supcon": loss_supcon,
+        }.items():
+            losses[key] += float(value.item()) * bsz
+        losses["lambda_supcon_current"] += 0.0
+        conf_sum += float(trial_conf.sum().item())
+        conf_count += int(trial_conf.numel())
+        max_conf = max(max_conf, float(trial_conf.max().item()))
+        weight_entropy_sum += float(entropy.sum().item())
+
+        all_trial_labels.extend(emotion_label.detach().cpu().tolist())
+        all_trial_preds.extend(trial_pred.detach().cpu().tolist())
+        all_window_labels.extend(emotion_label_window.detach().cpu().tolist())
+        all_window_preds.extend(window_pred.detach().cpu().tolist())
+        all_diag_labels.extend(diagnosis_label_window.detach().cpu().tolist())
+        all_diag_preds.extend(diag_pred.detach().cpu().tolist())
+
+    return _trial_supcon_metrics_from_lists(
+        losses=dict(losses),
+        total_trials=total_trials,
+        all_trial_labels=all_trial_labels,
+        all_trial_preds=all_trial_preds,
+        all_window_labels=all_window_labels,
+        all_window_preds=all_window_preds,
+        all_diag_labels=all_diag_labels,
+        all_diag_preds=all_diag_preds,
+        conf_sum=conf_sum,
+        conf_count=conf_count,
+        max_conf=max_conf,
+        weight_entropy_sum=weight_entropy_sum,
+    )
 
 
 def train_stage2_one_epoch(
@@ -1852,7 +2277,7 @@ def apply_subject_topk(trial_records: list[dict], k_pos: int = 4) -> list[dict]:
     return sorted(results, key=lambda x: (str(x["user_id"]), int(x["trial_id"])))
 
 
-def build_stage2_best_trackers() -> dict:
+def build_stage2_best_trackers(prefer_trial: bool = False) -> dict:
     def tracker(criteria):
         return {
             "criteria": criteria,
@@ -1862,6 +2287,53 @@ def build_stage2_best_trackers() -> dict:
             "checkpoint_path": None,
             "metrics_json_path": None,
             "summary_csv_path": None,
+        }
+
+    if prefer_trial:
+        trial_first = [
+            ("trial_macro_f1", "max"),
+            ("trial_acc", "max"),
+            ("window_macro_f1", "max"),
+            ("window_acc", "max"),
+            ("diag_macro_f1", "max"),
+            ("diag_acc", "max"),
+            ("loss", "min"),
+        ]
+        trial_acc_first = [
+            ("trial_acc", "max"),
+            ("trial_macro_f1", "max"),
+            ("window_acc", "max"),
+            ("loss", "min"),
+        ]
+        return {
+            "combined": tracker(trial_first),
+            "topk_trial_f1": tracker(trial_first),
+            "topk_trial_acc": tracker(trial_acc_first),
+            "trial_f1": tracker(trial_first),
+            "trial_acc": tracker(trial_acc_first),
+            "segment_emo_f1": tracker(
+                [
+                    ("window_macro_f1", "max"),
+                    ("window_acc", "max"),
+                    ("trial_macro_f1", "max"),
+                    ("loss", "min"),
+                ]
+            ),
+            "diag_f1": tracker(
+                [
+                    ("diag_macro_f1", "max"),
+                    ("diag_acc", "max"),
+                    ("trial_macro_f1", "max"),
+                    ("loss", "min"),
+                ]
+            ),
+            "loss": tracker(
+                [
+                    ("loss", "min"),
+                    ("trial_macro_f1", "max"),
+                    ("window_macro_f1", "max"),
+                ]
+            ),
         }
 
     return {
@@ -2281,6 +2753,34 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
         drop_last=False,
         normalize_test=not args.no_normalize,
     )
+    source_trial_dataset = source_trial_loader = None
+    val_trial_dataset = val_trial_loader = None
+    if args.use_trial_supcon:
+        source_trial_dataset, source_trial_loader = create_trial_loader_from_window_dataset(
+            source_dataset,
+            num_windows_per_trial=args.num_windows_per_trial,
+            num_workers=args.num_workers,
+            train=True,
+            trial_batch_per_class=args.trial_batch_per_class,
+            seed=run_seed,
+        )
+        val_trial_dataset, val_trial_loader = create_trial_loader_from_window_dataset(
+            val_dataset,
+            num_windows_per_trial=args.num_windows_per_trial,
+            num_workers=args.num_workers,
+            train=False,
+            trial_batch_per_class=args.trial_batch_per_class,
+            seed=run_seed,
+        )
+        train_trial_counts = Counter(int(g["label4"]) for g in source_trial_dataset.trial_groups)
+        val_trial_counts = Counter(int(g["label4"]) for g in val_trial_dataset.trial_groups)
+        print(
+            "[V2_conf_trial_supcon] enabled: "
+            f"K={args.num_windows_per_trial}, trial_batch_per_class={args.trial_batch_per_class}, "
+            f"train_trials={len(source_trial_dataset)}, val_trials={len(val_trial_dataset)}, "
+            f"train_label4_counts={dict(sorted(train_trial_counts.items()))}, "
+            f"val_label4_counts={dict(sorted(val_trial_counts.items()))}"
+        )
 
     use_subject_relative_de = bool(not args.no_subject_relative_de)
     use_subject_relative_bio = bool((not args.no_subject_relative_bio) and (not args.no_biomarkers))
@@ -2533,9 +3033,22 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
     if not args.no_stage1_init:
         load_stage1_encoder_into_stage2(stage1, stage2)
 
-    optimizer2 = torch.optim.AdamW(stage2.parameters(), lr=args.lr_stage2, weight_decay=args.weight_decay)
+    supcon_loss_fn = None
+    optimizer2_params = list(stage2.parameters())
+    if args.use_trial_supcon:
+        supcon_loss_fn = HierarchicalWeightedSupConLoss(
+            in_dim=stage2.in_dim,
+            proj_dim=args.supcon_proj_dim,
+            temperature=args.supcon_temperature,
+            same_label4_weight=args.supcon_same_label4_weight,
+            same_emotion_diff_diag_weight=args.supcon_same_emotion_diff_diag_weight,
+            same_subject_weight=args.supcon_same_subject_weight,
+        ).to(device)
+        optimizer2_params += list(supcon_loss_fn.parameters())
+
+    optimizer2 = torch.optim.AdamW(optimizer2_params, lr=args.lr_stage2, weight_decay=args.weight_decay)
     scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer2, T_max=max(args.stage2_epochs, 1))
-    best_trackers = build_stage2_best_trackers()
+    best_trackers = build_stage2_best_trackers(prefer_trial=args.use_trial_supcon)
     stage2_early_stop_track = args.stage2_early_stop_track
     if stage2_early_stop_track not in best_trackers:
         print(f"[Stage2 EarlyStop] track={stage2_early_stop_track} not found, fallback to topk_trial_f1")
@@ -2556,48 +3069,88 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
     last_stage2_epoch = 0
 
     for epoch in range(1, args.stage2_epochs + 1):
-        train_metrics = train_stage2_one_epoch(
-            stage2,
-            source_loader,
-            target_train_loader,
-            optimizer2,
-            device,
-            source_subject_weights=source_weights,
-            num_source_subjects=len(domain_mapping["source_subjects"]),
-            lambda_expert=args.lambda_expert,
-            lambda_mix=args.lambda_mix,
-            lambda_diag=args.lambda_diag,
-            lambda_mmd=args.stage2_lambda_mmd,
-            lambda_subject=args.lambda_subject,
-            grl_subject=args.grl_subject,
-            lambda_ent=args.lambda_ent,
-            lambda_mdc=args.lambda_mdc,
-            lambda_rank=args.lambda_rank,
-            rank_margin=args.rank_margin,
-            rank_warmup_epochs=args.rank_warmup_epochs,
-            rank_max_pairs_per_subject=args.rank_max_pairs_per_subject,
-            current_epoch=epoch,
-            source_de_mu=source_de_mu,
-            source_de_std=source_de_std,
-            source_bio_mu=source_bio_mu,
-            source_bio_std=source_bio_std,
-            target_de_mu=target_de_mu,
-            target_de_std=target_de_std,
-            target_bio_mu=target_bio_mu,
-            target_bio_std=target_bio_std,
-        )
-        val_metrics = validate_stage2_trial_level(
-            stage2,
-            val_loader,
-            device,
-            threshold=args.threshold,
-            k_pos=args.k_pos,
-            lambda_diag=args.lambda_diag,
-            val_de_mu=val_de_mu,
-            val_de_std=val_de_std,
-            val_bio_mu=val_bio_mu,
-            val_bio_std=val_bio_std,
-        )
+        if args.use_trial_supcon:
+            if source_trial_loader is None or val_trial_loader is None or supcon_loss_fn is None:
+                raise RuntimeError("Trial SupCon loaders/loss were not initialized.")
+            train_metrics = train_stage2_trial_supcon_one_epoch(
+                stage2,
+                source_trial_loader,
+                optimizer2,
+                device,
+                supcon_loss_fn=supcon_loss_fn,
+                current_epoch=epoch,
+                tau_conf=args.tau_conf,
+                conf_gamma=args.conf_gamma,
+                detach_conf=not args.no_detach_conf,
+                lambda_trial_ce=args.lambda_trial_ce,
+                lambda_window_ce=args.lambda_window_ce,
+                lambda_diag_ce=args.lambda_diag_ce,
+                lambda_supcon=args.lambda_supcon,
+                supcon_warmup_epochs=args.supcon_warmup_epochs,
+                supcon_ramp_epochs=args.supcon_ramp_epochs,
+                source_de_mu=source_de_mu,
+                source_de_std=source_de_std,
+                source_bio_mu=source_bio_mu,
+                source_bio_std=source_bio_std,
+            )
+            val_metrics = validate_stage2_trial_supcon(
+                stage2,
+                val_trial_loader,
+                device,
+                tau_conf=args.tau_conf,
+                conf_gamma=args.conf_gamma,
+                detach_conf=not args.no_detach_conf,
+                lambda_trial_ce=args.lambda_trial_ce,
+                lambda_window_ce=args.lambda_window_ce,
+                lambda_diag_ce=args.lambda_diag_ce,
+                val_de_mu=val_de_mu,
+                val_de_std=val_de_std,
+                val_bio_mu=val_bio_mu,
+                val_bio_std=val_bio_std,
+            )
+        else:
+            train_metrics = train_stage2_one_epoch(
+                stage2,
+                source_loader,
+                target_train_loader,
+                optimizer2,
+                device,
+                source_subject_weights=source_weights,
+                num_source_subjects=len(domain_mapping["source_subjects"]),
+                lambda_expert=args.lambda_expert,
+                lambda_mix=args.lambda_mix,
+                lambda_diag=args.lambda_diag,
+                lambda_mmd=args.stage2_lambda_mmd,
+                lambda_subject=args.lambda_subject,
+                grl_subject=args.grl_subject,
+                lambda_ent=args.lambda_ent,
+                lambda_mdc=args.lambda_mdc,
+                lambda_rank=args.lambda_rank,
+                rank_margin=args.rank_margin,
+                rank_warmup_epochs=args.rank_warmup_epochs,
+                rank_max_pairs_per_subject=args.rank_max_pairs_per_subject,
+                current_epoch=epoch,
+                source_de_mu=source_de_mu,
+                source_de_std=source_de_std,
+                source_bio_mu=source_bio_mu,
+                source_bio_std=source_bio_std,
+                target_de_mu=target_de_mu,
+                target_de_std=target_de_std,
+                target_bio_mu=target_bio_mu,
+                target_bio_std=target_bio_std,
+            )
+            val_metrics = validate_stage2_trial_level(
+                stage2,
+                val_loader,
+                device,
+                threshold=args.threshold,
+                k_pos=args.k_pos,
+                lambda_diag=args.lambda_diag,
+                val_de_mu=val_de_mu,
+                val_de_std=val_de_std,
+                val_bio_mu=val_bio_mu,
+                val_bio_std=val_bio_std,
+            )
         scheduler2.step()
         row = {"epoch": epoch, "lr": optimizer2.param_groups[0]["lr"]}
         row.update(flatten_metrics_for_csv("train", train_metrics))
@@ -2606,14 +3159,33 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
         last_stage2_train_metrics = copy.deepcopy(train_metrics)
         last_stage2_val_metrics = copy.deepcopy(val_metrics)
         last_stage2_epoch = epoch
-        print(
-            f"[Stage2] epoch={epoch} loss={train_metrics['loss']:.4f} "
-            f"train_emo_f1={train_metrics['emotion_macro_f1']:.4f} "
-            f"train_diag_f1={train_metrics['diag_macro_f1']:.4f} "
-            f"rank={train_metrics.get('loss_rank', 0.0):.4f} "
-            f"val_trial_f1={val_metrics['trial_macro_f1']:.4f} val_trial_acc={val_metrics['trial_acc']:.4f} "
-            f"val_topk_f1={val_metrics['topk_trial_macro_f1']:.4f} val_topk_acc={val_metrics['topk_trial_acc']:.4f}"
-        )
+        if args.use_trial_supcon:
+            print(
+                f"[Stage2 V2_conf_trial_supcon] epoch={epoch} loss={train_metrics['loss']:.4f} "
+                f"trial_ce={train_metrics['loss_trial_ce']:.4f} "
+                f"window_ce={train_metrics['loss_window_ce']:.4f} "
+                f"diag_ce={train_metrics['loss_diag_ce']:.4f} "
+                f"supcon={train_metrics['loss_supcon']:.4f} "
+                f"lambda_sup={train_metrics['lambda_supcon_current']:.4f} "
+                f"train_trial_f1={train_metrics['trial_macro_f1']:.4f} "
+                f"train_trial_acc={train_metrics['trial_acc']:.4f} "
+                f"train_window_acc={train_metrics['window_acc']:.4f} "
+                f"mean_conf={train_metrics['mean_conf']:.4f} "
+                f"weight_ent={train_metrics['mean_trial_weight_entropy']:.4f} "
+                f"val_trial_f1={val_metrics['trial_macro_f1']:.4f} "
+                f"val_trial_acc={val_metrics['trial_acc']:.4f} "
+                f"val_window_acc={val_metrics['window_acc']:.4f}"
+            )
+            print(f"[Stage2 V2_conf_trial_supcon] val_trial_confusion_matrix=\n{val_metrics['trial_confusion_matrix']}")
+        else:
+            print(
+                f"[Stage2] epoch={epoch} loss={train_metrics['loss']:.4f} "
+                f"train_emo_f1={train_metrics['emotion_macro_f1']:.4f} "
+                f"train_diag_f1={train_metrics['diag_macro_f1']:.4f} "
+                f"rank={train_metrics.get('loss_rank', 0.0):.4f} "
+                f"val_trial_f1={val_metrics['trial_macro_f1']:.4f} val_trial_acc={val_metrics['trial_acc']:.4f} "
+                f"val_topk_f1={val_metrics['topk_trial_macro_f1']:.4f} val_topk_acc={val_metrics['topk_trial_acc']:.4f}"
+            )
 
         if epoch <= args.save_warmup_epochs:
             print(f"[Stage2] skip best checkpoint during save warmup ({epoch}/{args.save_warmup_epochs})")
@@ -2641,6 +3213,8 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
                             "raw_source_subject_weights": raw_source_weights,
                             "source_weight_mode": source_weight_mode,
                             "source_weight_vote": vote_result,
+                            "trial_supcon_enabled": bool(args.use_trial_supcon),
+                            "trial_supcon_version": "V2_conf_trial_supcon" if args.use_trial_supcon else None,
                         },
                     )
                     tracker["best_metrics"] = copy.deepcopy(val_metrics)
@@ -2718,6 +3292,8 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
                 "raw_source_subject_weights": raw_source_weights,
                 "source_weight_mode": source_weight_mode,
                 "source_weight_vote": vote_result,
+                "trial_supcon_enabled": bool(args.use_trial_supcon),
+                "trial_supcon_version": "V2_conf_trial_supcon" if args.use_trial_supcon else None,
             },
         )
 
@@ -2824,6 +3400,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bio_abs_scale", type=float, default=0.3)
     parser.add_argument("--relative_eps", type=float, default=1e-6)
     parser.add_argument("--use_raw_diagnosis_label", action="store_true")
+    parser.add_argument("--use_trial_supcon", action="store_true")
+    parser.add_argument("--num_windows_per_trial", type=int, default=5)
+    parser.add_argument("--trial_batch_per_class", type=int, default=2)
+    parser.add_argument("--tau_conf", type=float, default=0.5)
+    parser.add_argument("--conf_gamma", type=float, default=0.6)
+    parser.add_argument("--detach_conf", dest="no_detach_conf", action="store_false")
+    parser.add_argument("--no_detach_conf", action="store_true")
+    parser.set_defaults(no_detach_conf=False)
+    parser.add_argument("--lambda_trial_ce", type=float, default=1.0)
+    parser.add_argument("--lambda_window_ce", type=float, default=0.3)
+    parser.add_argument("--lambda_diag_ce", type=float, default=0.3)
+    parser.add_argument("--lambda_supcon", type=float, default=0.03)
+    parser.add_argument("--supcon_temperature", type=float, default=0.1)
+    parser.add_argument("--supcon_proj_dim", type=int, default=64)
+    parser.add_argument("--supcon_warmup_epochs", type=int, default=5)
+    parser.add_argument("--supcon_ramp_epochs", type=int, default=5)
+    parser.add_argument("--supcon_same_label4_weight", type=float, default=1.0)
+    parser.add_argument("--supcon_same_emotion_diff_diag_weight", type=float, default=0.25)
+    parser.add_argument("--supcon_same_subject_weight", type=float, default=0.0)
 
     parser.add_argument("--lambda_domain", type=float, default=1.0)
     parser.add_argument("--stage1_lambda_mmd", type=float, default=0.03)
@@ -2893,6 +3488,9 @@ def get_v2_seed_for_repeat(repeat: int) -> int:
 
 def main() -> None:
     args = parse_args()
+    if args.use_trial_supcon and args.save_root == "model_params/V2_expert_ssas":
+        args.save_root = "model_params/V2_conf_trial_supcon"
+        print(f"[V2_conf_trial_supcon] save_root default switched to {args.save_root}")
     repeats = range(len(config.V2_seed)) if args.all_repeats else [args.repeat]
     folds = range(args.n_splits) if args.all_folds else [args.fold]
     results = []

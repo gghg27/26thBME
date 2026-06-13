@@ -235,17 +235,22 @@ class Stage1SSASSourceSelectionModel(nn.Module):
         z_diag_feat = enc.get("z_diag", enc["z"])
         z_emo_grl = grad_reverse(z_emotion, lambda_emo) if lambda_emo > 0 else z_emotion
         z_diag_grl = grad_reverse(z_diag_feat, lambda_diag) if lambda_diag > 0 else z_diag_feat
+        emotion_logits_grl = self.emotion_head(z_emo_grl)
+        diagnosis_logits_grl = self.diagnosis_head(z_diag_grl)
 
         out = dict(enc)
         out.update(
             {
                 "z": z_emotion,
                 "z_emotion": z_emotion,
+                "z_emo": z_emotion,
                 "z_diag": z_diag_feat,
                 "z_mmd": self.mmd_head(z_emotion),
                 "domain_logits": self.domain_head(z_emotion, lambda_grl=0.0),
-                "emotion_logits_grl": self.emotion_head(z_emo_grl),
-                "diagnosis_logits_grl": self.diagnosis_head(z_diag_grl),
+                "emotion_logits_grl": emotion_logits_grl,
+                "diagnosis_logits_grl": diagnosis_logits_grl,
+                "emotion_logits": emotion_logits_grl,
+                "diagnosis_logits": diagnosis_logits_grl,
             }
         )
         return out
@@ -333,6 +338,11 @@ class Stage2ExpertEmotionAdaptationModel(nn.Module):
             dropout=dropout,
         )
 
+    def trial_emotion_head(self, z_trial: torch.Tensor) -> torch.Tensor:
+        """Trial-level SupCon branch reuses the shared emotion head on z_emo."""
+
+        return self.shared_emotion_head(z_trial)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -365,9 +375,11 @@ class Stage2ExpertEmotionAdaptationModel(nn.Module):
             {
                 "z": z_emotion,
                 "z_emotion": z_emotion,
+                "z_emo": z_emotion,
                 "z_diag": z_diag_feat,
                 "z_mmd": self.mmd_head(z_emotion),
                 "diag_logits": diag_logits,
+                "diagnosis_logits": diag_logits,
                 "shared_logits": shared_logits,
                 "hc_logits": hc_logits,
                 "dep_logits": dep_logits,
@@ -382,6 +394,7 @@ class Stage2ExpertEmotionAdaptationModel(nn.Module):
                 "prob_dep": prob_dep,
                 "diag_prob": diag_prob,
                 "logits": mix_prob,
+                "emotion_logits": torch.log(mix_prob.clamp_min(1e-8)),
             }
         )
         return out
