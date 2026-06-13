@@ -3634,7 +3634,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.45)
     parser.add_argument("--biomarker_dim", type=int, default=57)
     parser.add_argument("--de_num_bands", type=int, default=5)
-    parser.add_argument("--no_biomarkers", dest="no_biomarkers", action="store_true", default=True)
+    parser.add_argument("--no_biomarkers", dest="no_biomarkers", action="store_true", default=False)
     parser.add_argument("--use_biomarkers", dest="no_biomarkers", action="store_false")
     parser.add_argument("--no_normalize", action="store_true")
     parser.add_argument("--no_subject_relative_de", action="store_true")
@@ -3645,8 +3645,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--arch_variant",
         choices=["base", "A", "B", "C", "D"],
-        default="C",
-        help="Architecture ablation variant: base/A/B/C/D. V5 defaults to C.",
+        default="D",
+        help="Architecture ablation variant: base/A/B/C/D. V5 defaults to D.",
     )
     parser.add_argument("--router_temperature", type=float, default=None)
     parser.add_argument("--diag_label_smoothing", type=float, default=None)
