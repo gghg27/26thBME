@@ -813,10 +813,10 @@ def compute_source_weights_by_classification_voting(
     domain_mapping: dict,
     device: torch.device,
     save_dir: str | Path,
-    smooth: float = 5.0,
+    smooth: float = 1.0,
     vote_level: str = "trial",
     vote_mode: str = "soft",
-    tau_vote: float = 1.0,
+    tau_vote: float = 0.7,
     confidence_power: float = 1.0,
     save_topk_probs: int = 5,
     target_de_mu: Optional[dict[str, torch.Tensor]] = None,
@@ -1442,7 +1442,7 @@ def train_stage2_one_epoch(
     num_source_subjects: int,
     lambda_expert: float = 0.5,
     lambda_mix: float = 1.0,
-    lambda_diag: float = 0.02,
+    lambda_diag: float = 0.03,
     diag_label_smoothing: float = 0.0,
     lambda_mmd: float = 0.0003,
     lambda_cond_mmd: float = 0.0,
@@ -1457,7 +1457,7 @@ def train_stage2_one_epoch(
     rank_margin: float = 0.2,
     rank_warmup_epochs: int = 3,
     rank_max_pairs_per_subject: int = 128,
-    rank_trial_pooling: str = "mean",
+    rank_trial_pooling: str = "attn_conf",
     trial_attn_tau: float = 1.0,
     current_epoch: int = 1,
     source_de_mu: Optional[dict[str, torch.Tensor]] = None,
@@ -1985,7 +1985,7 @@ def validate_stage2_trial_level(
     device: torch.device,
     threshold: float = 0.5,
     k_pos: int = 4,
-    lambda_diag: float = 0.02,
+    lambda_diag: float = 0.03,
     diag_label_smoothing: float = 0.0,
     trial_pooling: str = "attn_conf",
     trial_attn_tau: float = 1.0,
@@ -3569,7 +3569,7 @@ def resolve_arch_variant_args(args: argparse.Namespace) -> argparse.Namespace:
             "learnable_graph": False,
         },
         "C": {
-            "router_temperature": 1.5,
+            "router_temperature": 1.0,
             "diag_label_smoothing": 0.05,
             "shared_expert_trunk": True,
             "fusion_mode": "scalar_gated",
@@ -3619,7 +3619,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n_splits", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=0)
     parser.add_argument("--all_repeats", action="store_true")
-    parser.add_argument("--stage1_epochs", type=int, default=5)
+    parser.add_argument("--stage1_epochs", type=int, default=10)
     parser.add_argument("--stage2_epochs", type=int, default=25)
     parser.add_argument("--save_warmup_epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=200)
@@ -3634,7 +3634,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.45)
     parser.add_argument("--biomarker_dim", type=int, default=57)
     parser.add_argument("--de_num_bands", type=int, default=5)
-    parser.add_argument("--no_biomarkers", action="store_true")
+    parser.add_argument("--no_biomarkers", dest="no_biomarkers", action="store_true", default=True)
+    parser.add_argument("--use_biomarkers", dest="no_biomarkers", action="store_false")
     parser.add_argument("--no_normalize", action="store_true")
     parser.add_argument("--no_subject_relative_de", action="store_true")
     parser.add_argument("--no_subject_relative_bio", action="store_true")
@@ -3644,8 +3645,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--arch_variant",
         choices=["base", "A", "B", "C", "D"],
-        default="D",
-        help="Architecture ablation variant: base/A/B/C/D. V5 defaults to D.",
+        default="C",
+        help="Architecture ablation variant: base/A/B/C/D. V5 defaults to C.",
     )
     parser.add_argument("--router_temperature", type=float, default=None)
     parser.add_argument("--diag_label_smoothing", type=float, default=None)
@@ -3657,14 +3658,14 @@ def parse_args() -> argparse.Namespace:
         choices=["concat", "scalar_gated"],
         default=None,
     )
-    parser.add_argument("--bio_gate_init", type=float, default=-2.0)
+    parser.add_argument("--bio_gate_init", type=float, default=-1.0)
     parser.add_argument("--core_gate_init", type=float, default=0.0)
     parser.add_argument("--graph_gate_init", type=float, default=0.0)
     parser.add_argument("--temporal_gate_init", type=float, default=0.0)
     parser.add_argument("--learnable_graph", action="store_true")
     parser.add_argument("--no_learnable_graph", dest="learnable_graph", action="store_false")
     parser.add_argument("--learnable_graph_rank", type=int, default=4)
-    parser.add_argument("--graph_mix_logit_init", type=float, default=2.0)
+    parser.add_argument("--graph_mix_logit_init", type=float, default=0.0)
     parser.add_argument("--learnable_graph_dropout", type=float, default=0.0)
     parser.set_defaults(shared_expert_trunk=None)
     parser.set_defaults(learnable_graph=None)
@@ -3676,10 +3677,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda_diag_grl", type=float, default=0.001)
     parser.add_argument("--grl_diag", type=float, default=0.01)
     parser.add_argument("--lambda_weight_reg", type=float, default=0.0)
-    parser.add_argument("--vote_smooth", type=float, default=5.0)
+    parser.add_argument("--vote_smooth", type=float, default=1.0)
     parser.add_argument("--vote_level", choices=["window", "trial"], default="trial")
     parser.add_argument("--vote_mode", choices=["hard", "soft", "soft_conf"], default="soft")
-    parser.add_argument("--tau_vote", type=float, default=1.0)
+    parser.add_argument("--tau_vote", type=float, default=0.7)
     parser.add_argument("--confidence_power", type=float, default=1.0)
     parser.add_argument("--save_topk_probs", type=int, default=5)
     parser.add_argument("--use_mean_one_source_weights", dest="use_mean_one_source_weights", action="store_true", default=True)
@@ -3689,7 +3690,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--lambda_expert", type=float, default=0.5)
     parser.add_argument("--lambda_mix", type=float, default=1.0)
-    parser.add_argument("--lambda_diag", type=float, default=0.01)
+    parser.add_argument("--lambda_diag", type=float, default=0.03)
     parser.add_argument("--stage2_lambda_mmd", type=float, default=0.0003)
     parser.add_argument("--lambda_cond_mmd", type=float, default=0.0003)
     parser.add_argument("--cond_mmd_warmup_epochs", type=int, default=5)
@@ -3704,7 +3705,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rank_margin", type=float, default=0.2)
     parser.add_argument("--rank_warmup_epochs", type=int, default=3)
     parser.add_argument("--rank_max_pairs_per_subject", type=int, default=128)
-    parser.add_argument("--rank_trial_pooling", choices=["mean", "attn_conf"], default="mean")
+    parser.add_argument("--rank_trial_pooling", choices=["mean", "attn_conf"], default="attn_conf")
     parser.add_argument("--shared_mix_alpha", type=float, default=0.7)
     parser.add_argument("--no_stage1_init", action="store_true")
     parser.add_argument("--no_stage2_early_stop", action="store_true")
@@ -3819,3 +3820,4 @@ if __name__ == "__main__":
     # python3 V5/train_expert_ssas_emotion.py --all_folds --all_repeats --batch_size 200 --test_vote_method soft_topk --k_pos 4
 
     #python3 V5/train_expert_ssas_emotion.py --all_folds --all_repeats --batch_size 200
+    #python3 V5/train_expert_ssas_emotion.py --fold 9 --repeat 0 --batch_size 200
