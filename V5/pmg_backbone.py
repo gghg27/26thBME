@@ -265,6 +265,33 @@ class RegionPLVPMGEncoder(nn.Module):
 
 
 # =========================================================
+# Subject profile
+# =========================================================
+
+class SubjectProfileEncoder(nn.Module):
+    """Lightweight encoder for subject-level baseline statistics."""
+
+    def __init__(self, in_dim: int, out_dim: int = 32, hidden_dim: int = 64, dropout: float = 0.2) -> None:
+        super().__init__()
+        self.out_dim = int(max(out_dim, 0))
+        if self.out_dim > 0:
+            self.net = nn.Sequential(
+                nn.LayerNorm(in_dim),
+                nn.Linear(in_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, self.out_dim),
+            )
+        else:
+            self.net = None
+
+    def forward(self, profile_input: torch.Tensor) -> torch.Tensor:
+        if self.net is None:
+            return profile_input.new_zeros(profile_input.size(0), 0)
+        return self.net(profile_input)
+
+
+# =========================================================
 # Full backbone
 # =========================================================
 
@@ -311,6 +338,9 @@ class BrainGraphBackbone(nn.Module):
             learnable_graph_rank: int = 4,
             graph_mix_logit_init: float = 2.0,
             learnable_graph_dropout: float = 0.0,
+            use_subject_profile: bool = True,
+            subject_profile_dim: int = 32,
+            abs_to_emo_gate_init: float = -2.0,
     ) -> None:
         super().__init__()
         self.use_subject_relative_de = bool(use_subject_relative_de)
@@ -324,6 +354,8 @@ class BrainGraphBackbone(nn.Module):
         self.learnable_graph = bool(learnable_graph)
         self.learnable_graph_rank = int(learnable_graph_rank)
         self.learnable_graph_dropout = float(learnable_graph_dropout)
+        self.use_subject_profile = bool(use_subject_profile)
+        self.subject_profile_dim = int(subject_profile_dim) if self.use_subject_profile else 0
 
         self.node_encoder = NodeFeatureEncoder(sfreq=sfreq, temporal_dim=64, spectral_dim=16)
         if self.node_encoder.node_dim != node_dim:
@@ -337,11 +369,14 @@ class BrainGraphBackbone(nn.Module):
             diag_mode="centered",
         )
         self.leranable_diag = LearnableDEDiagonalFusion(num_bands=self.de_num_bands)
-        if self.use_subject_relative_de:
-            self.de_relative_adapter = SubjectRelativeDEAdapter(
-                in_bands=self.de_num_bands * 3,
-                out_bands=self.de_num_bands,
-            )
+        self.de_abs_adapter = nn.Sequential(
+            nn.Linear(self.de_num_bands, self.de_num_bands),
+            nn.GELU(),
+        )
+        self.de_rel_adapter = SubjectRelativeDEAdapter(
+            in_bands=self.de_num_bands * 2,
+            out_bands=self.de_num_bands,
+        )
 
         # 保留原来的节点特征对比分支。
         self.node_contrast_projector = NodeFeatureContrastProjector(
@@ -410,12 +445,36 @@ class BrainGraphBackbone(nn.Module):
                 bio_abs_scale=self.bio_abs_scale,
                 relative_eps=self.relative_eps,
             )
+            bio_raw_dim = int(getattr(self.biomarker_extractor, "raw_dim", self.biomarker_dim))
+            self.bio_abs_projector = nn.Sequential(
+                nn.LayerNorm(bio_raw_dim),
+                nn.Linear(bio_raw_dim, self.biomarker_dim),
+            )
+            self.bio_rel_projector = nn.Sequential(
+                nn.LayerNorm(bio_raw_dim * 2),
+                nn.Linear(bio_raw_dim * 2, self.biomarker_dim),
+            )
         else:
             self.biomarker_extractor = None
+            bio_raw_dim = 0
+        self.bio_raw_dim = int(bio_raw_dim)
+
+        profile_input_dim = 2 * self.de_num_bands + 4
+        self.subject_profile_encoder = SubjectProfileEncoder(
+            in_dim=profile_input_dim,
+            out_dim=self.subject_profile_dim,
+            hidden_dim=max(64, self.subject_profile_dim * 2 if self.subject_profile_dim > 0 else 64),
+            dropout=dropout,
+        )
+        self.abs_to_emo_gate_logit = nn.Parameter(torch.tensor(float(abs_to_emo_gate_init)))
 
         # 最终拼接：z_conv [B,64] + z_pmg [B,64] + z_bio [B,biomarker_dim]
         self.core_dim = 128
-        self.out_dim = self.core_dim + self.biomarker_dim
+        self.abs_out_dim = self.core_dim + self.biomarker_dim
+        self.rel_out_dim = self.core_dim + self.biomarker_dim
+        self.emo_out_dim = self.rel_out_dim + self.abs_out_dim
+        self.diag_out_dim = self.abs_out_dim + self.subject_profile_dim
+        self.out_dim = self.emo_out_dim
         if self.fusion_mode == "scalar_gated":
             self.temporal_gate_logit = nn.Parameter(torch.tensor(float(temporal_gate_init)))
             self.graph_gate_logit = nn.Parameter(torch.tensor(float(graph_gate_init)))
@@ -434,6 +493,57 @@ class BrainGraphBackbone(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
         )
+
+    @staticmethod
+    def _match_last_dim(feat: torch.Tensor, target_dim: int) -> torch.Tensor:
+        if feat.size(-1) == target_dim:
+            return feat
+        if feat.size(-1) > target_dim:
+            return feat[..., :target_dim]
+        pad = target_dim - feat.size(-1)
+        return F.pad(feat, (0, pad), mode="constant", value=0.0)
+
+    def _encode_subject_profile(
+            self,
+            batch_size: int,
+            device: torch.device,
+            dtype: torch.dtype,
+            subject_de_mu: Optional[torch.Tensor],
+            subject_de_std: Optional[torch.Tensor],
+            subject_bio_mu: Optional[torch.Tensor],
+            subject_bio_std: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if not self.use_subject_profile or self.subject_profile_dim <= 0:
+            return torch.zeros(batch_size, 0, device=device, dtype=dtype)
+        if subject_de_mu is None or subject_de_std is None:
+            return torch.zeros(batch_size, self.subject_profile_dim, device=device, dtype=dtype)
+
+        de_mu = subject_de_mu.to(device=device, dtype=dtype)
+        de_std = subject_de_std.to(device=device, dtype=dtype)
+        if de_mu.ndim != 3 or de_std.ndim != 3:
+            return torch.zeros(batch_size, self.subject_profile_dim, device=device, dtype=dtype)
+        de_mu = self._match_last_dim(de_mu, self.de_num_bands)
+        de_std = self._match_last_dim(de_std, self.de_num_bands)
+        de_mu_global = de_mu.mean(dim=(1, 2), keepdim=False).unsqueeze(-1)
+        de_std_global = de_std.mean(dim=(1, 2), keepdim=False).unsqueeze(-1)
+        de_mu_band = de_mu.mean(dim=1)
+        de_std_band = de_std.mean(dim=1)
+
+        if subject_bio_mu is not None and subject_bio_std is not None:
+            bio_mu = subject_bio_mu.to(device=device, dtype=dtype).reshape(batch_size, -1)
+            bio_std = subject_bio_std.to(device=device, dtype=dtype).reshape(batch_size, -1)
+            bio_mu_global = bio_mu.mean(dim=1, keepdim=True)
+            bio_std_global = bio_std.mean(dim=1, keepdim=True)
+        else:
+            bio_mu_global = torch.zeros(batch_size, 1, device=device, dtype=dtype)
+            bio_std_global = torch.zeros(batch_size, 1, device=device, dtype=dtype)
+
+        profile_input = torch.cat(
+            [de_mu_global, de_std_global, de_mu_band, de_std_band, bio_mu_global, bio_std_global],
+            dim=-1,
+        )
+        profile_input = torch.nan_to_num(profile_input, nan=0.0, posinf=0.0, neginf=0.0)
+        return self.subject_profile_encoder(profile_input)
 
     def _apply_learnable_graph_correction(
             self,
@@ -500,25 +610,31 @@ class BrainGraphBackbone(nn.Module):
         # =====================================================
         # 0. Subject-relative DE。若 baseline 缺失则自动退化为原始 de_feat。
         # =====================================================
-        de_rel = None
-        de_z = None
-        de_input = de_feat
-        de_for_model = de_feat
+        de_abs = de_feat
+        de_rel = torch.zeros_like(de_feat)
+        de_z = torch.zeros_like(de_feat)
+        de_abs_for_model = de_feat
+        de_rel_for_model = torch.zeros_like(de_feat)
+        de_abs_clean = torch.nan_to_num(de_abs, nan=0.0, posinf=0.0, neginf=0.0)
         use_de_relative = (
             self.use_subject_relative_de
-            and hasattr(self, "de_relative_adapter")
+            and hasattr(self, "de_rel_adapter")
             and subject_de_mu is not None
             and subject_de_std is not None
             and de_feat.size(-1) == self.de_num_bands
         )
+        if de_feat.size(-1) == self.de_num_bands:
+            de_abs_for_model = self.de_abs_adapter(de_abs_clean)
         if use_de_relative:
             subject_de_mu = subject_de_mu.to(device=de_feat.device, dtype=de_feat.dtype)
             subject_de_std = subject_de_std.to(device=de_feat.device, dtype=de_feat.dtype)
             de_rel = de_feat - subject_de_mu
             de_z = de_rel / (subject_de_std + self.relative_eps)
-            de_input = torch.cat([de_feat, de_rel, de_z], dim=-1)
-            de_input = torch.nan_to_num(de_input, nan=0.0, posinf=0.0, neginf=0.0)
-            de_for_model = self.de_relative_adapter(de_input)
+            de_rel_input = torch.cat([de_rel, de_z], dim=-1)
+            de_rel_input = torch.nan_to_num(de_rel_input, nan=0.0, posinf=0.0, neginf=0.0)
+            de_rel_for_model = self.de_rel_adapter(de_rel_input)
+        de_input = torch.cat([de_abs, de_rel, de_z], dim=-1) if de_feat.size(-1) == self.de_num_bands else de_feat
+        de_for_model = de_abs_for_model
 
         # =====================================================
         # 1. 原来的多尺度卷积节点特征
@@ -538,7 +654,7 @@ class BrainGraphBackbone(nn.Module):
         # =====================================================
         # 3. DE 对角线：两个图相关模块共用同一套 DE self-loop 逻辑
         # =====================================================
-        power_diag_values, band_weight = self.leranable_diag(de_for_model)  # [B, C]
+        power_diag_values, band_weight = self.leranable_diag(de_abs_for_model)  # [B, C]
 
         # =====================================================
         # 4. 分支 2 (新版 PMG)：PLV 构图 + PMG 编码器
@@ -588,25 +704,58 @@ class BrainGraphBackbone(nn.Module):
         if self.use_biomarkers and self.biomarker_extractor is not None:
             bio_dict = self.biomarker_extractor(
                 x,
-                de_feat=de_for_model,
+                de_feat=de_abs_clean,
                 hjorth=hjorth,
                 plv_matrix=plv_graph_dict["plv_matrix"],
                 subject_bio_mu=subject_bio_mu,
                 subject_bio_std=subject_bio_std,
             )
-            z_bio = bio_dict["bio_feat"]  # [B, biomarker_dim]
+            bio_raw = bio_dict["bio_raw"]
+            bio_raw_rel = bio_dict.get("bio_raw_rel", None)
+            bio_raw_z = bio_dict.get("bio_raw_z", None)
+            if bio_raw_rel is None:
+                bio_raw_rel = torch.zeros_like(bio_raw)
+            if bio_raw_z is None:
+                bio_raw_z = torch.zeros_like(bio_raw)
+            bio_abs_feat = self.bio_abs_projector(bio_raw)
+            bio_rel_input = torch.cat([bio_raw_rel, bio_raw_z], dim=-1)
+            bio_rel_input = torch.nan_to_num(bio_rel_input, nan=0.0, posinf=0.0, neginf=0.0)
+            bio_rel_feat = self.bio_rel_projector(bio_rel_input)
             if self.fusion_mode == "scalar_gated":
                 gate_bio = torch.sigmoid(self.bio_gate_logit)
                 fusion_gates["bio"] = gate_bio.detach()
-                z = torch.cat([z_core, gate_bio * z_bio], dim=-1)
-            else:
-                z = torch.cat([z_core, z_bio], dim=-1)
+                bio_abs_feat = gate_bio * bio_abs_feat
+                bio_rel_feat = gate_bio * bio_rel_feat
+            z_bio = bio_rel_feat
         else:
-            z_bio = z_core.new_zeros(z_core.size(0), 0)
-            z = z_core
+            bio_abs_feat = z_core.new_zeros(z_core.size(0), 0)
+            bio_rel_feat = z_core.new_zeros(z_core.size(0), 0)
+            z_bio = bio_rel_feat
+
+        z_abs = torch.cat([z_core, bio_abs_feat], dim=-1)
+        z_rel = torch.cat([z_core, bio_rel_feat], dim=-1)
+        z_profile = self._encode_subject_profile(
+            batch_size=z_core.size(0),
+            device=z_core.device,
+            dtype=z_core.dtype,
+            subject_de_mu=subject_de_mu,
+            subject_de_std=subject_de_std,
+            subject_bio_mu=subject_bio_mu,
+            subject_bio_std=subject_bio_std,
+        )
+        abs_to_emo_gate = torch.sigmoid(self.abs_to_emo_gate_logit.to(device=z_core.device, dtype=z_core.dtype))
+        fusion_gates["abs_to_emo"] = abs_to_emo_gate.detach()
+        z_diag = torch.cat([z_abs, z_profile], dim=-1)
+        z_emo = torch.cat([z_rel, abs_to_emo_gate * z_abs], dim=-1)
+        z = z_emo
 
         return {
             "z": z,
+            "z_abs": z_abs,
+            "z_rel": z_rel,
+            "z_emo": z_emo,
+            "z_diag": z_diag,
+            "z_profile": z_profile,
             "z_core": z_core,
             "z_bio": z_bio,
             "z_conv": z_conv,
@@ -650,9 +799,11 @@ class BrainGraphBackbone(nn.Module):
 
             # ---- 生物标志物 ----
             "bio_feat": z_bio,
+            "bio_abs_feat": bio_abs_feat,
+            "bio_rel_feat": bio_rel_feat,
             "bio_raw": bio_dict.get("bio_raw", None),
-            "bio_raw_rel": bio_dict.get("bio_raw_rel", None),
-            "bio_raw_z": bio_dict.get("bio_raw_z", None),
+            "bio_raw_rel": bio_raw_rel if self.use_biomarkers and self.biomarker_extractor is not None else None,
+            "bio_raw_z": bio_raw_z if self.use_biomarkers and self.biomarker_extractor is not None else None,
             "bio_input": bio_dict.get("bio_input", None),
             "bio_freq_feat": bio_dict.get("bio_freq_feat", None),
             "bio_asym_feat": bio_dict.get("bio_asym_feat", None),
@@ -667,5 +818,8 @@ class BrainGraphBackbone(nn.Module):
             "de_z": de_z,
             "de_input": de_input,
             "de_for_model": de_for_model,
+            "de_abs_for_model": de_abs_for_model,
+            "de_rel_for_model": de_rel_for_model,
+            "abs_to_emo_gate": abs_to_emo_gate,
             "hjorth": hjorth,
         }

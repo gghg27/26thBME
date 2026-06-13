@@ -136,6 +136,9 @@ class ThreeBranchEncoderWrapper(nn.Module):
         learnable_graph_rank: int = 4,
         graph_mix_logit_init: float = 2.0,
         learnable_graph_dropout: float = 0.0,
+        use_subject_profile: bool = True,
+        subject_profile_dim: int = 32,
+        abs_to_emo_gate_init: float = -2.0,
     ) -> None:
         super().__init__()
         self.backbone = BrainGraphBackbone(
@@ -161,8 +164,15 @@ class ThreeBranchEncoderWrapper(nn.Module):
             learnable_graph_rank=learnable_graph_rank,
             graph_mix_logit_init=graph_mix_logit_init,
             learnable_graph_dropout=learnable_graph_dropout,
+            use_subject_profile=use_subject_profile,
+            subject_profile_dim=subject_profile_dim,
+            abs_to_emo_gate_init=abs_to_emo_gate_init,
         )
         self.out_dim = int(self.backbone.out_dim)
+        self.emo_out_dim = int(getattr(self.backbone, "emo_out_dim", self.out_dim))
+        self.diag_out_dim = int(getattr(self.backbone, "diag_out_dim", self.out_dim))
+        self.abs_out_dim = int(getattr(self.backbone, "abs_out_dim", self.out_dim))
+        self.rel_out_dim = int(getattr(self.backbone, "rel_out_dim", self.out_dim))
 
     def forward(
         self,
@@ -173,6 +183,111 @@ class ThreeBranchEncoderWrapper(nn.Module):
         out = self.backbone(x, de_feat=de_feat, **kwargs)
         if "z" not in out:
             raise KeyError("BrainGraphBackbone must return a fused 'z' feature.")
+        return out
+
+
+class Stage0EmotionPretrainModel(nn.Module):
+    """Stage 0: pretrain the final emotion encoder before source selection."""
+
+    def __init__(
+        self,
+        sfreq: float = 250.0,
+        topk: int = 8,
+        dropout: float = 0.2,
+        prior_matrix: Optional[torch.Tensor] = None,
+        emotion_classes: int = 2,
+        diagnosis_classes: int = 2,
+        label4_classes: int = 4,
+        use_biomarkers: bool = True,
+        biomarker_dim: int = 57,
+        use_subject_relative_de: bool = False,
+        use_subject_relative_bio: bool = False,
+        bio_abs_scale: float = 0.3,
+        relative_eps: float = 1e-6,
+        de_num_bands: int = 5,
+        fusion_mode: str = "concat",
+        bio_gate_init: float = -2.0,
+        core_gate_init: float = 0.0,
+        temporal_gate_init: float = 0.0,
+        graph_gate_init: float = 0.0,
+        learnable_graph: bool = False,
+        learnable_graph_rank: int = 4,
+        graph_mix_logit_init: float = 2.0,
+        learnable_graph_dropout: float = 0.0,
+        use_subject_profile: bool = True,
+        subject_profile_dim: int = 32,
+        abs_to_emo_gate_init: float = -2.0,
+    ) -> None:
+        super().__init__()
+        self.use_subject_relative_de = bool(use_subject_relative_de)
+        self.use_subject_relative_bio = bool(use_subject_relative_bio)
+        self.shared_encoder = ThreeBranchEncoderWrapper(
+            sfreq=sfreq,
+            topk=topk,
+            dropout=dropout,
+            prior_matrix=prior_matrix,
+            use_biomarkers=use_biomarkers,
+            biomarker_dim=biomarker_dim,
+            use_subject_relative_de=self.use_subject_relative_de,
+            use_subject_relative_bio=self.use_subject_relative_bio,
+            bio_abs_scale=bio_abs_scale,
+            relative_eps=relative_eps,
+            de_num_bands=de_num_bands,
+            fusion_mode=fusion_mode,
+            bio_gate_init=bio_gate_init,
+            core_gate_init=core_gate_init,
+            temporal_gate_init=temporal_gate_init,
+            graph_gate_init=graph_gate_init,
+            learnable_graph=learnable_graph,
+            learnable_graph_rank=learnable_graph_rank,
+            graph_mix_logit_init=graph_mix_logit_init,
+            learnable_graph_dropout=learnable_graph_dropout,
+            use_subject_profile=use_subject_profile,
+            subject_profile_dim=subject_profile_dim,
+            abs_to_emo_gate_init=abs_to_emo_gate_init,
+        )
+        self.emo_out_dim = self.shared_encoder.emo_out_dim
+        self.diag_out_dim = self.shared_encoder.diag_out_dim
+        self.emotion_head = MLPHead(
+            in_dim=self.emo_out_dim,
+            out_dim=emotion_classes,
+            hidden_dim=64,
+            dropout=dropout,
+        )
+        self.diagnosis_head = MLPHead(
+            in_dim=self.diag_out_dim,
+            out_dim=diagnosis_classes,
+            hidden_dim=64,
+            dropout=dropout,
+        )
+        self.label4_head = MLPHead(
+            in_dim=self.emo_out_dim + self.diag_out_dim,
+            out_dim=label4_classes,
+            hidden_dim=128,
+            dropout=dropout,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        de_feat: torch.Tensor,
+        **kwargs,
+    ) -> Dict[str, torch.Tensor]:
+        enc = self.shared_encoder(x, de_feat=de_feat, **kwargs)
+        z_emo = enc.get("z_emo", enc["z"])
+        z_diag = enc.get("z_diag", z_emo)
+
+        out = dict(enc)
+        out.update(
+            {
+                "z": z_emo,
+                "z_emo": z_emo,
+                "z_diag": z_diag,
+                "emotion_logits": self.emotion_head(z_emo),
+                "diagnosis_logits": self.diagnosis_head(z_diag),
+                "label4_logits": self.label4_head(torch.cat([z_emo, z_diag], dim=-1)),
+            }
+        )
         return out
 
 
@@ -207,6 +322,9 @@ class Stage1SSASSourceSelectionModel(nn.Module):
         learnable_graph_rank: int = 4,
         graph_mix_logit_init: float = 2.0,
         learnable_graph_dropout: float = 0.0,
+        use_subject_profile: bool = True,
+        subject_profile_dim: int = 32,
+        abs_to_emo_gate_init: float = -2.0,
     ) -> None:
         super().__init__()
         self.use_subject_relative_de = bool(use_subject_relative_de)
@@ -234,8 +352,11 @@ class Stage1SSASSourceSelectionModel(nn.Module):
             learnable_graph_rank=learnable_graph_rank,
             graph_mix_logit_init=graph_mix_logit_init,
             learnable_graph_dropout=learnable_graph_dropout,
+            use_subject_profile=use_subject_profile,
+            subject_profile_dim=subject_profile_dim,
+            abs_to_emo_gate_init=abs_to_emo_gate_init,
         )
-        in_dim = self.shared_encoder.out_dim
+        in_dim = self.shared_encoder.abs_out_dim
         self.in_dim = in_dim
         self.domain_head = MultiDomainHead(
             in_dim=in_dim,
@@ -271,16 +392,17 @@ class Stage1SSASSourceSelectionModel(nn.Module):
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         enc = self.shared_encoder(x, de_feat=de_feat, **kwargs)
-        z = enc["z"]
-        z_emo = grad_reverse(z, lambda_emo) if lambda_emo > 0 else z
-        z_diag = grad_reverse(z, lambda_diag) if lambda_diag > 0 else z
+        z_select = enc.get("z_abs", enc["z"])
+        z_emo = grad_reverse(z_select, lambda_emo) if lambda_emo > 0 else z_select
+        z_diag = grad_reverse(z_select, lambda_diag) if lambda_diag > 0 else z_select
 
         out = dict(enc)
         out.update(
             {
-                "z": z,
-                "z_mmd": self.mmd_head(z),
-                "domain_logits": self.domain_head(z, lambda_grl=0.0),
+                "z": z_select,
+                "z_select": z_select,
+                "z_mmd": self.mmd_head(z_select),
+                "domain_logits": self.domain_head(z_select, lambda_grl=0.0),
                 "emotion_logits_grl": self.emotion_head(z_emo),
                 "diagnosis_logits_grl": self.diagnosis_head(z_diag),
             }
@@ -323,6 +445,9 @@ class Stage2ExpertEmotionAdaptationModel(nn.Module):
         learnable_graph_rank: int = 4,
         graph_mix_logit_init: float = 2.0,
         learnable_graph_dropout: float = 0.0,
+        use_subject_profile: bool = True,
+        subject_profile_dim: int = 32,
+        abs_to_emo_gate_init: float = -2.0,
     ) -> None:
         super().__init__()
         self.use_subject_relative_de = bool(use_subject_relative_de)
@@ -354,25 +479,31 @@ class Stage2ExpertEmotionAdaptationModel(nn.Module):
             learnable_graph_rank=learnable_graph_rank,
             graph_mix_logit_init=graph_mix_logit_init,
             learnable_graph_dropout=learnable_graph_dropout,
+            use_subject_profile=use_subject_profile,
+            subject_profile_dim=subject_profile_dim,
+            abs_to_emo_gate_init=abs_to_emo_gate_init,
         )
-        in_dim = self.shared_encoder.out_dim
-        self.in_dim = in_dim
+        emo_dim = self.shared_encoder.emo_out_dim
+        diag_dim = self.shared_encoder.diag_out_dim
+        self.in_dim = emo_dim
+        self.emo_in_dim = emo_dim
+        self.diag_in_dim = diag_dim
         self.diagnosis_router = MLPHead(
-            in_dim=in_dim,
+            in_dim=diag_dim,
             out_dim=diagnosis_classes,
             hidden_dim=64,
             dropout=dropout,
         )
         self.shared_emotion_head = MLPHead(
-            in_dim=in_dim,
+            in_dim=emo_dim,
             out_dim=emotion_classes,
             hidden_dim=64,
             dropout=dropout,
         )
         if self.shared_expert_trunk:
             self.emotion_trunk = nn.Sequential(
-                nn.LayerNorm(in_dim),
-                nn.Linear(in_dim, self.expert_hidden_dim),
+                nn.LayerNorm(emo_dim),
+                nn.Linear(emo_dim, self.expert_hidden_dim),
                 nn.GELU(),
                 nn.Dropout(dropout),
             )
@@ -380,25 +511,25 @@ class Stage2ExpertEmotionAdaptationModel(nn.Module):
             self.dep_classifier = nn.Linear(self.expert_hidden_dim, emotion_classes)
         else:
             self.hc_emotion_expert = MLPHead(
-                in_dim=in_dim,
+                in_dim=emo_dim,
                 out_dim=emotion_classes,
                 hidden_dim=64,
                 dropout=dropout,
             )
             self.dep_emotion_expert = MLPHead(
-                in_dim=in_dim,
+                in_dim=emo_dim,
                 out_dim=emotion_classes,
                 hidden_dim=64,
                 dropout=dropout,
             )
         self.mmd_head = MMDHead(
-            in_dim=in_dim,
+            in_dim=emo_dim,
             hidden_dim=mmd_hidden_dim,
             out_dim=mmd_dim,
             dropout=dropout,
         )
         self.subject_domain_head = MultiDomainHead(
-            in_dim=in_dim,
+            in_dim=emo_dim,
             num_domains=num_domains,
             hidden_dim=domain_hidden_dim,
             dropout=dropout,
@@ -412,17 +543,18 @@ class Stage2ExpertEmotionAdaptationModel(nn.Module):
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         enc = self.shared_encoder(x, de_feat=de_feat, **kwargs)
-        z = enc["z"]
+        z_emo = enc.get("z_emo", enc["z"])
+        z_diag = enc.get("z_diag", z_emo)
 
-        diag_logits = self.diagnosis_router(z)
-        shared_logits = self.shared_emotion_head(z)
+        diag_logits = self.diagnosis_router(z_diag)
+        shared_logits = self.shared_emotion_head(z_emo)
         if self.shared_expert_trunk:
-            h_emo = self.emotion_trunk(z)
+            h_emo = self.emotion_trunk(z_emo)
             hc_logits = self.hc_classifier(h_emo)
             dep_logits = self.dep_classifier(h_emo)
         else:
-            hc_logits = self.hc_emotion_expert(z)
-            dep_logits = self.dep_emotion_expert(z)
+            hc_logits = self.hc_emotion_expert(z_emo)
+            dep_logits = self.dep_emotion_expert(z_emo)
 
         diag_prob = torch.softmax(diag_logits / self.router_temperature, dim=1)
         prob_shared = torch.softmax(shared_logits, dim=1)
@@ -438,8 +570,10 @@ class Stage2ExpertEmotionAdaptationModel(nn.Module):
         out = dict(enc)
         out.update(
             {
-                "z": z,
-                "z_mmd": self.mmd_head(z),
+                "z": z_emo,
+                "z_emo": z_emo,
+                "z_diag": z_diag,
+                "z_mmd": self.mmd_head(z_emo),
                 "diag_logits": diag_logits,
                 "shared_logits": shared_logits,
                 "hc_logits": hc_logits,
@@ -447,7 +581,7 @@ class Stage2ExpertEmotionAdaptationModel(nn.Module):
                 "mix_prob": mix_prob,
                 "expert_mix_prob": expert_mix_prob,
                 "subject_domain_logits": self.subject_domain_head(
-                    z,
+                    z_emo,
                     lambda_grl=lambda_subject,
                 ),
                 "prob_shared": prob_shared,

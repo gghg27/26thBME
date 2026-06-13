@@ -40,6 +40,7 @@ from dataloader import Competition4ClassDataset
 from utils.data import expand_window_index, resolve_data_path
 from utils.folds import get_unified_subject_split
 from V5.expert_ssas_emotion_model import (
+    Stage0EmotionPretrainModel,
     Stage1SSASSourceSelectionModel,
     Stage2ExpertEmotionAdaptationModel,
     hard_expert_emotion_loss,
@@ -485,6 +486,18 @@ def create_val_loader(
     return dataset, loader
 
 
+def _first_window_length(dataset: Dataset) -> Optional[int]:
+    if len(dataset) <= 0:
+        return None
+    try:
+        sample = dataset[0]
+        x = sample.get("x") if isinstance(sample, dict) else None
+        return int(x.shape[-1]) if torch.is_tensor(x) and x.ndim >= 2 else None
+    except Exception as exc:
+        print(f"[target] WARNING: could not inspect first window length: {exc}")
+        return None
+
+
 def create_target_loader(
     val_dataset: Dataset,
     domain_mapping: dict,
@@ -495,7 +508,7 @@ def create_target_loader(
     drop_last: bool = True,
     generator: Optional[torch.Generator] = None,
     normalize_test: bool = True,
-) -> tuple[Dataset, DataLoader]:
+    ) -> tuple[Dataset, DataLoader]:
     datasets: list[Dataset] = [val_dataset]
     if test_csv is not None and Path(test_csv).exists() and domain_mapping.get("test_users"):
         test_dataset = UnlabeledTargetDataset(
@@ -504,8 +517,20 @@ def create_target_loader(
             root=ROOT,
             normalize=normalize_test,
         )
-        datasets.append(test_dataset)
-        print(f"[target] using val + test target: val={len(val_dataset)}, test={len(test_dataset)}")
+        val_window_len = _first_window_length(val_dataset)
+        test_window_len = _first_window_length(test_dataset)
+        if (
+            val_window_len is not None
+            and test_window_len is not None
+            and val_window_len != test_window_len
+        ):
+            print(
+                "[target] skip test target due to window length mismatch: "
+                f"val={val_window_len}, test={test_window_len}, test_csv={test_csv}"
+            )
+        else:
+            datasets.append(test_dataset)
+            print(f"[target] using val + test target: val={len(val_dataset)}, test={len(test_dataset)}")
     else:
         print(f"[target] using val target only; test_csv={test_csv}")
 
@@ -592,6 +617,15 @@ def extract_arch_output_stats(out: dict) -> dict[str, float]:
     if beta is not None:
         stats["graph_beta"] = beta
 
+    abs_to_emo_gate = _scalar_stat(out.get("abs_to_emo_gate"))
+    if abs_to_emo_gate is not None:
+        stats["abs_to_emo_gate"] = abs_to_emo_gate
+
+    if torch.is_tensor(out.get("z_emo")) and out["z_emo"].ndim == 2:
+        stats["z_emo_dim"] = float(out["z_emo"].size(1))
+    if torch.is_tensor(out.get("z_diag")) and out["z_diag"].ndim == 2:
+        stats["z_diag_dim"] = float(out["z_diag"].size(1))
+
     adj_learnable = out.get("adj_learnable")
     if torch.is_tensor(adj_learnable) and adj_learnable.numel() > 0:
         adj_learnable_float = adj_learnable.detach().float()
@@ -611,6 +645,9 @@ def format_stage2_arch_stats(metrics: dict) -> str:
         ("gate_g", "fusion_gate_graph"),
         ("gate_core", "fusion_gate_core"),
         ("gate_bio", "fusion_gate_bio"),
+        ("abs_to_emo_gate", "abs_to_emo_gate"),
+        ("z_emo_dim", "z_emo_dim"),
+        ("z_diag_dim", "z_diag_dim"),
         ("graph_beta", "graph_beta"),
     ]
     for label, key in aliases:
@@ -618,6 +655,224 @@ def format_stage2_arch_stats(metrics: dict) -> str:
         if value is not None:
             parts.append(f"{label}={float(value):.4f}")
     return (" " + " ".join(parts)) if parts else ""
+
+
+def train_stage0_one_epoch(
+    model: Stage0EmotionPretrainModel,
+    source_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    lambda_stage0_emo: float = 1.0,
+    lambda_stage0_diag: float = 0.2,
+    lambda_stage0_label4: float = 0.0,
+    lambda_stage0_supcon: float = 0.0,
+    emotion_class_weight: Optional[torch.Tensor] = None,
+    diag_class_weight: Optional[torch.Tensor] = None,
+    source_de_mu: Optional[dict[str, torch.Tensor]] = None,
+    source_de_std: Optional[dict[str, torch.Tensor]] = None,
+    source_bio_mu: Optional[dict[str, torch.Tensor]] = None,
+    source_bio_std: Optional[dict[str, torch.Tensor]] = None,
+) -> dict:
+    model.train()
+    totals = defaultdict(float)
+    total_n = 0
+    all_preds, all_labels = [], []
+    all_diag_preds, all_diag_labels = [], []
+    emotion_class_weight = emotion_class_weight.to(device) if emotion_class_weight is not None else None
+    diag_class_weight = diag_class_weight.to(device) if diag_class_weight is not None else None
+    arch_stat_keys: set[str] = set()
+
+    pbar = tqdm(source_loader, desc="Stage0-Train", leave=False)
+    for batch in pbar:
+        batch = move_batch_to_device(batch, device)
+        rel_kwargs = get_subject_relative_kwargs(
+            batch,
+            device,
+            dtype=batch["de_feat"].dtype,
+            de_mu=source_de_mu,
+            de_std=source_de_std,
+            bio_mu=source_bio_mu,
+            bio_std=source_bio_std,
+        )
+        optimizer.zero_grad(set_to_none=True)
+        out = model(batch["x"], batch["de_feat"], **rel_kwargs)
+        y_emo = batch["emotion_label"].long()
+        y_diag = batch["diagnosis_label"].long()
+        y_label4 = batch["label4"].long()
+
+        loss_emo = F.cross_entropy(out["emotion_logits"], y_emo, weight=emotion_class_weight)
+        loss_diag = F.cross_entropy(out["diagnosis_logits"], y_diag, weight=diag_class_weight)
+        loss_label4 = F.cross_entropy(out["label4_logits"], y_label4)
+        loss_supcon = out["z_emo"].new_tensor(0.0)
+        loss = (
+            lambda_stage0_emo * loss_emo
+            + lambda_stage0_diag * loss_diag
+            + lambda_stage0_label4 * loss_label4
+            + lambda_stage0_supcon * loss_supcon
+        )
+        loss.backward()
+        optimizer.step()
+
+        with torch.no_grad():
+            pred = out["emotion_logits"].argmax(dim=1)
+            diag_pred = out["diagnosis_logits"].argmax(dim=1)
+            arch_stats = extract_arch_output_stats(out)
+            arch_stat_keys.update(arch_stats.keys())
+
+        bsz = batch["x"].size(0)
+        total_n += bsz
+        totals["loss"] += float(loss.item()) * bsz
+        totals["emotion_loss"] += float(loss_emo.item()) * bsz
+        totals["diag_loss"] += float(loss_diag.item()) * bsz
+        totals["label4_loss"] += float(loss_label4.item()) * bsz
+        totals["supcon_loss"] += float(loss_supcon.item()) * bsz
+        totals["segment_correct"] += int((pred == y_emo).sum().item())
+        totals["diag_correct"] += int((diag_pred == y_diag).sum().item())
+        for key, value in arch_stats.items():
+            totals[key] += float(value) * bsz
+        all_preds.extend(pred.detach().cpu().tolist())
+        all_labels.extend(y_emo.detach().cpu().tolist())
+        all_diag_preds.extend(diag_pred.detach().cpu().tolist())
+        all_diag_labels.extend(y_diag.detach().cpu().tolist())
+        pbar.set_postfix({"loss": f"{totals['loss'] / max(total_n, 1):.4f}"})
+
+    metrics = {
+        "loss": totals["loss"] / max(total_n, 1),
+        "emotion_loss": totals["emotion_loss"] / max(total_n, 1),
+        "diag_loss": totals["diag_loss"] / max(total_n, 1),
+        "label4_loss": totals["label4_loss"] / max(total_n, 1),
+        "supcon_loss": totals["supcon_loss"] / max(total_n, 1),
+        "segment_acc": totals["segment_correct"] / max(total_n, 1),
+        "diag_acc": totals["diag_correct"] / max(total_n, 1),
+        "emotion_macro_f1": f1_score(all_labels, all_preds, average="macro", labels=[0, 1], zero_division=0)
+        if all_labels
+        else 0.0,
+        "diag_macro_f1": f1_score(all_diag_labels, all_diag_preds, average="macro", labels=[0, 1], zero_division=0)
+        if all_diag_labels
+        else 0.0,
+    }
+    metrics["segment_macro_f1"] = metrics["emotion_macro_f1"]
+    for key in sorted(arch_stat_keys):
+        metrics[key] = totals[key] / max(total_n, 1)
+    return metrics
+
+
+@torch.no_grad()
+def validate_stage0_trial_level(
+    model: Stage0EmotionPretrainModel,
+    val_loader: DataLoader,
+    device: torch.device,
+    threshold: float = 0.5,
+    k_pos: int = 4,
+    lambda_stage0_emo: float = 1.0,
+    lambda_stage0_diag: float = 0.2,
+    lambda_stage0_label4: float = 0.0,
+    trial_pooling: str = "attn_conf",
+    trial_attn_tau: float = 1.0,
+    val_de_mu: Optional[dict[str, torch.Tensor]] = None,
+    val_de_std: Optional[dict[str, torch.Tensor]] = None,
+    val_bio_mu: Optional[dict[str, torch.Tensor]] = None,
+    val_bio_std: Optional[dict[str, torch.Tensor]] = None,
+) -> dict:
+    model.eval()
+    total_loss = 0.0
+    total_n = 0
+    all_preds, all_labels = [], []
+    all_diag_preds, all_diag_labels = [], []
+    segment_records = []
+    arch_stat_keys: set[str] = set()
+    arch_totals = defaultdict(float)
+
+    for batch in tqdm(val_loader, desc="Stage0-Val", leave=False):
+        batch = move_batch_to_device(batch, device)
+        rel_kwargs = get_subject_relative_kwargs(
+            batch,
+            device,
+            dtype=batch["de_feat"].dtype,
+            de_mu=val_de_mu,
+            de_std=val_de_std,
+            bio_mu=val_bio_mu,
+            bio_std=val_bio_std,
+        )
+        out = model(batch["x"], batch["de_feat"], **rel_kwargs)
+        y_emo = batch["emotion_label"].long()
+        y_diag = batch["diagnosis_label"].long()
+        y_label4 = batch["label4"].long()
+        loss_emo = F.cross_entropy(out["emotion_logits"], y_emo)
+        loss_diag = F.cross_entropy(out["diagnosis_logits"], y_diag)
+        loss_label4 = F.cross_entropy(out["label4_logits"], y_label4)
+        loss = (
+            lambda_stage0_emo * loss_emo
+            + lambda_stage0_diag * loss_diag
+            + lambda_stage0_label4 * loss_label4
+        )
+
+        bsz = batch["x"].size(0)
+        total_loss += float(loss.item()) * bsz
+        total_n += bsz
+        prob = torch.softmax(out["emotion_logits"], dim=1).clamp_min(1e-8)
+        prob_pos = prob[:, 1]
+        score_pos = torch.log(prob[:, 1]) - torch.log(prob[:, 0])
+        pred = out["emotion_logits"].argmax(dim=1)
+        diag_pred = out["diagnosis_logits"].argmax(dim=1)
+        all_preds.extend(pred.detach().cpu().tolist())
+        all_labels.extend(y_emo.detach().cpu().tolist())
+        all_diag_preds.extend(diag_pred.detach().cpu().tolist())
+        all_diag_labels.extend(y_diag.detach().cpu().tolist())
+        arch_stats = extract_arch_output_stats(out)
+        arch_stat_keys.update(arch_stats.keys())
+        for key, value in arch_stats.items():
+            arch_totals[key] += float(value) * bsz
+
+        for i in range(bsz):
+            segment_records.append(
+                {
+                    "subject_id": int(batch["subject_id"][i].detach().cpu()),
+                    "user_id": str(batch["user_id"][i]) if "user_id" in batch else str(int(batch["subject_id"][i].detach().cpu())),
+                    "trial_id": int(batch["trial_id"][i].detach().cpu()),
+                    "prob_pos": float(prob_pos[i].detach().cpu()),
+                    "score_pos": float(score_pos[i].detach().cpu()),
+                    "pred_emo": int(pred[i].detach().cpu()),
+                    "label_emo": int(y_emo[i].detach().cpu()),
+                    "pred_diag": int(diag_pred[i].detach().cpu()),
+                    "label_diag": int(y_diag[i].detach().cpu()),
+                }
+            )
+
+    segment_acc = accuracy_score(all_labels, all_preds) if all_labels else 0.0
+    segment_macro_f1 = f1_score(all_labels, all_preds, average="macro", labels=[0, 1], zero_division=0) if all_labels else 0.0
+    trial_metrics = compute_trial_level_metrics(
+        segment_records,
+        threshold=threshold,
+        vote_method="hard",
+        pooling=trial_pooling,
+        tau=trial_attn_tau,
+    )
+    topk_trial_metrics = compute_trial_topk_metrics(
+        segment_records,
+        k_pos=k_pos,
+        pooling=trial_pooling,
+        tau=trial_attn_tau,
+    )
+    metrics = {
+        "loss": total_loss / max(total_n, 1),
+        "segment_acc": segment_acc,
+        "segment_macro_f1": segment_macro_f1,
+        "emotion_acc": segment_acc,
+        "emotion_macro_f1": segment_macro_f1,
+        "diag_acc": accuracy_score(all_diag_labels, all_diag_preds) if all_diag_labels else 0.0,
+        "diag_macro_f1": f1_score(all_diag_labels, all_diag_preds, average="macro", labels=[0, 1], zero_division=0)
+        if all_diag_labels
+        else 0.0,
+        "segment_records": segment_records,
+    }
+    metrics.update(trial_metrics)
+    metrics.update(topk_trial_metrics)
+    metrics["macro_f1"] = metrics["segment_macro_f1"]
+    metrics["acc"] = metrics["segment_acc"]
+    for key in sorted(arch_stat_keys):
+        metrics[key] = arch_totals[key] / max(total_n, 1)
+    return metrics
 
 
 def train_stage1_one_epoch(
@@ -630,8 +885,8 @@ def train_stage1_one_epoch(
     lambda_mmd: float = 0.01,
     lambda_emo_grl: float = 0.001,
     grl_emo: float = 0.01,
-    lambda_diag_grl: float = 0.001,
-    grl_diag: float = 0.01,
+    lambda_diag_grl: float = 0.0,
+    grl_diag: float = 0.0,
     lambda_weight_reg: float = 0.0,
     emotion_class_weight: Optional[torch.Tensor] = None,
     diag_class_weight: Optional[torch.Tensor] = None,
@@ -696,6 +951,8 @@ def train_stage1_one_epoch(
         loss_domain = F.cross_entropy(domain_logits, domain_labels)
 
         loss_mmd = weighted_mmd_rbf(source_out["z_mmd"], target_out["z_mmd"])
+        # Stage1 emotion branch is adversarial leakage suppression only,
+        # not a positive emotion classifier.
         loss_emo = F.cross_entropy(
             source_out["emotion_logits_grl"],
             source_batch["emotion_label"].long(),
@@ -761,6 +1018,8 @@ def validate_stage1(
     target_iter = cycle(target_loader)
     steps = min(len(source_loader), len(target_loader))
     iterator = iter(source_loader)
+    all_emo_preds, all_emo_labels = [], []
+    all_diag_preds, all_diag_labels = [], []
     for _ in tqdm(range(steps), desc="Stage1-Val", leave=False):
         source_batch = move_batch_to_device(next(iterator), device)
         target_batch = move_batch_to_device(next(target_iter), device)
@@ -792,17 +1051,40 @@ def validate_stage1(
         loss_emo = F.cross_entropy(source_out["emotion_logits_grl"], source_batch["emotion_label"].long())
         loss_diag = F.cross_entropy(source_out["diagnosis_logits_grl"], source_batch["diagnosis_label"].long())
         loss = loss_domain + 0.01 * loss_mmd + 0.001 * loss_emo + 0.001 * loss_diag
+        emo_pred = source_out["emotion_logits_grl"].argmax(dim=1)
+        diag_pred = source_out["diagnosis_logits_grl"].argmax(dim=1)
+        y_emo = source_batch["emotion_label"].long()
+        y_diag = source_batch["diagnosis_label"].long()
 
         bsz = source_batch["x"].size(0)
         total_n += bsz
         totals["loss"] += float(loss.item()) * bsz
         totals["loss_domain"] += float(loss_domain.item()) * bsz
         totals["loss_mmd"] += float(loss_mmd.item()) * bsz
+        totals["loss_emo_grl"] += float(loss_emo.item()) * bsz
+        totals["loss_diag_grl"] += float(loss_diag.item()) * bsz
         totals["domain_acc"] += int((domain_logits.argmax(dim=1) == domain_labels).sum().item())
         totals["domain_n"] += int(domain_labels.numel())
+        all_emo_preds.extend(emo_pred.detach().cpu().tolist())
+        all_emo_labels.extend(y_emo.detach().cpu().tolist())
+        all_diag_preds.extend(diag_pred.detach().cpu().tolist())
+        all_diag_labels.extend(y_diag.detach().cpu().tolist())
 
     metrics = {k: v / max(total_n, 1) for k, v in totals.items() if k not in ("domain_acc", "domain_n")}
     metrics["domain_acc"] = totals["domain_acc"] / max(totals["domain_n"], 1)
+    metrics["stage1_emo_acc_grl"] = accuracy_score(all_emo_labels, all_emo_preds) if all_emo_labels else 0.0
+    metrics["stage1_emo_macro_f1_grl"] = (
+        f1_score(all_emo_labels, all_emo_preds, average="macro", labels=[0, 1], zero_division=0)
+        if all_emo_labels
+        else 0.0
+    )
+    metrics["stage1_diag_acc_grl"] = accuracy_score(all_diag_labels, all_diag_preds) if all_diag_labels else 0.0
+    metrics["stage1_diag_macro_f1_grl"] = (
+        f1_score(all_diag_labels, all_diag_preds, average="macro", labels=[0, 1], zero_division=0)
+        if all_diag_labels
+        else 0.0
+    )
+    metrics["emotion_leakage"] = max(0.0, float(metrics["stage1_emo_macro_f1_grl"]) - 0.5)
     return metrics
 
 
@@ -1110,6 +1392,64 @@ def source_weight_l1_change(old_weights: dict[str, float], new_weights: dict[str
     if not keys:
         return 0.0
     return float(sum(abs(float(new_weights.get(k, 0.0)) - float(old_weights.get(k, 0.0))) for k in keys))
+
+
+def compute_weight_effective_ratio(source_weights: dict[str, float]) -> float:
+    if not source_weights:
+        return 0.0
+    values = np.asarray([float(v) for v in source_weights.values()], dtype=np.float64)
+    values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+    values = np.maximum(values, 0.0)
+    total = float(values.sum())
+    if total <= 0:
+        return 0.0
+    p = values / total
+    effective_n = 1.0 / max(float(np.sum(p ** 2)), 1e-12)
+    return float(effective_n / max(values.size, 1))
+
+
+def compute_weight_collapse(source_weights: dict[str, float], min_effective_ratio: float) -> float:
+    effective_ratio = compute_weight_effective_ratio(source_weights)
+    return float(max(0.0, float(min_effective_ratio) - effective_ratio))
+
+
+def compute_stage1_selector_metrics(
+    val_metrics: dict,
+    current_source_weights: Optional[dict[str, float]],
+    previous_source_weights: Optional[dict[str, float]],
+    selector_alpha_mmd: float = 0.1,
+    selector_beta_leakage: float = 0.5,
+    selector_gamma_weight_stability: float = 0.2,
+    selector_delta_weight_collapse: float = 0.2,
+    selector_min_effective_ratio: float = 0.2,
+) -> dict:
+    current_source_weights = current_source_weights or {}
+    val_loss_domain = float(val_metrics.get("loss_domain", val_metrics.get("loss", 0.0)))
+    val_loss_mmd = float(val_metrics.get("loss_mmd", 0.0))
+    emotion_leakage = float(val_metrics.get("emotion_leakage", 0.0))
+    weight_instability = (
+        source_weight_l1_change(previous_source_weights, current_source_weights) / max(len(current_source_weights), 1)
+        if previous_source_weights is not None and current_source_weights
+        else 0.0
+    )
+    effective_ratio = compute_weight_effective_ratio(current_source_weights)
+    weight_collapse = compute_weight_collapse(current_source_weights, selector_min_effective_ratio)
+    domain_mmd_loss = val_loss_domain + float(selector_alpha_mmd) * val_loss_mmd
+    selector_loss = (
+        domain_mmd_loss
+        + float(selector_beta_leakage) * emotion_leakage
+        + float(selector_gamma_weight_stability) * weight_instability
+        + float(selector_delta_weight_collapse) * weight_collapse
+    )
+    return {
+        "selector_loss": float(selector_loss),
+        "selector_score": float(-selector_loss),
+        "domain_mmd_loss": float(domain_mmd_loss),
+        "emotion_leakage": emotion_leakage,
+        "weight_instability": float(weight_instability),
+        "weight_effective_ratio": float(effective_ratio),
+        "weight_collapse": float(weight_collapse),
+    }
 
 
 @torch.no_grad()
@@ -2181,6 +2521,48 @@ def flatten_metrics_for_csv(prefix: str, metrics: dict) -> dict:
     return row
 
 
+def save_stage0_checkpoint(
+    save_dir: str | Path,
+    filename: str,
+    model: Stage0EmotionPretrainModel,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    train_metrics: dict,
+    val_metrics: dict,
+    train_subjects,
+    val_subjects,
+    config_dict: dict,
+    domain_mapping: dict,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+    best_name: str = "stage0",
+    criteria=None,
+    extra_state: Optional[dict] = None,
+) -> str:
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = save_dir / filename
+    ckpt = {
+        "best_name": best_name,
+        "epoch": epoch,
+        "criteria": criteria or [],
+        "criteria_readable": format_criteria(criteria or []),
+        "model_state_dict": copy.deepcopy(model.state_dict()),
+        "encoder_state_dict": copy.deepcopy(model.shared_encoder.state_dict()),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "train_metrics": to_jsonable(train_metrics),
+        "val_metrics": to_jsonable(val_metrics),
+        "train_subjects": to_jsonable(train_subjects),
+        "val_subjects": to_jsonable(val_subjects),
+        "config": to_jsonable(config_dict),
+        "domain_mapping": to_jsonable(domain_mapping),
+        "extra_state": to_jsonable(extra_state or {"domain_mapping": domain_mapping}),
+    }
+    if scheduler is not None:
+        ckpt["scheduler_state_dict"] = scheduler.state_dict()
+    torch.save(ckpt, ckpt_path)
+    return str(ckpt_path)
+
+
 def save_best_checkpoint(
     save_dir: str | Path,
     fold: int,
@@ -2684,8 +3066,15 @@ def build_stage2_model_from_checkpoint(ckpt: dict, device: torch.device) -> tupl
         learnable_graph_rank=_cfg_int("learnable_graph_rank", 4),
         graph_mix_logit_init=_cfg_float("graph_mix_logit_init", 2.0),
         learnable_graph_dropout=_cfg_float("learnable_graph_dropout", 0.0),
+        use_subject_profile=_cfg_bool("use_subject_profile", True),
+        subject_profile_dim=_cfg_int("subject_profile_dim", 32),
+        abs_to_emo_gate_init=_cfg_float("abs_to_emo_gate_init", -2.0),
     ).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    try:
+        model.load_state_dict(ckpt["model_state_dict"])
+    except RuntimeError as exc:
+        print(f"[V5 checkpoint load] failed with explicit state-dict mismatch: {exc}")
+        raise
     return model, domain_mapping
 
 
@@ -2798,6 +3187,41 @@ def ensemble_test_predictions(
     return merged
 
 
+def load_stage0_encoder_into_model(stage0_ckpt_or_model, target_model: torch.nn.Module, device: torch.device) -> dict:
+    if isinstance(stage0_ckpt_or_model, Stage0EmotionPretrainModel):
+        encoder_state = stage0_ckpt_or_model.shared_encoder.state_dict()
+        source_desc = "Stage0 model object"
+    elif hasattr(stage0_ckpt_or_model, "shared_encoder"):
+        encoder_state = stage0_ckpt_or_model.shared_encoder.state_dict()
+        source_desc = f"{stage0_ckpt_or_model.__class__.__name__} object"
+    else:
+        source_path = Path(stage0_ckpt_or_model)
+        ckpt = load_checkpoint(source_path, device)
+        source_desc = str(source_path)
+        encoder_state = ckpt.get("encoder_state_dict")
+        if encoder_state is None:
+            model_state = ckpt.get("model_state_dict", {})
+            prefix = "shared_encoder."
+            encoder_state = {
+                key[len(prefix):]: value
+                for key, value in model_state.items()
+                if str(key).startswith(prefix)
+            }
+        if not encoder_state:
+            raise KeyError(f"Stage0 checkpoint has no encoder_state_dict: {source_path}")
+
+    missing, unexpected = target_model.shared_encoder.load_state_dict(encoder_state, strict=False)
+    print(
+        f"[Stage0 Init] loaded encoder from {source_desc}; "
+        f"missing={len(missing)}, unexpected={len(unexpected)}"
+    )
+    if missing:
+        print(f"[Stage0 Init] missing keys: {missing[:20]}")
+    if unexpected:
+        print(f"[Stage0 Init] unexpected keys: {unexpected[:20]}")
+    return {"missing": list(missing), "unexpected": list(unexpected), "source": source_desc}
+
+
 def load_stage1_encoder_into_stage2(
     stage1_model: Stage1SSASSourceSelectionModel,
     stage2_model: Stage2ExpertEmotionAdaptationModel,
@@ -2905,6 +3329,35 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
         worker_init_fn=seed_worker,
     )
 
+    stage0 = Stage0EmotionPretrainModel(
+        sfreq=args.sfreq,
+        topk=args.topk,
+        dropout=args.dropout,
+        use_biomarkers=not args.no_biomarkers,
+        biomarker_dim=args.biomarker_dim,
+        use_subject_relative_de=use_subject_relative_de,
+        use_subject_relative_bio=use_subject_relative_bio,
+        bio_abs_scale=args.bio_abs_scale,
+        relative_eps=args.relative_eps,
+        de_num_bands=args.de_num_bands,
+        fusion_mode=args.fusion_mode,
+        bio_gate_init=args.bio_gate_init,
+        core_gate_init=args.core_gate_init,
+        temporal_gate_init=args.temporal_gate_init,
+        graph_gate_init=args.graph_gate_init,
+        learnable_graph=args.learnable_graph,
+        learnable_graph_rank=args.learnable_graph_rank,
+        graph_mix_logit_init=args.graph_mix_logit_init,
+        learnable_graph_dropout=args.learnable_graph_dropout,
+        use_subject_profile=args.use_subject_profile,
+        subject_profile_dim=args.subject_profile_dim,
+        abs_to_emo_gate_init=args.abs_to_emo_gate_init,
+    ).to(device)
+    print(
+        f"[Stage0 Model] z_emo_dim={stage0.shared_encoder.emo_out_dim}, "
+        f"z_diag_dim={stage0.shared_encoder.diag_out_dim}"
+    )
+
     stage1 = Stage1SSASSourceSelectionModel(
         num_domains=domain_mapping["num_domains"],
         sfreq=args.sfreq,
@@ -2926,11 +3379,14 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
         learnable_graph_rank=args.learnable_graph_rank,
         graph_mix_logit_init=args.graph_mix_logit_init,
         learnable_graph_dropout=args.learnable_graph_dropout,
+        use_subject_profile=args.use_subject_profile,
+        subject_profile_dim=args.subject_profile_dim,
+        abs_to_emo_gate_init=args.abs_to_emo_gate_init,
     ).to(device)
     if use_subject_relative_bio:
-        print("[Subject Relative] computing source/val/target bio baselines with Stage1 encoder...")
+        print("[Subject Relative] computing source/val/target bio baselines with Stage0 encoder...")
         source_bio_mu, source_bio_std = compute_subject_bio_baselines(
-            stage1,
+            stage0,
             source_baseline_loader,
             device,
             subject_de_mu=source_de_mu,
@@ -2938,7 +3394,7 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
             eps=args.relative_eps,
         )
         val_bio_mu, val_bio_std = compute_subject_bio_baselines(
-            stage1,
+            stage0,
             val_loader,
             device,
             subject_de_mu=val_de_mu,
@@ -2946,7 +3402,7 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
             eps=args.relative_eps,
         )
         target_bio_mu, target_bio_std = compute_subject_bio_baselines(
-            stage1,
+            stage0,
             target_vote_loader,
             device,
             subject_de_mu=target_de_mu,
@@ -2959,8 +3415,170 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
     emotion_weights = build_emotion_class_weights(source_dataset)
     diag_weights = build_diag_class_weights(source_dataset, use_label4_for_diagnosis=not args.use_raw_diagnosis_label)
 
+    stage0_best_path = None
+    stage0_best_metrics = None
+    stage0_best_train_metrics = None
+    stage0_history = []
+    last_stage0_epoch = 0
+    last_stage0_train_metrics = {}
+    last_stage0_val_metrics = {}
+    stage0_criteria = [
+        ("topk_trial_macro_f1", "max"),
+        ("topk_trial_acc", "max"),
+        ("trial_macro_f1", "max"),
+        ("emotion_macro_f1", "max"),
+        ("diag_macro_f1", "max"),
+        ("loss", "min"),
+    ]
+    if args.skip_stage0:
+        if args.stage0_encoder_path:
+            stage0_best_path = args.stage0_encoder_path
+            print(f"[Stage0] skipped; external encoder path will be used: {stage0_best_path}")
+        else:
+            print("[Stage0] skipped and no --stage0_encoder_path provided; Stage2 may train without Stage0 initialization.")
+    else:
+        print("[Stage0] training encoder pretrain stage...")
+        optimizer0 = torch.optim.AdamW(stage0.parameters(), lr=args.lr_stage0, weight_decay=args.weight_decay)
+        scheduler0 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer0, T_max=max(args.stage0_epochs, 1))
+        for epoch in range(1, args.stage0_epochs + 1):
+            train0 = train_stage0_one_epoch(
+                stage0,
+                source_loader,
+                optimizer0,
+                device,
+                lambda_stage0_emo=args.lambda_stage0_emo,
+                lambda_stage0_diag=args.lambda_stage0_diag,
+                lambda_stage0_label4=args.lambda_stage0_label4,
+                lambda_stage0_supcon=args.lambda_stage0_supcon,
+                emotion_class_weight=emotion_weights,
+                diag_class_weight=diag_weights,
+                source_de_mu=source_de_mu,
+                source_de_std=source_de_std,
+                source_bio_mu=source_bio_mu,
+                source_bio_std=source_bio_std,
+            )
+            val0 = validate_stage0_trial_level(
+                stage0,
+                val_loader,
+                device,
+                threshold=args.threshold,
+                k_pos=args.k_pos,
+                lambda_stage0_emo=args.lambda_stage0_emo,
+                lambda_stage0_diag=args.lambda_stage0_diag,
+                lambda_stage0_label4=args.lambda_stage0_label4,
+                trial_pooling=args.trial_pooling,
+                trial_attn_tau=args.trial_attn_tau,
+                val_de_mu=val_de_mu,
+                val_de_std=val_de_std,
+                val_bio_mu=val_bio_mu,
+                val_bio_std=val_bio_std,
+            )
+            scheduler0.step()
+            row0 = {"epoch": epoch, "lr": optimizer0.param_groups[0]["lr"]}
+            row0.update(flatten_metrics_for_csv("train", train0))
+            row0.update(flatten_metrics_for_csv("val", val0))
+            stage0_history.append(row0)
+            last_stage0_epoch = epoch
+            last_stage0_train_metrics = copy.deepcopy(train0)
+            last_stage0_val_metrics = copy.deepcopy(val0)
+            print(
+                f"[Stage0] epoch={epoch} loss={train0['loss']:.4f} "
+                f"val_topk_f1={val0['topk_trial_macro_f1']:.4f} "
+                f"val_trial_f1={val0['trial_macro_f1']:.4f} "
+                f"val_diag_f1={val0['diag_macro_f1']:.4f}"
+                f"{format_stage2_arch_stats(train0)}"
+            )
+            if is_better_by_criteria(val0, stage0_best_metrics, stage0_criteria):
+                stage0_best_metrics = copy.deepcopy(val0)
+                stage0_best_train_metrics = copy.deepcopy(train0)
+                stage0_best_path = save_stage0_checkpoint(
+                    save_dir=save_dir,
+                    filename="stage0_best.pt",
+                    model=stage0,
+                    optimizer=optimizer0,
+                    epoch=epoch,
+                    train_metrics=train0,
+                    val_metrics=val0,
+                    train_subjects=split["train_all"],
+                    val_subjects=split["val_all"],
+                    config_dict=config_dict,
+                    domain_mapping=domain_mapping,
+                    scheduler=scheduler0,
+                    best_name="stage0_best",
+                    criteria=stage0_criteria,
+                    extra_state={
+                        "domain_mapping": domain_mapping,
+                        "stage0_best_path": str(save_dir / "stage0_best.pt"),
+                        "stage0_init_stage1": args.stage0_init_stage1,
+                        "stage2_init_from_stage0": None,
+                        "stage1_role": "source_selector_only",
+                        "stage1_best_metric": args.stage1_best_metric,
+                    },
+                )
+                save_json(
+                    save_dir / "stage0_best_metrics.json",
+                    {
+                        "best_name": "stage0_best",
+                        "epoch": epoch,
+                        "criteria": stage0_criteria,
+                        "criteria_readable": format_criteria(stage0_criteria),
+                        "train_metrics": train0,
+                        "val_metrics": val0,
+                        "checkpoint_path": stage0_best_path,
+                    },
+                )
+                print(f"[Stage0] saved best: path={stage0_best_path}")
+        pd.DataFrame(stage0_history).to_csv(save_dir / "stage0_history.csv", index=False, encoding="utf-8-sig")
+        if last_stage0_epoch > 0:
+            save_stage0_checkpoint(
+                save_dir=save_dir,
+                filename="stage0_final.pt",
+                model=stage0,
+                optimizer=optimizer0,
+                epoch=last_stage0_epoch,
+                train_metrics=last_stage0_train_metrics,
+                val_metrics=last_stage0_val_metrics,
+                train_subjects=split["train_all"],
+                val_subjects=split["val_all"],
+                config_dict=config_dict,
+                domain_mapping=domain_mapping,
+                scheduler=scheduler0,
+                best_name="stage0_final",
+                criteria=stage0_criteria,
+                extra_state={
+                    "domain_mapping": domain_mapping,
+                    "stage0_best_path": stage0_best_path,
+                    "stage0_init_stage1": args.stage0_init_stage1,
+                    "stage2_init_from_stage0": None,
+                    "stage1_role": "source_selector_only",
+                    "stage1_best_metric": args.stage1_best_metric,
+                },
+            )
+        print(f"[Stage0] history saved: {save_dir / 'stage0_history.csv'}")
+
+    stage0_init_stage1_loaded = False
+    if args.stage0_init_stage1 and stage0_best_path and Path(stage0_best_path).exists():
+        load_stage0_encoder_into_model(stage0_best_path, stage1, device)
+        stage0_init_stage1_loaded = True
+        print("[Stage1 Init] loaded Stage0 encoder for selector warm start.")
+    elif args.stage0_init_stage1:
+        print("[Stage1 Init] Stage0 encoder not available; Stage1 uses random initialization.")
+
     best_stage1 = None
+    best_stage1_value = math.inf
     stage1_best_path = None
+    stage1_selector_metrics = {}
+    previous_selector_weights = None
+    last_selector_vote_result = None
+    last_selector_weights = None
+    stage1_selector_criteria = [
+        ("selector_loss", "min"),
+        ("loss_domain", "min"),
+        ("loss_mmd", "min"),
+        ("emotion_leakage", "min"),
+        ("weight_instability", "min"),
+        ("weight_collapse", "min"),
+    ]
     history1 = []
     last_stage1_train_metrics = {}
     last_stage1_val_metrics = {}
@@ -3004,6 +3622,48 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
             target_bio_mu=target_bio_mu,
             target_bio_std=target_bio_std,
         )
+        current_selector_weights = last_selector_weights
+        current_vote_result = last_selector_vote_result
+        if epoch % max(1, int(args.stage1_vote_every)) == 0:
+            current_vote_result = compute_source_weights_by_classification_voting(
+                stage1,
+                target_vote_loader,
+                domain_mapping,
+                device,
+                save_dir / "stage1_selector_epochs" / f"epoch_{epoch:03d}",
+                smooth=args.vote_smooth,
+                vote_level=args.vote_level,
+                vote_mode=args.vote_mode,
+                tau_vote=args.tau_vote,
+                confidence_power=args.confidence_power,
+                save_topk_probs=args.save_topk_probs,
+                target_de_mu=target_de_mu,
+                target_de_std=target_de_std,
+                target_bio_mu=target_bio_mu,
+                target_bio_std=target_bio_std,
+            )
+            current_selector_weights = (
+                current_vote_result["weights_mean_one"]
+                if args.use_mean_one_source_weights
+                else current_vote_result["weights"]
+            )
+        selector_metrics = compute_stage1_selector_metrics(
+            val_stage1,
+            current_selector_weights,
+            previous_selector_weights,
+            selector_alpha_mmd=args.selector_alpha_mmd,
+            selector_beta_leakage=args.selector_beta_leakage,
+            selector_gamma_weight_stability=args.selector_gamma_weight_stability,
+            selector_delta_weight_collapse=args.selector_delta_weight_collapse,
+            selector_min_effective_ratio=args.selector_min_effective_ratio,
+        )
+        val_stage1.update(selector_metrics)
+        if current_selector_weights is not None:
+            previous_selector_weights = dict(current_selector_weights)
+            last_selector_weights = dict(current_selector_weights)
+        if current_vote_result is not None:
+            last_selector_vote_result = current_vote_result
+        stage1_selector_metrics = copy.deepcopy(selector_metrics)
         scheduler1.step()
         row = {"epoch": epoch, "lr": optimizer1.param_groups[0]["lr"]}
         row.update(flatten_metrics_for_csv("train", train_metrics))
@@ -3012,19 +3672,28 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
         last_stage1_train_metrics = copy.deepcopy(train_metrics)
         last_stage1_val_metrics = copy.deepcopy(val_stage1)
         last_stage1_epoch = epoch
-        print(f"[Stage1] epoch={epoch} train_loss={train_metrics['loss']:.4f} val_domain={val_stage1['loss_domain']:.4f}")
-        if epoch <= args.save_warmup_epochs:
-            print(f"[Stage1] skip best checkpoint during save warmup ({epoch}/{args.save_warmup_epochs})")
-        elif best_stage1 is None or val_stage1["loss_domain"] < best_stage1["val"]["loss_domain"]:
+        print(
+            f"[Stage1 Selector] epoch={epoch} train_loss={train_metrics['loss']:.4f} "
+            f"val_domain={val_stage1['loss_domain']:.4f} selector_loss={selector_metrics['selector_loss']:.4f} "
+            f"emotion_leakage={selector_metrics['emotion_leakage']:.4f} "
+            f"weight_instability={selector_metrics['weight_instability']:.4f} "
+            f"weight_collapse={selector_metrics['weight_collapse']:.4f}"
+        )
+        metric_key = "selector_loss" if args.stage1_best_metric == "selector_loss" else "domain_mmd_loss"
+        current_best_value = float(selector_metrics[metric_key])
+        if epoch <= args.stage1_selector_warmup_epochs:
+            print(f"[Stage1 Selector] skip best checkpoint during selector warmup ({epoch}/{args.stage1_selector_warmup_epochs})")
+        elif best_stage1 is None or current_best_value < best_stage1_value:
+            best_stage1_value = current_best_value
             best_stage1 = {"epoch": epoch, "train": copy.deepcopy(train_metrics), "val": copy.deepcopy(val_stage1)}
-            stage1_ckpt_path = save_dir / "stage1_best.pt"
+            stage1_ckpt_path = save_dir / "stage1_best_selector.pt"
             stage1_best_path = stage1_ckpt_path
             torch.save(
                 {
-                    "best_name": "stage1_domain",
+                    "best_name": "stage1_selector",
                     "epoch": epoch,
-                    "criteria": [("loss_domain", "min"), ("domain_acc", "max"), ("loss", "min")],
-                    "criteria_readable": "loss_domain(min) -> domain_acc(max) -> loss(min)",
+                    "criteria": stage1_selector_criteria,
+                    "criteria_readable": format_criteria(stage1_selector_criteria),
                     "model_state_dict": copy.deepcopy(stage1.state_dict()),
                     "optimizer_state_dict": optimizer1.state_dict(),
                     "scheduler_state_dict": scheduler1.state_dict(),
@@ -3033,16 +3702,29 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
                     "train_subjects": to_jsonable(split["train_all"]),
                     "val_subjects": to_jsonable(split["val_all"]),
                     "domain_mapping": to_jsonable(domain_mapping),
+                    "config": to_jsonable(config_dict),
+                    "extra_state": to_jsonable(
+                        {
+                            "domain_mapping": domain_mapping,
+                            "stage0_best_path": stage0_best_path,
+                            "stage0_init_stage1": stage0_init_stage1_loaded,
+                            "stage1_role": "source_selector_only",
+                            "stage1_best_metric": args.stage1_best_metric,
+                            "stage1_selector_metrics": selector_metrics,
+                            "source_subject_weights": current_selector_weights,
+                            "source_weight_vote": current_vote_result,
+                        }
+                    ),
                 },
                 stage1_ckpt_path,
             )
             save_json(
-                save_dir / "stage1_best_metrics.json",
+                save_dir / "stage1_best_selector_metrics.json",
                 {
-                    "best_name": "stage1_domain",
+                    "best_name": "stage1_selector",
                     "epoch": epoch,
-                    "criteria": [("loss_domain", "min"), ("domain_acc", "max"), ("loss", "min")],
-                    "criteria_readable": "loss_domain(min) -> domain_acc(max) -> loss(min)",
+                    "criteria": stage1_selector_criteria,
+                    "criteria_readable": format_criteria(stage1_selector_criteria),
                     "train_metrics": train_metrics,
                     "val_metrics": val_stage1,
                     "train_subjects": split["train_all"],
@@ -3051,15 +3733,16 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
                 },
             )
             stage1_row = {
-                "best_name": "stage1_domain",
+                "best_name": "stage1_selector",
                 "epoch": epoch,
-                "criteria": "loss_domain(min) -> domain_acc(max) -> loss(min)",
+                "criteria": format_criteria(stage1_selector_criteria),
                 "checkpoint_path": str(stage1_ckpt_path),
             }
             stage1_row.update(flatten_metrics_for_csv("train", train_metrics))
             stage1_row.update(flatten_metrics_for_csv("val", val_stage1))
-            pd.DataFrame([stage1_row]).to_csv(save_dir / "stage1_best_summary.csv", index=False, encoding="utf-8-sig")
+            pd.DataFrame([stage1_row]).to_csv(save_dir / "stage1_best_selector_summary.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame(history1).to_csv(save_dir / "stage1_history.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(history1).to_csv(save_dir / "stage1_selector_history.csv", index=False, encoding="utf-8-sig")
     if last_stage1_epoch > 0:
         save_final_checkpoint(
             save_dir=save_dir,
@@ -3073,13 +3756,73 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
             val_subjects=split["val_all"],
             config_dict=config_dict,
             scheduler=scheduler1,
-            extra_state={"domain_mapping": domain_mapping},
+            extra_state={
+                "domain_mapping": domain_mapping,
+                "stage0_best_path": stage0_best_path,
+                "stage0_init_stage1": stage0_init_stage1_loaded,
+                "stage1_role": "source_selector_only",
+                "stage1_best_metric": args.stage1_best_metric,
+                "stage1_selector_metrics": stage1_selector_metrics,
+                "source_subject_weights": last_selector_weights,
+                "source_weight_vote": last_selector_vote_result,
+            },
+        )
+    if stage1_best_path is None and last_stage1_epoch > 0:
+        stage1_best_path = save_dir / "stage1_best_selector.pt"
+        print(f"[Stage1 Selector] no best after warmup; saving final selector fallback: {stage1_best_path}")
+        torch.save(
+            {
+                "best_name": "stage1_selector_final_fallback",
+                "epoch": last_stage1_epoch,
+                "criteria": stage1_selector_criteria,
+                "criteria_readable": format_criteria(stage1_selector_criteria),
+                "model_state_dict": copy.deepcopy(stage1.state_dict()),
+                "optimizer_state_dict": optimizer1.state_dict(),
+                "scheduler_state_dict": scheduler1.state_dict(),
+                "train_metrics": to_jsonable(last_stage1_train_metrics),
+                "val_metrics": to_jsonable(last_stage1_val_metrics),
+                "train_subjects": to_jsonable(split["train_all"]),
+                "val_subjects": to_jsonable(split["val_all"]),
+                "domain_mapping": to_jsonable(domain_mapping),
+                "config": to_jsonable(config_dict),
+                "extra_state": to_jsonable(
+                    {
+                        "domain_mapping": domain_mapping,
+                        "stage0_best_path": stage0_best_path,
+                        "stage0_init_stage1": stage0_init_stage1_loaded,
+                        "stage1_role": "source_selector_only",
+                        "stage1_best_metric": args.stage1_best_metric,
+                        "stage1_selector_metrics": stage1_selector_metrics,
+                        "source_subject_weights": last_selector_weights,
+                        "source_weight_vote": last_selector_vote_result,
+                    }
+                ),
+            },
+            stage1_best_path,
+        )
+        save_json(
+            save_dir / "stage1_best_selector_metrics.json",
+            {
+                "best_name": "stage1_selector_final_fallback",
+                "epoch": last_stage1_epoch,
+                "criteria": stage1_selector_criteria,
+                "criteria_readable": format_criteria(stage1_selector_criteria),
+                "train_metrics": last_stage1_train_metrics,
+                "val_metrics": last_stage1_val_metrics,
+                "checkpoint_path": str(stage1_best_path),
+            },
         )
     if stage1_best_path is not None and stage1_best_path.exists():
         ckpt = torch.load(stage1_best_path, map_location=device)
         stage1.load_state_dict(ckpt["model_state_dict"])
+        stage1_selector_metrics = (
+            ckpt.get("extra_state", {}).get("stage1_selector_metrics", stage1_selector_metrics)
+            if isinstance(ckpt, dict)
+            else stage1_selector_metrics
+        )
+        print(f"[Stage1 Selector] loaded best selector for final voting: {stage1_best_path}")
     elif last_stage1_epoch > 0:
-        print("[Stage1] no best checkpoint saved after warmup; using final Stage1 model for voting.")
+        print("[Stage1 Selector] no best selector checkpoint found; using final Stage1 model for voting.")
 
     vote_result = compute_source_weights_by_classification_voting(
         stage1,
@@ -3123,6 +3866,7 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
             "source": "stage1_voting",
             "raw_stage1_weights": raw_source_weights,
             "source_weights": source_weights,
+            "stage1_selector_metrics": stage1_selector_metrics,
             **summarize_source_weights(source_weights),
         }
     ]
@@ -3152,13 +3896,36 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
         learnable_graph_rank=args.learnable_graph_rank,
         graph_mix_logit_init=args.graph_mix_logit_init,
         learnable_graph_dropout=args.learnable_graph_dropout,
+        use_subject_profile=args.use_subject_profile,
+        subject_profile_dim=args.subject_profile_dim,
+        abs_to_emo_gate_init=args.abs_to_emo_gate_init,
     ).to(device)
     print(
         f"[Stage2 Model] shared_expert_trunk={args.shared_expert_trunk}, "
-        f"expert_hidden_dim={args.expert_hidden_dim}"
+        f"expert_hidden_dim={args.expert_hidden_dim}, "
+        f"z_emo_dim={stage2.shared_encoder.emo_out_dim}, "
+        f"z_diag_dim={stage2.shared_encoder.diag_out_dim}"
     )
-    if not args.no_stage1_init:
-        load_stage1_encoder_into_stage2(stage1, stage2)
+    stage2_init_from_stage0 = False
+    stage2_stage0_init_info = None
+    stage0_init_source = None
+    if stage0_best_path and Path(stage0_best_path).exists():
+        stage0_init_source = stage0_best_path
+    elif args.stage0_encoder_path:
+        stage0_init_source = args.stage0_encoder_path
+
+    if stage0_init_source:
+        stage2_stage0_init_info = load_stage0_encoder_into_model(stage0_init_source, stage2, device)
+        stage2_init_from_stage0 = True
+        print(f"[Stage2 Init] loaded Stage0 encoder: {stage0_init_source}")
+    else:
+        print("[Stage2 Init] WARNING: Stage2 is trained without Stage0 initialization.")
+    print("[Stage2 Init] Stage1 encoder is NOT loaded")
+    try:
+        gate_value = float(torch.sigmoid(stage2.shared_encoder.backbone.abs_to_emo_gate_logit).detach().cpu().item())
+        print(f"[Stage2 Init] abs_to_emo_gate={gate_value:.4f}")
+    except AttributeError:
+        pass
 
     optimizer2 = torch.optim.AdamW(stage2.parameters(), lr=args.lr_stage2, weight_decay=args.weight_decay)
     scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer2, T_max=max(args.stage2_epochs, 1))
@@ -3181,6 +3948,29 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
     last_stage2_train_metrics = {}
     last_stage2_val_metrics = {}
     last_stage2_epoch = 0
+
+    def make_stage2_extra_state() -> dict:
+        return {
+            "domain_mapping": domain_mapping,
+            "arch_variant": args.arch_variant,
+            "resolved_arch": resolved_arch_state(args),
+            "stage0_best_path": stage0_best_path,
+            "stage0_init_stage1": stage0_init_stage1_loaded,
+            "stage2_init_from_stage0": stage2_init_from_stage0,
+            "stage2_stage0_init_info": stage2_stage0_init_info,
+            "stage1_role": "source_selector_only",
+            "stage1_best_metric": args.stage1_best_metric,
+            "stage1_selector_metrics": stage1_selector_metrics,
+            "source_subject_weights": source_weights,
+            "raw_source_subject_weights": raw_source_weights,
+            "initial_stage1_source_weights": stage1_prior_source_weights,
+            "source_weight_history": source_weight_history,
+            "source_weight_mode": source_weight_mode,
+            "source_weight_vote": vote_result,
+            "dynamic_source_weight": args.dynamic_source_weight,
+            "lambda_cond_mmd": args.lambda_cond_mmd,
+            "cond_mmd_conf_threshold": args.cond_mmd_conf_threshold,
+        }
 
     for epoch in range(1, args.stage2_epochs + 1):
         train_metrics = train_stage2_one_epoch(
@@ -3376,6 +4166,13 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
                             "domain_mapping": domain_mapping,
                             "arch_variant": args.arch_variant,
                             "resolved_arch": resolved_arch_state(args),
+                            "stage0_best_path": stage0_best_path,
+                            "stage0_init_stage1": stage0_init_stage1_loaded,
+                            "stage2_init_from_stage0": stage2_init_from_stage0,
+                            "stage2_stage0_init_info": stage2_stage0_init_info,
+                            "stage1_role": "source_selector_only",
+                            "stage1_best_metric": args.stage1_best_metric,
+                            "stage1_selector_metrics": stage1_selector_metrics,
                             "source_subject_weights": source_weights,
                             "raw_source_subject_weights": raw_source_weights,
                             "initial_stage1_source_weights": stage1_prior_source_weights,
@@ -3460,6 +4257,13 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
                 "domain_mapping": domain_mapping,
                 "arch_variant": args.arch_variant,
                 "resolved_arch": resolved_arch_state(args),
+                "stage0_best_path": stage0_best_path,
+                "stage0_init_stage1": stage0_init_stage1_loaded,
+                "stage2_init_from_stage0": stage2_init_from_stage0,
+                "stage2_stage0_init_info": stage2_stage0_init_info,
+                "stage1_role": "source_selector_only",
+                "stage1_best_metric": args.stage1_best_metric,
+                "stage1_selector_metrics": stage1_selector_metrics,
                 "source_subject_weights": source_weights,
                 "raw_source_subject_weights": raw_source_weights,
                 "initial_stage1_source_weights": stage1_prior_source_weights,
@@ -3471,6 +4275,37 @@ def run_one_fold(args, fold: int, repeat_index: int, rand_seed: int) -> dict:
                 "cond_mmd_conf_threshold": args.cond_mmd_conf_threshold,
             },
         )
+
+    if last_stage2_epoch > 0:
+        for best_name, tracker in best_trackers.items():
+            if tracker["checkpoint_path"] is not None:
+                continue
+            ckpt_path, json_path, csv_path = save_best_checkpoint(
+                save_dir=save_dir,
+                fold=fold,
+                best_name=best_name,
+                model=stage2,
+                optimizer=optimizer2,
+                epoch=last_stage2_epoch,
+                train_metrics=last_stage2_train_metrics,
+                val_metrics=last_stage2_val_metrics,
+                train_subjects=split["train_all"],
+                val_subjects=split["val_all"],
+                criteria=tracker["criteria"],
+                config_dict=config_dict,
+                scheduler=scheduler2,
+                extra_state=make_stage2_extra_state(),
+            )
+            tracker["best_metrics"] = copy.deepcopy(last_stage2_val_metrics)
+            tracker["best_train_metrics"] = copy.deepcopy(last_stage2_train_metrics)
+            tracker["best_epoch"] = last_stage2_epoch
+            tracker["checkpoint_path"] = ckpt_path
+            tracker["metrics_json_path"] = json_path
+            tracker["summary_csv_path"] = csv_path
+            print(
+                f"[Stage2] saved fallback best_{best_name} from final epoch={last_stage2_epoch}: "
+                f"path={ckpt_path}"
+            )
 
     best_rows = []
     for best_name, tracker in best_trackers.items():
@@ -3597,6 +4432,9 @@ def resolved_arch_state(args: argparse.Namespace) -> dict:
         "shared_expert_trunk": args.shared_expert_trunk,
         "fusion_mode": args.fusion_mode,
         "learnable_graph": args.learnable_graph,
+        "use_subject_profile": args.use_subject_profile,
+        "subject_profile_dim": args.subject_profile_dim,
+        "abs_to_emo_gate_init": args.abs_to_emo_gate_init,
     }
 
 
@@ -3607,6 +4445,9 @@ def print_arch_config(args: argparse.Namespace) -> None:
     print(f"[Arch] shared_expert_trunk={args.shared_expert_trunk}")
     print(f"[Arch] fusion_mode={args.fusion_mode}")
     print(f"[Arch] learnable_graph={args.learnable_graph}")
+    print(f"[Arch] use_subject_profile={args.use_subject_profile}")
+    print(f"[Arch] subject_profile_dim={args.subject_profile_dim}")
+    print(f"[Arch] abs_to_emo_gate_init={args.abs_to_emo_gate_init}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -3619,6 +4460,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n_splits", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=0)
     parser.add_argument("--all_repeats", action="store_true")
+    parser.add_argument("--stage0_epochs", type=int, default=10)
     parser.add_argument("--stage1_epochs", type=int, default=10)
     parser.add_argument("--stage2_epochs", type=int, default=25)
     parser.add_argument("--save_warmup_epochs", type=int, default=1)
@@ -3626,6 +4468,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument("--lr_stage0", type=float, default=1e-4)
     parser.add_argument("--lr_stage1", type=float, default=1e-4)
     parser.add_argument("--lr_stage2", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-3)
@@ -3667,16 +4510,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learnable_graph_rank", type=int, default=4)
     parser.add_argument("--graph_mix_logit_init", type=float, default=0.0)
     parser.add_argument("--learnable_graph_dropout", type=float, default=0.0)
+    parser.add_argument("--use_subject_profile", dest="use_subject_profile", action="store_true", default=True)
+    parser.add_argument("--no_subject_profile", dest="use_subject_profile", action="store_false")
+    parser.add_argument("--subject_profile_dim", type=int, default=32)
+    parser.add_argument("--abs_to_emo_gate_init", type=float, default=-2.0)
     parser.set_defaults(shared_expert_trunk=None)
     parser.set_defaults(learnable_graph=None)
+
+    parser.add_argument("--lambda_stage0_emo", type=float, default=1.0)
+    parser.add_argument("--lambda_stage0_diag", type=float, default=0.2)
+    parser.add_argument("--lambda_stage0_label4", type=float, default=0.0)
+    parser.add_argument("--lambda_stage0_supcon", type=float, default=0.0)
+    parser.add_argument("--stage0_init_stage1", dest="stage0_init_stage1", action="store_true", default=True)
+    parser.add_argument("--no_stage0_init_stage1", dest="stage0_init_stage1", action="store_false")
+    parser.add_argument("--stage0_encoder_path", type=str, default="")
+    parser.add_argument("--skip_stage0", action="store_true")
 
     parser.add_argument("--lambda_domain", type=float, default=1.0)
     parser.add_argument("--stage1_lambda_mmd", type=float, default=0.03)
     parser.add_argument("--lambda_emo_grl", type=float, default=0.001)
     parser.add_argument("--grl_emo", type=float, default=0.01)
-    parser.add_argument("--lambda_diag_grl", type=float, default=0.001)
-    parser.add_argument("--grl_diag", type=float, default=0.01)
+    parser.add_argument("--lambda_diag_grl", type=float, default=0.0)
+    parser.add_argument("--grl_diag", type=float, default=0.0)
     parser.add_argument("--lambda_weight_reg", type=float, default=0.0)
+    parser.add_argument("--stage1_best_metric", choices=["selector_loss", "domain_mmd"], default="selector_loss")
+    parser.add_argument("--selector_alpha_mmd", type=float, default=0.1)
+    parser.add_argument("--selector_beta_leakage", type=float, default=0.5)
+    parser.add_argument("--selector_gamma_weight_stability", type=float, default=0.2)
+    parser.add_argument("--selector_delta_weight_collapse", type=float, default=0.2)
+    parser.add_argument("--selector_min_effective_ratio", type=float, default=0.2)
+    parser.add_argument("--stage1_selector_warmup_epochs", type=int, default=2)
+    parser.add_argument("--stage1_vote_every", type=int, default=1)
     parser.add_argument("--vote_smooth", type=float, default=1.0)
     parser.add_argument("--vote_level", choices=["window", "trial"], default="trial")
     parser.add_argument("--vote_mode", choices=["hard", "soft", "soft_conf"], default="soft")
@@ -3714,7 +4578,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage2_early_stop_warmup", type=int, default=3)
     parser.add_argument("--stage2_early_stop_min_delta", type=float, default=1e-6)
 
-    parser.add_argument("--dynamic_source_weight", action="store_true")
+    parser.add_argument("--dynamic_source_weight", action="store_true",default=True)
     parser.add_argument("--dynamic_weight_start_epoch", type=int, default=5)
     parser.add_argument("--source_weight_update_every", type=int, default=5)
     parser.add_argument("--source_weight_ema", type=float, default=0.8)
