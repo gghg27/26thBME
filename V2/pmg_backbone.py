@@ -401,6 +401,8 @@ class BrainGraphBackbone(nn.Module):
         # 最终拼接：z_conv [B,64] + z_pmg [B,64] + z_bio [B,biomarker_dim]
         self.core_dim = 128
         self.out_dim = self.core_dim + self.biomarker_dim
+        self.dual_head_de_bio = True
+        print("[DualHead] emotion uses subject-relative DE/Bio; diagnosis uses absolute DE/Bio")
 
         # 保留原来的 Hjorth projector 定义，避免外部加载旧代码时报属性缺失；
         # 但当前双分支版本不再把 Hjorth 拼进最终 z。
@@ -409,6 +411,223 @@ class BrainGraphBackbone(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
         )
+
+    def _forward_dual_head(
+            self,
+            x: torch.Tensor,
+            de_feat: torch.Tensor,
+            subject_de_mu: Optional[torch.Tensor] = None,
+            subject_de_std: Optional[torch.Tensor] = None,
+            subject_bio_mu: Optional[torch.Tensor] = None,
+            subject_bio_std: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        de_rel = None
+        de_z = None
+        de_input_emotion = de_feat
+        de_for_diag = de_feat
+        de_for_emotion = de_feat
+
+        use_de_relative = (
+            self.use_subject_relative_de
+            and hasattr(self, "de_relative_adapter")
+            and subject_de_mu is not None
+            and subject_de_std is not None
+            and de_feat.size(-1) == self.de_num_bands
+        )
+        if use_de_relative:
+            subject_de_mu = subject_de_mu.to(device=de_feat.device, dtype=de_feat.dtype)
+            subject_de_std = subject_de_std.to(device=de_feat.device, dtype=de_feat.dtype)
+            de_rel = de_feat - subject_de_mu
+            de_z = de_rel / (subject_de_std + self.relative_eps)
+            de_input_emotion = torch.cat([de_feat, de_rel, de_z], dim=-1)
+            de_input_emotion = torch.nan_to_num(de_input_emotion, nan=0.0, posinf=0.0, neginf=0.0)
+            de_for_emotion = self.de_relative_adapter(de_input_emotion)
+
+        h = self.node_encoder(x)
+        node_features = h["h_raw"]
+        hjorth = h["hjorth"]
+        node_contrast_feat = self.node_contrast_projector(node_features)
+        z_conv, _ = self.conv_readout(node_features)
+
+        power_diag_emotion, band_weight_emotion = self.leranable_diag(de_for_emotion)
+        power_diag_diag, band_weight_diag = self.leranable_diag(de_for_diag)
+
+        plv_graph_emotion = self.plv_graph_constructor(
+            x,
+            diag_values=power_diag_emotion,
+        )
+        plv_graph_diag = self.plv_graph_constructor(
+            x,
+            diag_values=power_diag_diag,
+        )
+
+        pmg_emotion = self.pmg_encoder(
+            node_features=node_features,
+            plv_adj_norm=plv_graph_emotion["adj_norm"],
+            plv_matrix=plv_graph_emotion["plv_matrix"],
+        )
+        pmg_diag = self.pmg_encoder(
+            node_features=node_features,
+            plv_adj_norm=plv_graph_diag["adj_norm"],
+            plv_matrix=plv_graph_diag["plv_matrix"],
+        )
+
+        z_pmg_emotion = pmg_emotion["z_pmg"]
+        z_pmg_diag = pmg_diag["z_pmg"]
+        z_core_emotion = torch.cat([z_conv, z_pmg_emotion], dim=-1)
+        z_core_diag = torch.cat([z_conv, z_pmg_diag], dim=-1)
+
+        bio_emotion = {}
+        bio_diag = {}
+        if self.use_biomarkers and self.biomarker_extractor is not None:
+            bio_diag = self.biomarker_extractor(
+                x,
+                de_feat=de_for_diag,
+                hjorth=hjorth,
+                plv_matrix=plv_graph_diag["plv_matrix"],
+                subject_bio_mu=None,
+                subject_bio_std=None,
+            )
+            use_bio_relative = (
+                self.use_subject_relative_bio
+                and subject_bio_mu is not None
+                and subject_bio_std is not None
+            )
+            bio_emotion_de = de_for_emotion if use_bio_relative else de_for_diag
+            bio_emotion = self.biomarker_extractor(
+                x,
+                de_feat=bio_emotion_de,
+                hjorth=hjorth,
+                plv_matrix=plv_graph_emotion["plv_matrix"],
+                subject_bio_mu=subject_bio_mu,
+                subject_bio_std=subject_bio_std,
+            )
+            z_bio_emotion = bio_emotion["bio_feat"]
+            z_bio_diag = bio_diag["bio_feat"]
+            z_emotion = torch.cat([z_core_emotion, z_bio_emotion], dim=-1)
+            z_diag = torch.cat([z_core_diag, z_bio_diag], dim=-1)
+        else:
+            z_bio_emotion = z_core_emotion.new_zeros(z_core_emotion.size(0), 0)
+            z_bio_diag = z_core_diag.new_zeros(z_core_diag.size(0), 0)
+            z_emotion = z_core_emotion
+            z_diag = z_core_diag
+
+        pmg_node_embeddings = pmg_emotion["local_node_embeddings"]
+
+        return {
+            "z": z_emotion,
+            "z_emotion": z_emotion,
+            "z_diag": z_diag,
+
+            "z_core": z_core_emotion,
+            "z_core_emotion": z_core_emotion,
+            "z_core_diag": z_core_diag,
+
+            "z_bio": z_bio_emotion,
+            "z_bio_emotion": z_bio_emotion,
+            "z_bio_diag": z_bio_diag,
+            "z_conv": z_conv,
+
+            "z_pmg": z_pmg_emotion,
+            "z_pmg_emotion": z_pmg_emotion,
+            "z_pmg_diag": z_pmg_diag,
+            "z_plv": z_pmg_emotion,
+            "z_or": z_pmg_emotion,
+
+            "node_embeddings": pmg_node_embeddings,
+            "pmg_node_embeddings": pmg_node_embeddings,
+            "plv_node_embeddings": pmg_node_embeddings,
+            "local_node_embeddings": pmg_emotion["local_node_embeddings"],
+            "pmg_node_embeddings_diag": pmg_diag["local_node_embeddings"],
+            "local_node_embeddings_diag": pmg_diag["local_node_embeddings"],
+
+            "z_local": pmg_emotion["z_local"],
+            "z_local_emotion": pmg_emotion["z_local"],
+            "z_local_diag": pmg_diag["z_local"],
+            "z_region": pmg_emotion["z_region"],
+            "z_region_emotion": pmg_emotion["z_region"],
+            "z_region_diag": pmg_diag["z_region"],
+            "region_features": pmg_emotion["region_features"],
+            "region_features_emotion": pmg_emotion["region_features"],
+            "region_features_diag": pmg_diag["region_features"],
+            "region_adj": pmg_emotion["region_adj"],
+            "region_adj_emotion": pmg_emotion["region_adj"],
+            "region_adj_diag": pmg_diag["region_adj"],
+            "region_adj_norm": pmg_emotion["region_adj_norm"],
+            "region_adj_norm_emotion": pmg_emotion["region_adj_norm"],
+            "region_adj_norm_diag": pmg_diag["region_adj_norm"],
+            "region_embeddings": pmg_emotion["region_embeddings"],
+            "region_embeddings_emotion": pmg_emotion["region_embeddings"],
+            "region_embeddings_diag": pmg_diag["region_embeddings"],
+
+            "node_features": node_features,
+            "node_contrast_feat": node_contrast_feat,
+
+            "adj_norm": plv_graph_emotion["adj_norm"],
+            "adj_norm_emotion": plv_graph_emotion["adj_norm"],
+            "adj_norm_diag": plv_graph_diag["adj_norm"],
+            "adj_masked": plv_graph_emotion["adj_masked"],
+            "adj_masked_emotion": plv_graph_emotion["adj_masked"],
+            "adj_masked_diag": plv_graph_diag["adj_masked"],
+            "adj_dense": plv_graph_emotion["adj_dense"],
+            "adj_dense_emotion": plv_graph_emotion["adj_dense"],
+            "adj_dense_diag": plv_graph_diag["adj_dense"],
+            "scores": plv_graph_emotion["scores"],
+            "scores_emotion": plv_graph_emotion["scores"],
+            "scores_diag": plv_graph_diag["scores"],
+            "plv_adj_norm": plv_graph_emotion["adj_norm"],
+            "plv_adj_norm_emotion": plv_graph_emotion["adj_norm"],
+            "plv_adj_norm_diag": plv_graph_diag["adj_norm"],
+            "plv_adj_masked": plv_graph_emotion["adj_masked"],
+            "plv_adj_masked_emotion": plv_graph_emotion["adj_masked"],
+            "plv_adj_masked_diag": plv_graph_diag["adj_masked"],
+            "plv_adj_dense": plv_graph_emotion["adj_dense"],
+            "plv_adj_dense_emotion": plv_graph_emotion["adj_dense"],
+            "plv_adj_dense_diag": plv_graph_diag["adj_dense"],
+            "plv_matrix": plv_graph_emotion["plv_matrix"],
+            "plv_matrix_emotion": plv_graph_emotion["plv_matrix"],
+            "plv_matrix_diag": plv_graph_diag["plv_matrix"],
+
+            "bio_feat": z_bio_emotion,
+            "bio_raw": bio_diag.get("bio_raw", None),
+            "bio_raw_abs": bio_diag.get("bio_raw", None),
+            "bio_raw_rel": bio_emotion.get("bio_raw_rel", None),
+            "bio_raw_z": bio_emotion.get("bio_raw_z", None),
+            "bio_input": bio_emotion.get("bio_input", None),
+            "bio_input_emotion": bio_emotion.get("bio_input", None),
+            "bio_input_diag": bio_diag.get("bio_input", None),
+            "bio_freq_feat": bio_emotion.get("bio_freq_feat", None),
+            "bio_freq_feat_emotion": bio_emotion.get("bio_freq_feat", None),
+            "bio_freq_feat_diag": bio_diag.get("bio_freq_feat", None),
+            "bio_asym_feat": bio_emotion.get("bio_asym_feat", None),
+            "bio_asym_feat_emotion": bio_emotion.get("bio_asym_feat", None),
+            "bio_asym_feat_diag": bio_diag.get("bio_asym_feat", None),
+            "bio_hjorth_feat": bio_emotion.get("bio_hjorth_feat", None),
+            "bio_hjorth_feat_emotion": bio_emotion.get("bio_hjorth_feat", None),
+            "bio_hjorth_feat_diag": bio_diag.get("bio_hjorth_feat", None),
+            "bio_plv_feat": bio_emotion.get("bio_plv_feat", None),
+            "bio_plv_feat_emotion": bio_emotion.get("bio_plv_feat", None),
+            "bio_plv_feat_diag": bio_diag.get("bio_plv_feat", None),
+            "bio_nonlinear_feat": bio_emotion.get("bio_nonlinear_feat", None),
+            "bio_nonlinear_feat_emotion": bio_emotion.get("bio_nonlinear_feat", None),
+            "bio_nonlinear_feat_diag": bio_diag.get("bio_nonlinear_feat", None),
+
+            "power_diag_values": power_diag_emotion,
+            "power_diag_emotion": power_diag_emotion,
+            "power_diag_diag": power_diag_diag,
+            "de_band_weight": band_weight_emotion,
+            "de_band_weight_emotion": band_weight_emotion,
+            "de_band_weight_diag": band_weight_diag,
+            "de_rel": de_rel,
+            "de_z": de_z,
+            "de_input": de_input_emotion,
+            "de_input_emotion": de_input_emotion,
+            "de_input_diag": de_feat,
+            "de_for_model": de_for_emotion,
+            "de_for_emotion": de_for_emotion,
+            "de_for_diag": de_for_diag,
+            "hjorth": hjorth,
+        }
 
     def forward(
             self,
@@ -432,6 +651,15 @@ class BrainGraphBackbone(nn.Module):
                 node_features: [B, C, 64]
                 plv_adj_norm: [B, C, C]
         """
+        return self._forward_dual_head(
+            x=x,
+            de_feat=de_feat,
+            subject_de_mu=subject_de_mu,
+            subject_de_std=subject_de_std,
+            subject_bio_mu=subject_bio_mu,
+            subject_bio_std=subject_bio_std,
+        )
+
         # =====================================================
         # 0. Subject-relative DE。若 baseline 缺失则自动退化为原始 de_feat。
         # =====================================================

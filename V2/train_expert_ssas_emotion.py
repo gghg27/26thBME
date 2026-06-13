@@ -225,6 +225,11 @@ def compute_subject_bio_baselines(
     eps: float = 1e-6,
 ) -> tuple[dict, dict]:
     model.eval()
+    backbone = getattr(getattr(model, "shared_encoder", None), "backbone", None)
+    if backbone is not None and not getattr(backbone, "use_biomarkers", True):
+        print("[Bio baseline] skipped because biomarkers are disabled.")
+        return {}, {}
+
     sums: dict[str, torch.Tensor] = {}
     sq_sums: dict[str, torch.Tensor] = {}
     counts: dict[str, int] = defaultdict(int)
@@ -246,7 +251,8 @@ def compute_subject_bio_baselines(
         )
         bio_raw = out.get("bio_raw", None)
         if bio_raw is None:
-            raise RuntimeError("Model forward did not return bio_raw; cannot compute bio baselines.")
+            print("[Bio baseline] skipped because model forward did not return bio_raw.")
+            return {}, {}
         bio_raw = bio_raw.detach().cpu().float()
 
         for i, key in enumerate(keys):

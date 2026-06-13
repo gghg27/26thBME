@@ -4543,7 +4543,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage1_vote_every", type=int, default=1)
     parser.add_argument("--vote_smooth", type=float, default=1.0)
     parser.add_argument("--vote_level", choices=["window", "trial"], default="trial")
-    parser.add_argument("--vote_mode", choices=["hard", "soft", "soft_conf"], default="soft")
+    parser.add_argument("--vote_mode", choices=["hard", "soft", "soft_conf"], default="soft_conf")
     parser.add_argument("--tau_vote", type=float, default=0.7)
     parser.add_argument("--confidence_power", type=float, default=1.0)
     parser.add_argument("--save_topk_probs", type=int, default=5)
@@ -4597,7 +4597,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--test_vote_method",
         choices=["prob", "soft_threshold", "hard", "soft_topk", "topk"],
-        default="soft_topk",
+        default="topk",
     )
     parser.add_argument("--k_pos", type=int, default=4)
     parser.add_argument("--no_test_ensemble", action="store_true")

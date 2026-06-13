@@ -231,18 +231,21 @@ class Stage1SSASSourceSelectionModel(nn.Module):
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         enc = self.shared_encoder(x, de_feat=de_feat, **kwargs)
-        z = enc["z"]
-        z_emo = grad_reverse(z, lambda_emo) if lambda_emo > 0 else z
-        z_diag = grad_reverse(z, lambda_diag) if lambda_diag > 0 else z
+        z_emotion = enc.get("z_emotion", enc["z"])
+        z_diag_feat = enc.get("z_diag", enc["z"])
+        z_emo_grl = grad_reverse(z_emotion, lambda_emo) if lambda_emo > 0 else z_emotion
+        z_diag_grl = grad_reverse(z_diag_feat, lambda_diag) if lambda_diag > 0 else z_diag_feat
 
         out = dict(enc)
         out.update(
             {
-                "z": z,
-                "z_mmd": self.mmd_head(z),
-                "domain_logits": self.domain_head(z, lambda_grl=0.0),
-                "emotion_logits_grl": self.emotion_head(z_emo),
-                "diagnosis_logits_grl": self.diagnosis_head(z_diag),
+                "z": z_emotion,
+                "z_emotion": z_emotion,
+                "z_diag": z_diag_feat,
+                "z_mmd": self.mmd_head(z_emotion),
+                "domain_logits": self.domain_head(z_emotion, lambda_grl=0.0),
+                "emotion_logits_grl": self.emotion_head(z_emo_grl),
+                "diagnosis_logits_grl": self.diagnosis_head(z_diag_grl),
             }
         )
         return out
@@ -338,12 +341,13 @@ class Stage2ExpertEmotionAdaptationModel(nn.Module):
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         enc = self.shared_encoder(x, de_feat=de_feat, **kwargs)
-        z = enc["z"]
+        z_emotion = enc.get("z_emotion", enc["z"])
+        z_diag_feat = enc.get("z_diag", enc["z"])
 
-        diag_logits = self.diagnosis_router(z)
-        shared_logits = self.shared_emotion_head(z)
-        hc_logits = self.hc_emotion_expert(z)
-        dep_logits = self.dep_emotion_expert(z)
+        diag_logits = self.diagnosis_router(z_diag_feat)
+        shared_logits = self.shared_emotion_head(z_emotion)
+        hc_logits = self.hc_emotion_expert(z_emotion)
+        dep_logits = self.dep_emotion_expert(z_emotion)
 
         diag_prob = torch.softmax(diag_logits, dim=1)
         prob_shared = torch.softmax(shared_logits, dim=1)
@@ -359,8 +363,10 @@ class Stage2ExpertEmotionAdaptationModel(nn.Module):
         out = dict(enc)
         out.update(
             {
-                "z": z,
-                "z_mmd": self.mmd_head(z),
+                "z": z_emotion,
+                "z_emotion": z_emotion,
+                "z_diag": z_diag_feat,
+                "z_mmd": self.mmd_head(z_emotion),
                 "diag_logits": diag_logits,
                 "shared_logits": shared_logits,
                 "hc_logits": hc_logits,
@@ -368,7 +374,7 @@ class Stage2ExpertEmotionAdaptationModel(nn.Module):
                 "mix_prob": mix_prob,
                 "expert_mix_prob": expert_mix_prob,
                 "subject_domain_logits": self.subject_domain_head(
-                    z,
+                    z_emotion,
                     lambda_grl=lambda_subject,
                 ),
                 "prob_shared": prob_shared,
