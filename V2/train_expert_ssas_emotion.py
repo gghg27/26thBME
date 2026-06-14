@@ -3550,4 +3550,4 @@ if __name__ == "__main__":
     #训练
     # python3 V2/train_expert_ssas_emotion.py --all_folds --all_repeats --batch_size 200 --test_vote_method soft_topk --k_pos 4
 
-    #python3 V2/train_expert_ssas_emotion.py --all_folds --all_repeats --batch_size 200
+    #python3 V2/train_expert_ssas_emotion.py --all_folds --all_repeats --batch_size 200 --use_trial_supcon

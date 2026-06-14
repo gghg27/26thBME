@@ -268,6 +268,61 @@ class RegionPLVPMGEncoder(nn.Module):
 # Full backbone
 # =========================================================
 
+class NodeRelativeEmotionAdapter(nn.Module):
+    """
+    用 DE 相对特征调制 node_encoder 输出的通道级节点特征，
+    构造情绪分支使用的相对时序节点特征。
+
+    输入:
+        node_features: [B, C, node_dim]
+        de_input:      [B, C, de_in_dim]
+                       当 de_num_bands=5 时，de_input = concat(de_abs, de_rel, de_z)，维度为 15
+
+    输出:
+        node_features_emotion: [B, C, node_dim]
+    """
+
+    def __init__(
+            self,
+            node_dim: int = 64,
+            de_in_dim: int = 15,
+            hidden_dim: int = 64,
+            dropout: float = 0.2,
+            init_scale: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.de_proj = nn.Sequential(
+            nn.Linear(de_in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, node_dim),
+        )
+
+        self.gate = nn.Sequential(
+            nn.Linear(node_dim * 2, node_dim),
+            nn.Sigmoid(),
+        )
+
+        self.delta = nn.Sequential(
+            nn.Linear(node_dim * 2, node_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(node_dim, node_dim),
+        )
+
+        self.norm = nn.LayerNorm(node_dim)
+        self.res_scale = nn.Parameter(torch.tensor(float(init_scale)))
+
+    def forward(self, node_features: torch.Tensor, de_input: torch.Tensor) -> torch.Tensor:
+        de_ctx = self.de_proj(de_input)
+        joint = torch.cat([node_features, de_ctx], dim=-1)
+        gate = self.gate(joint)
+        delta = self.delta(joint)
+        out = node_features + self.res_scale * gate * delta
+        out = self.norm(out)
+        return out
+
+
 class BrainGraphBackbone(nn.Module):
     """
     双分支 EEG backbone (PMG 版)。
@@ -327,6 +382,13 @@ class BrainGraphBackbone(nn.Module):
                 in_bands=self.de_num_bands * 3,
                 out_bands=self.de_num_bands,
             )
+            self.node_emotion_adapter = NodeRelativeEmotionAdapter(
+                node_dim=node_dim,
+                de_in_dim=self.de_num_bands * 3,
+                hidden_dim=node_dim,
+                dropout=dropout,
+                init_scale=0.1,
+            )
 
         # 保留原来的节点特征对比分支。
         self.node_contrast_projector = NodeFeatureContrastProjector(
@@ -340,13 +402,22 @@ class BrainGraphBackbone(nn.Module):
         # 分支 1：原来的多尺度卷积特征分支
         # [B, 30, 64] -> flatten -> 256 -> 64
         # =====================================================
-        self.conv_readout = FlattenGraphReadout(
+        self.conv_readout_emotion = FlattenGraphReadout(
             node_dim=node_dim,
             num_nodes=30,
             hidden_dim=256,
             out_dim=64,
             dropout=dropout,
         )
+
+        self.conv_readout_diag = FlattenGraphReadout(
+            node_dim=node_dim,
+            num_nodes=30,
+            hidden_dim=256,
+            out_dim=64,
+            dropout=dropout,
+        )
+        self.conv_readout = self.conv_readout_emotion
 
         # =====================================================
         # 分支 2：原始信号 PLV 脑网络分支
@@ -403,6 +474,7 @@ class BrainGraphBackbone(nn.Module):
         self.out_dim = self.core_dim + self.biomarker_dim
         self.dual_head_de_bio = True
         print("[DualHead] emotion uses subject-relative DE/Bio; diagnosis uses absolute DE/Bio")
+        print("[ConvDualFlow-B2] z_conv_emotion uses DE-relative modulated node features; z_conv_diag uses absolute node features.")
 
         # 保留原来的 Hjorth projector 定义，避免外部加载旧代码时报属性缺失；
         # 但当前双分支版本不再把 Hjorth 拼进最终 z。
@@ -444,10 +516,19 @@ class BrainGraphBackbone(nn.Module):
             de_for_emotion = self.de_relative_adapter(de_input_emotion)
 
         h = self.node_encoder(x)
-        node_features = h["h_raw"]
+        node_features_abs = h["h_raw"]
         hjorth = h["hjorth"]
-        node_contrast_feat = self.node_contrast_projector(node_features)
-        z_conv, _ = self.conv_readout(node_features)
+        node_features_diag = node_features_abs
+        node_features_emotion = node_features_abs
+        if use_de_relative and hasattr(self, "node_emotion_adapter"):
+            node_features_emotion = self.node_emotion_adapter(
+                node_features_abs,
+                de_input_emotion,
+            )
+
+        node_contrast_feat = self.node_contrast_projector(node_features_emotion)
+        z_conv_emotion, _ = self.conv_readout_emotion(node_features_emotion)
+        z_conv_diag, _ = self.conv_readout_diag(node_features_diag)
 
         power_diag_emotion, band_weight_emotion = self.leranable_diag(de_for_emotion)
         power_diag_diag, band_weight_diag = self.leranable_diag(de_for_diag)
@@ -462,20 +543,20 @@ class BrainGraphBackbone(nn.Module):
         )
 
         pmg_emotion = self.pmg_encoder(
-            node_features=node_features,
+            node_features=node_features_abs,
             plv_adj_norm=plv_graph_emotion["adj_norm"],
             plv_matrix=plv_graph_emotion["plv_matrix"],
         )
         pmg_diag = self.pmg_encoder(
-            node_features=node_features,
+            node_features=node_features_abs,
             plv_adj_norm=plv_graph_diag["adj_norm"],
             plv_matrix=plv_graph_diag["plv_matrix"],
         )
 
         z_pmg_emotion = pmg_emotion["z_pmg"]
         z_pmg_diag = pmg_diag["z_pmg"]
-        z_core_emotion = torch.cat([z_conv, z_pmg_emotion], dim=-1)
-        z_core_diag = torch.cat([z_conv, z_pmg_diag], dim=-1)
+        z_core_emotion = torch.cat([z_conv_emotion, z_pmg_emotion], dim=-1)
+        z_core_diag = torch.cat([z_conv_diag, z_pmg_diag], dim=-1)
 
         bio_emotion = {}
         bio_diag = {}
@@ -526,7 +607,9 @@ class BrainGraphBackbone(nn.Module):
             "z_bio": z_bio_emotion,
             "z_bio_emotion": z_bio_emotion,
             "z_bio_diag": z_bio_diag,
-            "z_conv": z_conv,
+            "z_conv": z_conv_emotion,
+            "z_conv_emotion": z_conv_emotion,
+            "z_conv_diag": z_conv_diag,
 
             "z_pmg": z_pmg_emotion,
             "z_pmg_emotion": z_pmg_emotion,
@@ -560,7 +643,10 @@ class BrainGraphBackbone(nn.Module):
             "region_embeddings_emotion": pmg_emotion["region_embeddings"],
             "region_embeddings_diag": pmg_diag["region_embeddings"],
 
-            "node_features": node_features,
+            "node_features": node_features_emotion,
+            "node_features_abs": node_features_abs,
+            "node_features_emotion": node_features_emotion,
+            "node_features_diag": node_features_diag,
             "node_contrast_feat": node_contrast_feat,
 
             "adj_norm": plv_graph_emotion["adj_norm"],
