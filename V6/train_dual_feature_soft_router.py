@@ -1775,7 +1775,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n_splits", type=int, default=10)
     parser.add_argument("--repeat_seeds", type=str, default=",".join(str(s) for s in getattr(config, "V2_seed", [42])))
     parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--batch_size", type=int, default=200)
+    parser.add_argument("--batch_size", type=int, default=300)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -1849,3 +1849,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    #
