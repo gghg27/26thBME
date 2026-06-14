@@ -5,7 +5,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Function
-from models.dep_contrast_bio import NodeFeatureEncoder,NodeFeatureContrastProjector, FlattenGraphReadout, RawSignalPLVGraphConstructor, WeightedGCNEncoder, BiologicalMarkerExtractor, normalize_adjacency
+from models.dep_contrast_bio import (
+    NodeFeatureEncoder,
+    NodeFeatureContrastProjector,
+    FlattenGraphReadout,
+    RawSignalPLVGraphConstructor,
+    WeightedGCNEncoder,
+    BiologicalMarkerExtractor,
+    normalize_adjacency,
+    masked_topk_adjacency,
+    add_power_diag_self_loop,
+)
 from models.dep_contrast_bio import BandPowerDiagonalMapper, LearnableDEDiagonalFusion, SubjectRelativeDEAdapter
 
 # =========================================================
@@ -412,6 +422,54 @@ class BrainGraphBackbone(nn.Module):
             nn.Dropout(dropout),
         )
 
+    def _graph_from_override_plv(
+            self,
+            plv_matrix: torch.Tensor,
+            diag_values: Optional[torch.Tensor],
+            reference_x: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Build the PLV graph path from an externally supplied PLV matrix."""
+
+        if plv_matrix.ndim == 4:
+            plv_matrix = plv_matrix.mean(dim=1)
+        if plv_matrix.ndim == 2:
+            plv_matrix = plv_matrix.unsqueeze(0)
+        if plv_matrix.ndim != 3:
+            raise ValueError(f"override_plv_adj should be [B, N, N] or [N, N], got {tuple(plv_matrix.shape)}")
+
+        B, N, _ = reference_x.shape
+        plv_matrix = plv_matrix.to(device=reference_x.device, dtype=reference_x.dtype)
+        if plv_matrix.size(0) == 1 and B > 1:
+            plv_matrix = plv_matrix.expand(B, -1, -1)
+        if plv_matrix.shape != (B, N, N):
+            raise ValueError(f"override_plv_adj shape should be {(B, N, N)}, got {tuple(plv_matrix.shape)}")
+
+        plv_matrix = torch.nan_to_num(plv_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+        plv_matrix = plv_matrix.clamp(min=0.0)
+        if getattr(self.plv_graph_constructor, "symmetrize", True):
+            plv_matrix = 0.5 * (plv_matrix + plv_matrix.transpose(-1, -2))
+
+        eye = torch.eye(N, device=reference_x.device, dtype=reference_x.dtype).unsqueeze(0).expand(B, -1, -1)
+        adj_dense = plv_matrix * (1.0 - eye)
+        adj_masked = masked_topk_adjacency(
+            adj_dense,
+            k=int(getattr(self.plv_graph_constructor, "topk", 8)),
+            symmetrize_after=bool(getattr(self.plv_graph_constructor, "symmetrize", True)),
+        )
+        if diag_values is None:
+            adj_with_self = adj_masked + eye
+        else:
+            adj_with_self = add_power_diag_self_loop(adj_masked, eye, diag_values)
+        adj_norm = normalize_adjacency(adj_with_self)
+
+        return {
+            "adj_norm": adj_norm,
+            "adj_masked": adj_masked,
+            "adj_dense": adj_dense,
+            "scores": plv_matrix,
+            "plv_matrix": plv_matrix,
+        }
+
     def _forward_dual_head(
             self,
             x: torch.Tensor,
@@ -420,6 +478,11 @@ class BrainGraphBackbone(nn.Module):
             subject_de_std: Optional[torch.Tensor] = None,
             subject_bio_mu: Optional[torch.Tensor] = None,
             subject_bio_std: Optional[torch.Tensor] = None,
+            override_plv_adj: Optional[torch.Tensor] = None,
+            return_features: bool = False,
+            return_plv: bool = False,
+            return_route: bool = False,
+            return_logits: bool = False,
     ) -> Dict[str, torch.Tensor]:
         de_rel = None
         de_z = None
@@ -452,14 +515,26 @@ class BrainGraphBackbone(nn.Module):
         power_diag_emotion, band_weight_emotion = self.leranable_diag(de_for_emotion)
         power_diag_diag, band_weight_diag = self.leranable_diag(de_for_diag)
 
-        plv_graph_emotion = self.plv_graph_constructor(
-            x,
-            diag_values=power_diag_emotion,
-        )
-        plv_graph_diag = self.plv_graph_constructor(
-            x,
-            diag_values=power_diag_diag,
-        )
+        if override_plv_adj is None:
+            plv_graph_emotion = self.plv_graph_constructor(
+                x,
+                diag_values=power_diag_emotion,
+            )
+            plv_graph_diag = self.plv_graph_constructor(
+                x,
+                diag_values=power_diag_diag,
+            )
+        else:
+            plv_graph_emotion = self._graph_from_override_plv(
+                override_plv_adj,
+                diag_values=power_diag_emotion,
+                reference_x=x,
+            )
+            plv_graph_diag = self._graph_from_override_plv(
+                override_plv_adj,
+                diag_values=power_diag_diag,
+                reference_x=x,
+            )
 
         pmg_emotion = self.pmg_encoder(
             node_features=node_features,
@@ -637,6 +712,11 @@ class BrainGraphBackbone(nn.Module):
             subject_de_std: Optional[torch.Tensor] = None,
             subject_bio_mu: Optional[torch.Tensor] = None,
             subject_bio_std: Optional[torch.Tensor] = None,
+            override_plv_adj: Optional[torch.Tensor] = None,
+            return_features: bool = False,
+            return_plv: bool = False,
+            return_route: bool = False,
+            return_logits: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -658,6 +738,11 @@ class BrainGraphBackbone(nn.Module):
             subject_de_std=subject_de_std,
             subject_bio_mu=subject_bio_mu,
             subject_bio_std=subject_bio_std,
+            override_plv_adj=override_plv_adj,
+            return_features=return_features,
+            return_plv=return_plv,
+            return_route=return_route,
+            return_logits=return_logits,
         )
 
         # =====================================================

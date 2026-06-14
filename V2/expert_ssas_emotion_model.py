@@ -228,13 +228,29 @@ class Stage1SSASSourceSelectionModel(nn.Module):
         de_feat: torch.Tensor,
         lambda_emo: float = 0.0,
         lambda_diag: float = 0.0,
+        return_features: bool = False,
+        return_plv: bool = False,
+        return_route: bool = False,
+        return_logits: bool = False,
+        override_plv_adj: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
-        enc = self.shared_encoder(x, de_feat=de_feat, **kwargs)
+        enc = self.shared_encoder(
+            x,
+            de_feat=de_feat,
+            return_features=return_features,
+            return_plv=return_plv,
+            return_route=return_route,
+            return_logits=return_logits,
+            override_plv_adj=override_plv_adj,
+            **kwargs,
+        )
         z_emotion = enc.get("z_emotion", enc["z"])
         z_diag_feat = enc.get("z_diag", enc["z"])
         z_emo_grl = grad_reverse(z_emotion, lambda_emo) if lambda_emo > 0 else z_emotion
         z_diag_grl = grad_reverse(z_diag_feat, lambda_diag) if lambda_diag > 0 else z_diag_feat
+        emotion_logits = self.emotion_head(z_emo_grl)
+        diagnosis_logits = self.diagnosis_head(z_diag_grl)
 
         out = dict(enc)
         out.update(
@@ -242,10 +258,18 @@ class Stage1SSASSourceSelectionModel(nn.Module):
                 "z": z_emotion,
                 "z_emotion": z_emotion,
                 "z_diag": z_diag_feat,
+                "z_abs": z_diag_feat,
+                "z_rel": z_emotion,
+                "z_fused": z_emotion,
                 "z_mmd": self.mmd_head(z_emotion),
                 "domain_logits": self.domain_head(z_emotion, lambda_grl=0.0),
-                "emotion_logits_grl": self.emotion_head(z_emo_grl),
-                "diagnosis_logits_grl": self.diagnosis_head(z_diag_grl),
+                "emotion_logits_grl": emotion_logits,
+                "diagnosis_logits_grl": diagnosis_logits,
+                "emotion_logits": emotion_logits,
+                "diagnosis_logits": diagnosis_logits,
+                "emotion_prob": torch.softmax(emotion_logits, dim=1),
+                "diagnosis_prob": torch.softmax(diagnosis_logits, dim=1),
+                "plv_adj": enc.get("plv_matrix", enc.get("adj_dense", None)),
             }
         )
         return out
@@ -338,9 +362,23 @@ class Stage2ExpertEmotionAdaptationModel(nn.Module):
         x: torch.Tensor,
         de_feat: torch.Tensor,
         lambda_subject: float = 0.0,
+        return_features: bool = False,
+        return_plv: bool = False,
+        return_route: bool = False,
+        return_logits: bool = False,
+        override_plv_adj: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
-        enc = self.shared_encoder(x, de_feat=de_feat, **kwargs)
+        enc = self.shared_encoder(
+            x,
+            de_feat=de_feat,
+            return_features=return_features,
+            return_plv=return_plv,
+            return_route=return_route,
+            return_logits=return_logits,
+            override_plv_adj=override_plv_adj,
+            **kwargs,
+        )
         z_emotion = enc.get("z_emotion", enc["z"])
         z_diag_feat = enc.get("z_diag", enc["z"])
 
@@ -366,12 +404,18 @@ class Stage2ExpertEmotionAdaptationModel(nn.Module):
                 "z": z_emotion,
                 "z_emotion": z_emotion,
                 "z_diag": z_diag_feat,
+                "z_abs": z_diag_feat,
+                "z_rel": z_emotion,
+                "z_fused": z_emotion,
                 "z_mmd": self.mmd_head(z_emotion),
                 "diag_logits": diag_logits,
+                "diagnosis_logits": diag_logits,
                 "shared_logits": shared_logits,
                 "hc_logits": hc_logits,
                 "dep_logits": dep_logits,
+                "emotion_logits": torch.log(mix_prob.clamp_min(1e-8)),
                 "mix_prob": mix_prob,
+                "emotion_prob": mix_prob,
                 "expert_mix_prob": expert_mix_prob,
                 "subject_domain_logits": self.subject_domain_head(
                     z_emotion,
@@ -381,6 +425,9 @@ class Stage2ExpertEmotionAdaptationModel(nn.Module):
                 "prob_hc": prob_hc,
                 "prob_dep": prob_dep,
                 "diag_prob": diag_prob,
+                "diagnosis_prob": diag_prob,
+                "route_weight": torch.cat([p_hc, p_dep], dim=1),
+                "plv_adj": enc.get("plv_matrix", enc.get("adj_dense", None)),
                 "logits": mix_prob,
             }
         )
