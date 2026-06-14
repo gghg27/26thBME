@@ -1401,6 +1401,110 @@ def predict_test_trial_level(
     return trial_df
 
 
+def ensemble_test_predictions_from_fold_outputs(
+    results: list[dict],
+    save_root: str | Path,
+    threshold: float = 0.5,
+    vote_method: str = "soft_topk",
+    k_pos: int = 4,
+) -> Optional[pd.DataFrame]:
+    """Average per-fold V6 test trial predictions and write ensemble submissions.
+
+    Each fold has already run predict_test_trial_level(), so we ensemble the saved
+    trial-level probabilities/log-odds instead of forwarding all models again.
+    """
+
+    fold_frames = []
+    for result in results:
+        trial_path = Path(result["save_dir"]) / "test_trial_probs.csv"
+        if not trial_path.exists():
+            print(f"[V6 ensemble] skip missing trial prediction: {trial_path}")
+            continue
+        df = pd.read_csv(trial_path)
+        required_cols = {"user_id", "trial_id", "prob_pos", "score_pos", "hard_mean"}
+        missing = required_cols - set(df.columns)
+        if missing:
+            print(f"[V6 ensemble] skip {trial_path}; missing columns={sorted(missing)}")
+            continue
+        df = df.copy()
+        df["source_fold"] = int(result["fold"])
+        df["source_repeat"] = int(result["repeat_index"])
+        df["source_best_name"] = str(result.get("best_name", ""))
+        df["source_best_path"] = str(result.get("best_path", ""))
+        fold_frames.append(df)
+
+    if not fold_frames:
+        print("[V6 ensemble] no fold test_trial_probs.csv files found; ensemble skipped.")
+        return None
+
+    all_pred_df = pd.concat(fold_frames, ignore_index=True)
+    ensemble_dir = Path(save_root) / "v6_test_ensemble"
+    ensemble_dir.mkdir(parents=True, exist_ok=True)
+    all_pred_df.to_csv(ensemble_dir / "ensemble_member_trial_probs.csv", index=False, encoding="utf-8-sig")
+
+    agg_kwargs = {
+        "prob_pos": ("prob_pos", "mean"),
+        "score_pos": ("score_pos", "mean"),
+        "hard_mean": ("hard_mean", "mean"),
+        "model_count": ("prob_pos", "count"),
+    }
+    if "n_windows" in all_pred_df.columns:
+        agg_kwargs["n_windows_mean"] = ("n_windows", "mean")
+
+    trial_df = (
+        all_pred_df.groupby(["user_id", "trial_id"], as_index=False)
+        .agg(**agg_kwargs)
+        .sort_values(["user_id", "trial_id"])
+    )
+    trial_df["trial_prob"] = trial_df["prob_pos"]
+    trial_df["pred_soft_threshold"] = (trial_df["prob_pos"] >= threshold).astype(int)
+    trial_df["pred_hard_threshold"] = (trial_df["hard_mean"] >= 0.5).astype(int)
+
+    topk_records = apply_subject_topk(
+        trial_df[["user_id", "trial_id", "prob_pos", "score_pos"]].to_dict("records"),
+        k_pos=k_pos,
+    )
+    topk_df = pd.DataFrame(topk_records)[["user_id", "trial_id", "Emotion_label"]].rename(
+        columns={"Emotion_label": "pred_soft_topk"}
+    )
+    trial_df = trial_df.merge(topk_df, on=["user_id", "trial_id"], how="left")
+    trial_df["pred_soft_topk"] = trial_df["pred_soft_topk"].fillna(0).astype(int)
+
+    if vote_method == "hard":
+        trial_df["Emotion_label"] = trial_df["pred_hard_threshold"]
+    elif vote_method in {"soft_topk", "topk"}:
+        trial_df["Emotion_label"] = trial_df["pred_soft_topk"]
+    elif vote_method in {"prob", "soft_threshold"}:
+        trial_df["Emotion_label"] = trial_df["pred_soft_threshold"]
+    else:
+        raise ValueError(f"Unknown vote_method={vote_method}")
+
+    trial_df.to_csv(ensemble_dir / "ensemble_trial_probs.csv", index=False, encoding="utf-8-sig")
+
+    sub_soft_threshold = trial_df[["user_id", "trial_id", "pred_soft_threshold"]].copy()
+    sub_soft_threshold.rename(columns={"pred_soft_threshold": "Emotion_label"}, inplace=True)
+    sub_soft_threshold.to_csv(ensemble_dir / "submission_v6_ensemble_soft_threshold.csv", index=False, encoding="utf-8-sig")
+
+    sub_soft_topk = trial_df[["user_id", "trial_id", "pred_soft_topk"]].copy()
+    sub_soft_topk.rename(columns={"pred_soft_topk": "Emotion_label"}, inplace=True)
+    sub_soft_topk.to_csv(ensemble_dir / "submission_v6_ensemble_soft_topk.csv", index=False, encoding="utf-8-sig")
+
+    sub_hard_threshold = trial_df[["user_id", "trial_id", "pred_hard_threshold"]].copy()
+    sub_hard_threshold.rename(columns={"pred_hard_threshold": "Emotion_label"}, inplace=True)
+    sub_hard_threshold.to_csv(ensemble_dir / "submission_v6_ensemble_hard_threshold.csv", index=False, encoding="utf-8-sig")
+
+    submission = trial_df[["user_id", "trial_id", "Emotion_label"]].copy()
+    submission.to_csv(ensemble_dir / "submission_v6_ensemble.csv", index=False, encoding="utf-8-sig")
+
+    n_models = int(trial_df["model_count"].max()) if not trial_df.empty else 0
+    n_selected = int(submission["Emotion_label"].sum()) if not submission.empty else 0
+    print(
+        f"[V6 ensemble] saved to {ensemble_dir}; models={n_models}, "
+        f"trials={len(submission)}, selected={vote_method}: {n_selected}/{len(submission)} positive"
+    )
+    return trial_df
+
+
 def _extra_state(domain_mapping: dict) -> dict:
     return {
         "domain_mapping": domain_mapping,
@@ -1845,6 +1949,15 @@ def main() -> None:
         summary_rows.append(row)
     pd.DataFrame(summary_rows).to_csv(save_root / "all_fold_summary.csv", index=False, encoding="utf-8-sig")
     print(f"[done] summary saved to {save_root / 'all_fold_summary.csv'}")
+
+    if args.all_folds and args.predict_test:
+        ensemble_test_predictions_from_fold_outputs(
+            results,
+            save_root=save_root,
+            threshold=args.threshold,
+            vote_method=args.vote_method,
+            k_pos=args.k_pos,
+        )
 
 
 if __name__ == "__main__":
