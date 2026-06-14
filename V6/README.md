@@ -71,6 +71,18 @@ Full folds with automatic test ensemble:
 python V6/train_dual_feature_soft_router.py --all_folds --epochs 100 --predict_test
 ```
 
+Ensemble existing checkpoints without retraining:
+
+```bash
+python V6/ensemble_predict.py --model_dir model_params/V6_NoSSAS_DualFeature_SoftRouter
+```
+
+Or pass checkpoint paths explicitly:
+
+```bash
+python V6/ensemble_predict.py --model_paths path/to/fold0/v6_best.pt path/to/fold1/v6_best.pt
+```
+
 The default test voting method is `soft_topk`, matching the expected 4 positive
 trials per 8-trial test subject.
 
@@ -100,6 +112,12 @@ model_params/V6_NoSSAS_DualFeature_SoftRouter/v6_test_ensemble/
 ```
 
 The final ensemble submission is `submission_v6_ensemble.csv`.
+
+For `V6/ensemble_predict.py`, outputs are written by default to:
+
+```text
+model_params/V6_NoSSAS_DualFeature_SoftRouter/v6_checkpoint_ensemble/
+```
 
 This version is meant to test whether relative/absolute feature disentanglement
 plus diagnosis-guided emotion expert routing is stable without complex domain

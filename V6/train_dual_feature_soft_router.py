@@ -1869,7 +1869,7 @@ def _parse_repeat_seeds(value: str | None) -> list[int]:
     return [int(p) for p in parts] if parts else [42]
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args() -> argparse.Namespace: 
     parser = argparse.ArgumentParser(description=VERSION_NAME)
     parser.add_argument("--index_csv", type=str, default="com_index_sub_2s.csv")
     parser.add_argument("--test_csv", type=str, default="com_test_trial_index_2s.csv")
