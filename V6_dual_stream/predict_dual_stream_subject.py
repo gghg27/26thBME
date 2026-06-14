@@ -49,6 +49,7 @@ def build_model_from_config(config_dict: dict) -> DualStreamSubjectEmotionModel:
         share_abs_rel_encoder=bool(config_dict.get("share_abs_rel_encoder", False)),
         hidden_dim=int(config_dict.get("hidden_dim", 128)),
         relative_eps=float(config_dict.get("relative_eps", 1e-6)),
+        encode_chunk_size=int(config_dict.get("encode_chunk_size", 0)),
     )
 
 

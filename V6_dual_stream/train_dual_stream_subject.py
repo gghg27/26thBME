@@ -9,6 +9,7 @@ import json
 import os
 import random
 import sys
+from contextlib import nullcontext
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -255,6 +256,12 @@ def forward_model(model: torch.nn.Module, batch: dict) -> dict:
     )
 
 
+def autocast_context(device: torch.device, amp_enabled: bool):
+    if amp_enabled and device.type == "cuda":
+        return torch.cuda.amp.autocast()
+    return nullcontext()
+
+
 def compute_loss(out: dict, batch: dict, args: argparse.Namespace) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     y_emo = batch["emotion_label"].long()
     y_diag = batch["diagnosis_label"].long()
@@ -279,7 +286,7 @@ def compute_loss(out: dict, batch: dict, args: argparse.Namespace) -> tuple[torc
     }
 
 
-def train_one_epoch(model, loader, optimizer, device, args) -> dict:
+def train_one_epoch(model, loader, optimizer, device, args, scaler=None) -> dict:
     model.train()
     totals = defaultdict(float)
     total_subjects = 0
@@ -290,12 +297,23 @@ def train_one_epoch(model, loader, optimizer, device, args) -> dict:
     for batch in pbar:
         batch = move_batch_to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
-        out = forward_model(model, batch)
-        loss, loss_parts = compute_loss(out, batch, args)
-        loss.backward()
-        if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.grad_clip))
-        optimizer.step()
+        amp_enabled = bool(args.amp and device.type == "cuda")
+        with autocast_context(device, amp_enabled):
+            out = forward_model(model, batch)
+            loss, loss_parts = compute_loss(out, batch, args)
+
+        if scaler is not None and scaler.is_enabled():
+            scaler.scale(loss).backward()
+            if args.grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.grad_clip))
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(args.grad_clip))
+            optimizer.step()
 
         batch_subjects = int(batch["x_abs"].size(0))
         total_subjects += batch_subjects
@@ -329,8 +347,9 @@ def validate(model, loader, device, args, save_dir: Path | None = None) -> dict:
 
     for batch in tqdm(loader, desc="V6-dual-val", leave=False):
         batch = move_batch_to_device(batch, device)
-        out = forward_model(model, batch)
-        loss, loss_parts = compute_loss(out, batch, args)
+        with autocast_context(device, bool(args.amp and device.type == "cuda")):
+            out = forward_model(model, batch)
+            loss, loss_parts = compute_loss(out, batch, args)
         batch_subjects = int(batch["x_abs"].size(0))
         total_subjects += batch_subjects
         totals["loss"] += float(loss.item()) * batch_subjects
@@ -413,6 +432,7 @@ def build_model(args_or_config: argparse.Namespace | dict) -> DualStreamSubjectE
         share_abs_rel_encoder=bool(cfg.get("share_abs_rel_encoder", False)),
         hidden_dim=int(cfg.get("hidden_dim", 128)),
         relative_eps=float(cfg.get("relative_eps", 1e-6)),
+        encode_chunk_size=int(cfg.get("encode_chunk_size", 0)),
     )
 
 
@@ -487,10 +507,12 @@ def run_one_fold(args: argparse.Namespace, fold: int, base_seed: int) -> dict:
     model = build_model(args).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
+    scaler = torch.cuda.amp.GradScaler(enabled=bool(args.amp and device.type == "cuda"))
 
     print(
         f"[model] encoder_dim={model.encoder_dim} share_abs_rel_encoder={model.share_abs_rel_encoder} "
-        f"shared_mix_alpha={model.shared_mix_alpha}"
+        f"shared_mix_alpha={model.shared_mix_alpha} encode_chunk_size={model.encode_chunk_size} "
+        f"amp={bool(args.amp and device.type == 'cuda')}"
     )
     print(f"[best] criteria={format_criteria(BEST_CRITERIA)}")
 
@@ -500,7 +522,7 @@ def run_one_fold(args: argparse.Namespace, fold: int, base_seed: int) -> dict:
     best_path = save_dir / "best_checkpoint.pt"
 
     for epoch in range(1, args.epochs + 1):
-        train_metrics = train_one_epoch(model, train_loader, optimizer, device, args)
+        train_metrics = train_one_epoch(model, train_loader, optimizer, device, args, scaler=scaler)
         val_metrics = validate(model, val_loader, device, args, save_dir=save_dir)
         scheduler.step()
 
@@ -597,6 +619,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--de_num_bands", type=int, default=5)
     parser.add_argument("--no_biomarkers", action="store_true")
     parser.add_argument("--share_abs_rel_encoder", action="store_true")
+    parser.add_argument(
+        "--encode_chunk_size",
+        type=int,
+        default=0,
+        help="Forward encoder windows in chunks. 0 means all windows at once; use 1/2/4 to reduce CUDA memory.",
+    )
+    parser.add_argument("--amp", action="store_true", help="Use CUDA automatic mixed precision to reduce memory.")
     parser.add_argument("--relative_eps", type=float, default=1e-6)
     parser.add_argument("--lambda_diag", type=float, default=0.2)
     parser.add_argument("--lambda_expert", type=float, default=0.5)

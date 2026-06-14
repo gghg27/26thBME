@@ -117,11 +117,13 @@ class DualStreamSubjectEmotionModel(nn.Module):
         share_abs_rel_encoder: bool = False,
         hidden_dim: int = 128,
         relative_eps: float = 1e-6,
+        encode_chunk_size: int = 0,
     ) -> None:
         super().__init__()
         self.shared_mix_alpha = float(max(0.0, min(1.0, shared_mix_alpha)))
         self.share_abs_rel_encoder = bool(share_abs_rel_encoder)
         self.relative_eps = float(relative_eps)
+        self.encode_chunk_size = int(encode_chunk_size)
 
         encoder_kwargs = dict(
             sfreq=sfreq,
@@ -191,8 +193,17 @@ class DualStreamSubjectEmotionModel(nn.Module):
         batch, trials, windows, channels, time_len = x.shape
         flat_x = x.reshape(batch * trials * windows, channels, time_len)
         flat_de = de_feat.reshape(batch * trials * windows, channels, de_feat.shape[-1])
-        enc = encoder(flat_x, flat_de)
-        z = enc.get(z_key, enc["z"])
+        chunk_size = int(self.encode_chunk_size)
+        if chunk_size <= 0 or chunk_size >= flat_x.size(0):
+            enc = encoder(flat_x, flat_de)
+            z = enc.get(z_key, enc["z"])
+        else:
+            z_chunks = []
+            for start in range(0, flat_x.size(0), chunk_size):
+                end = min(start + chunk_size, flat_x.size(0))
+                enc = encoder(flat_x[start:end], flat_de[start:end])
+                z_chunks.append(enc.get(z_key, enc["z"]))
+            z = torch.cat(z_chunks, dim=0)
         return z.reshape(batch, trials, windows, -1)
 
     def _pool_windows(
