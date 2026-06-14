@@ -122,6 +122,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip_occlusion", action="store_true")
     parser.add_argument("--no_normalize", action="store_true")
     parser.add_argument("--use_raw_diagnosis_label", action="store_true")
+    parser.add_argument("--strict_load", action="store_true", help="Require an exact checkpoint/model state_dict match.")
     return parser.parse_args()
 
 
@@ -193,7 +194,54 @@ def build_domain_mapping_if_needed(args: argparse.Namespace, ckpt: dict) -> tupl
     return domain_mapping, train_subjects, val_subjects
 
 
-def build_stage2_model(ckpt: dict, domain_mapping: dict, device: torch.device) -> Stage2ExpertEmotionAdaptationModel:
+def load_model_state_compat(
+    model: torch.nn.Module,
+    state: dict[str, torch.Tensor],
+    strict: bool = False,
+) -> None:
+    if not isinstance(state, dict):
+        raise TypeError(f"Checkpoint model_state_dict must be a dict, got {type(state)!r}")
+
+    if state and all(str(key).startswith("module.") for key in state.keys()):
+        state = {str(key)[7:]: value for key, value in state.items()}
+
+    if strict:
+        model.load_state_dict(state, strict=True)
+        return
+
+    model_state = model.state_dict()
+    compatible_state = {}
+    incompatible = []
+    for key, value in state.items():
+        if key not in model_state:
+            continue
+        if tuple(value.shape) != tuple(model_state[key].shape):
+            incompatible.append((key, tuple(value.shape), tuple(model_state[key].shape)))
+            continue
+        compatible_state[key] = value
+
+    missing, unexpected = model.load_state_dict(compatible_state, strict=False)
+    skipped_unexpected = [key for key in state.keys() if key not in model_state]
+    if missing:
+        print(f"[WARN] Missing checkpoint keys loaded with current defaults: {len(missing)}")
+        print("[WARN] Missing examples:", ", ".join(list(missing)[:8]))
+    if skipped_unexpected:
+        print(f"[WARN] Ignored unexpected checkpoint keys: {len(skipped_unexpected)}")
+        print("[WARN] Unexpected examples:", ", ".join(skipped_unexpected[:8]))
+    if incompatible:
+        print(f"[WARN] Ignored shape-mismatched checkpoint keys: {len(incompatible)}")
+        examples = [f"{key}: ckpt{src} != model{dst}" for key, src, dst in incompatible[:5]]
+        print("[WARN] Shape mismatch examples:", "; ".join(examples))
+    if unexpected:
+        print(f"[WARN] load_state_dict reported unexpected compatible keys: {len(unexpected)}")
+
+
+def build_stage2_model(
+    ckpt: dict,
+    domain_mapping: dict,
+    device: torch.device,
+    strict_load: bool = False,
+) -> Stage2ExpertEmotionAdaptationModel:
     config_dict = ckpt.get("config", {}) or {}
     use_biomarkers = not bool(config_dict.get("no_biomarkers", False))
     use_subject_relative_de = not bool(config_dict.get("no_subject_relative_de", False))
@@ -213,7 +261,7 @@ def build_stage2_model(ckpt: dict, domain_mapping: dict, device: torch.device) -
         shared_mix_alpha=float(config_dict.get("shared_mix_alpha", 0.5)),
     ).to(device)
     state = ckpt.get("model_state_dict", ckpt)
-    model.load_state_dict(state)
+    load_model_state_compat(model, state, strict=strict_load)
     model.eval()
     return model
 
@@ -1219,7 +1267,7 @@ def main() -> None:
 
     ckpt = load_checkpoint(args.ckpt, device)
     domain_mapping, train_subjects, val_subjects = build_domain_mapping_if_needed(args, ckpt)
-    model = build_stage2_model(ckpt, domain_mapping, device)
+    model = build_stage2_model(ckpt, domain_mapping, device, strict_load=args.strict_load)
     print("[OK] Loaded model checkpoint")
 
     dataset, loader = build_dataset_and_loader(args, domain_mapping, train_subjects, val_subjects)
