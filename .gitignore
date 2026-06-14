@@ -1,5 +1,6 @@
 data/
-testdata/
+test_data/
+train_data/
 model_params/
 dep/
 hc/
