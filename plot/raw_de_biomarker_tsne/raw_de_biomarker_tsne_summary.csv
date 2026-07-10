@@ -1,0 +1,10 @@
+﻿feature_type,feature_name,label_mode,n_samples,feature_dim,silhouette
+de_feat,DE features,label4,480,150,-0.05383453518152237
+de_feat,DE features,diagnosis,480,150,0.12667106091976166
+de_feat,DE features,emotion,480,150,0.02112063206732273
+bio_raw,Biomarker features,label4,480,57,-0.04809112846851349
+bio_raw,Biomarker features,diagnosis,480,57,0.06727800518274307
+bio_raw,Biomarker features,emotion,480,57,0.020669186487793922
+de_bio_fused,DE + biomarker fused features,label4,480,207,-0.07330616563558578
+de_bio_fused,DE + biomarker fused features,diagnosis,480,207,0.0955728217959404
+de_bio_fused,DE + biomarker fused features,emotion,480,207,0.008681452833116055

@@ -558,13 +558,13 @@ def com_preprocess_subject(pos_data, neu_data, sfreq=250, ch_name_path="../ch_na
     # 6. subject-wise 标准化
     #    在整个被试的 pos + neu 上算 mean/std
     # =========================
-    clean_all_norm, subj_mean, subj_std = subject_wise_zscore(clean_all)
+    # clean_all_norm, subj_mean, subj_std = subject_wise_zscore(clean_all)
 
     # =========================
     # 7. 切回 pos 和 neu
     # =========================
-    pos_clean_norm = clean_all_norm[:, :pos_len]
-    neu_clean_norm = clean_all_norm[:, pos_len:pos_len + neu_len]
+    pos_clean_norm = clean_all[:, :pos_len]
+    neu_clean_norm = clean_all[:, pos_len:pos_len + neu_len]
 
     assert pos_clean_norm.shape == pos_data.shape
     assert neu_clean_norm.shape == neu_data.shape
@@ -573,8 +573,8 @@ def com_preprocess_subject(pos_data, neu_data, sfreq=250, ch_name_path="../ch_na
         "bad_channels": bads,
         "ica_labels": labels,
         "ica_exclude_idx": exclude_idx,
-        "subject_mean": subj_mean,
-        "subject_std": subj_std,
+        # "subject_mean": subj_mean,
+        # "subject_std": subj_std,
     }
 
     return pos_clean_norm, neu_clean_norm, info_dict
