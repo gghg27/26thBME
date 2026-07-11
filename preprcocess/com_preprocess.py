@@ -19,8 +19,8 @@ from mne_icalabel import label_components
 
 SFREQ = 250
 TRIAL_LEN = 12500
-WIN_LEN = 2500
-STEP = 2500
+WIN_LEN = 500
+STEP = 250
 
 
 def load_mat_auto(mat_path: str):

@@ -27,8 +27,8 @@ N_TEST_TRIALS = 8
 TEST_TRIAL_LEN = 2500
 
 # 和你训练集保持一致：2 秒窗口，1 秒步长
-WIN_LEN = 2500
-STEP = 2500
+WIN_LEN = 500
+STEP = 250
 
 DE_BANDS = [
     (1.0, 4.0),     # delta
@@ -719,18 +719,18 @@ if __name__ == "__main__":
     #   P_test2.mat
     #   ...
     #   P_test10.mat
-    TEST_MAT_ROOT = "../testdata"
+    TEST_MAT_ROOT = "testdata"
 
     # 如果你有 ch_name.mat，就填真实路径
     # 如果没有，程序会自动使用数据集说明中的 30 通道顺序
-    CH_NAME_PATH = "../ch_name.mat"
+    CH_NAME_PATH = "ch_name.mat"
 
-    SAVE_CLEAN_ROOT = "../data/com_test_clean_10s"
-    SAVE_TRIAL_ROOT = "../data/com_test_split_trial_10s"
-    SAVE_DE_ROOT = "../data/com_test_de_features_10s"
+    SAVE_CLEAN_ROOT = "data/com_test_clean_2s"
+    SAVE_TRIAL_ROOT = "data/com_test_split_trial_2s"
+    SAVE_DE_ROOT = "data/com_test_de_features_2s"
 
-    OUT_WINDOW_CSV = "../data/com_test_window_index_10s.csv"
-    OUT_TRIAL_CSV = "../data/com_test_trial_index_10s.csv"
+    OUT_WINDOW_CSV = "data/com_test_window_index_2s.csv"
+    OUT_TRIAL_CSV = "data/com_test_trial_index_2s.csv"
 
     build_test_index(
         test_mat_root=TEST_MAT_ROOT,
