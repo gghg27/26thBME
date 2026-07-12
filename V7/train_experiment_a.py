@@ -56,6 +56,7 @@ from V7.experiment_a_model import (
     weighted_mmd_rbf,                  # 加权 RBF-MMD 距离
 )
 from V7.trial_sequence import TrialSequenceDataset, trial_sequence_collate
+from V7.adaptive_threshold import adaptive_validation_metrics, apply_threshold, load_threshold, train_threshold
 
 
 # ============================================================================
@@ -555,20 +556,13 @@ def predict_trials(model, loader, device, baselines, labeled=True, max_batches=0
     return pd.DataFrame(rows)
 
 
-def validate(model, loader, device, baselines, k_pos, max_batches=0):
-    """验证/测试：推理 + 计算 trial 级别和 top-K 级别的各项指标。
-
-    Returns:
-        trial_acc/macro_f1:   逐 trial 的准确率 / macro F1
-        topk_trial_acc/macro_f1:  Top-K 筛选后的准确率 / macro F1
-        diagnosis_acc/macro_f1:   诊断分类指标
-        records:                完整预测 DataFrame
-    """
-    frame=predict_trials(model,loader,device,baselines,True,max_batches); pred=frame.pred_emo.to_numpy(); y=frame.label_emo.to_numpy()
-    topk=apply_topk(frame,k_pos); yd=frame.label_diag.to_numpy(); dp=frame.pred_diag.to_numpy()
-    return {"trial_acc":accuracy_score(y,pred),"trial_macro_f1":f1_score(y,pred,average="macro",zero_division=0),
-            "trial_confusion_matrix":confusion_matrix(y,pred,labels=[0,1]),
-            "topk_trial_acc":accuracy_score(y,topk),"topk_trial_macro_f1":f1_score(y,topk,average="macro",zero_division=0),
+def validate(model, loader, device, baselines, max_batches=0):
+    """Validate Stage 2 with its raw probabilities and a fixed 0.5 cutoff."""
+    frame=predict_trials(model,loader,device,baselines,True,max_batches); pred=(frame.prob_pos.to_numpy() >= .5).astype(int); y=frame.label_emo.to_numpy()
+    yd=frame.label_diag.to_numpy(); dp=frame.pred_diag.to_numpy()
+    loss=float(-np.log(np.where(y == 1, frame.prob_pos.to_numpy(), 1-frame.prob_pos.to_numpy()).clip(1e-8)).mean())
+    return {"loss":loss,"trial_acc_fixed":accuracy_score(y,pred),"trial_macro_f1_fixed":f1_score(y,pred,average="macro",zero_division=0),
+            "trial_confusion_matrix_fixed":confusion_matrix(y,pred,labels=[0,1]),
             "diagnosis_acc":accuracy_score(yd,dp),"diagnosis_macro_f1":f1_score(yd,dp,average="macro",zero_division=0),
             "records":frame}
 
@@ -647,32 +641,78 @@ def run_fold(args, fold, repeat, seed):
     if not args.no_stage1_init:
         loaded=stage2.shared_encoder.load_state_dict(stage1.shared_encoder.state_dict(),strict=False)
         print(f"[stage2 init] missing_keys={loaded.missing_keys}; unexpected_keys={loaded.unexpected_keys}")
-    opt=torch.optim.AdamW(stage2.parameters(),lr=args.lr_stage2,weight_decay=args.weight_decay); best_metric=-1.; best_path=save_dir/"stage2_best.pt"; patience=0
+    opt=torch.optim.AdamW(stage2.parameters(),lr=args.lr_stage2,weight_decay=args.weight_decay); best_metric=None; best_path=save_dir/"stage2_best.pt"; patience=0
     for epoch in range(1,args.stage2_epochs+1):
         train_m=train_stage2(stage2,src_loader,target_loader,opt,device,args,weights,source_base,target_base,epoch)
-        val_m=validate(stage2,val_loader,device,val_base,args.k_pos,args.max_batches); score=val_m["topk_trial_macro_f1"]
-        print(f"[Stage2] epoch={epoch} loss={train_m['loss']:.4f} trial_f1={val_m['trial_macro_f1']:.4f} topk_f1={score:.4f}")
-        # 早停机制：基于 topk_trial_macro_f1 的增量阈值
-        if score>best_metric+args.stage2_early_stop_min_delta:
+        val_m=validate(stage2,val_loader,device,val_base,max_batches=args.max_batches)
+        score=((-val_m["loss"],val_m["trial_macro_f1_fixed"],val_m["trial_acc_fixed"])
+               if args.predict_best_name == "loss" else
+               (val_m["trial_macro_f1_fixed"],val_m["trial_acc_fixed"],-val_m["loss"]))
+        print(f"[Stage2] epoch={epoch} loss={train_m['loss']:.4f} fixed_trial_f1={score[0]:.4f} fixed_trial_acc={score[1]:.4f}")
+        # Stage 2 selection is fixed-F1, then fixed-accuracy, then loss.
+        improved = best_metric is None or score[0] > best_metric[0] + args.stage2_early_stop_min_delta or (abs(score[0]-best_metric[0]) <= args.stage2_early_stop_min_delta and score[1:] > best_metric[1:])
+        if improved:
             best_metric=score; patience=0; torch.save(checkpoint_payload(stage2,args,mapping,weights,fold,repeat,run_seed,val_m),best_path)
         else: patience+=1
         if not args.no_stage2_early_stop and epoch>=args.stage2_early_stop_warmup and patience>=args.stage2_early_stop_patience: break
 
     # ---- 最终评估 ----
-    ckpt=torch.load(best_path,map_location=device,weights_only=False); restored=rebuild_stage2(ckpt,device); final=validate(restored,val_loader,device,val_base,args.k_pos,args.max_batches); final["records"].to_csv(save_dir/"validation_trials.csv",index=False,encoding="utf-8-sig")
-    if args.predict_test and test_ds is not None:
-        loader=DataLoader(test_ds,batch_size=args.batch_size,shuffle=False,num_workers=args.num_workers,collate_fn=trial_sequence_collate); predict_trials(restored,loader,device,target_base,False,args.max_batches).to_csv(save_dir/"test_trials.csv",index=False,encoding="utf-8-sig")
-    return {"fold":fold,"repeat":repeat,"best_path":str(best_path),"metrics":{k:v for k,v in final.items() if k!="records"}}
+    ckpt=torch.load(best_path,map_location=device,weights_only=False); restored=rebuild_stage2(ckpt,device)
+    # Final calibration/evaluation always uses complete subject trial sets.
+    final=validate(restored,val_loader,device,val_base,max_batches=0)
+    threshold_path=None
+    if not args.no_adaptive_threshold:
+        restored.eval()
+        for parameter in restored.parameters(): parameter.requires_grad_(False)
+        frozen={name:value.detach().cpu().clone() for name,value in restored.state_dict().items()}
+        # The calibration pass is deliberately unshuffled/non-dropping and includes every source trial.
+        source_complete_loader=DataLoader(src,batch_size=args.batch_size,shuffle=False,drop_last=False,
+                                          num_workers=args.num_workers,pin_memory=True,collate_fn=trial_sequence_collate)
+        source_records=predict_trials(restored,source_complete_loader,device,source_base,True,0)
+        source_records.to_csv(save_dir/"adaptive_threshold_source_trials.csv",index=False,encoding="utf-8-sig")
+        threshold,threshold_ckpt,threshold_path=train_threshold(source_records,args,save_dir,str(best_path),device)
+        threshold,threshold_ckpt=load_threshold(threshold_path,device)
+        changed=[name for name,value in restored.state_dict().items() if not torch.equal(frozen[name],value.detach().cpu())]
+        if changed: raise RuntimeError(f"Stage 2 changed during threshold training: {changed[:3]}")
+        print("[adaptive threshold] Stage 2 freeze check=PASS; optimizer contains threshold parameters only")
+        val_adaptive,val_summary=apply_threshold(final["records"],threshold,device,labeled=True)
+        val_metrics=adaptive_validation_metrics(val_adaptive); final.update(val_metrics)
+        val_adaptive.to_csv(save_dir/"validation_trials.csv",index=False,encoding="utf-8-sig")
+        val_summary.insert(1,"split","val")
+        _,source_summary=apply_threshold(source_records,threshold,device,labeled=True)
+        split_lookup={str(x):"threshold_train" for x in threshold_ckpt["threshold_train_subjects"]}
+        split_lookup.update({str(x):"threshold_val" for x in threshold_ckpt["threshold_val_subjects"]})
+        source_summary.insert(1,"split",source_summary.user_id.map(split_lookup))
+        summaries=[source_summary,val_summary]
+        print("[adaptive threshold] grouped examples:\n",source_summary.head(2).to_string(index=False))
+        if args.predict_test and test_ds is not None:
+            loader=DataLoader(test_ds,batch_size=args.batch_size,shuffle=False,num_workers=args.num_workers,collate_fn=trial_sequence_collate)
+            test_records=predict_trials(restored,loader,device,target_base,False,0)
+            test_adaptive,test_summary=apply_threshold(test_records,threshold,device,labeled=False)
+            test_adaptive.to_csv(save_dir/"test_trials.csv",index=False,encoding="utf-8-sig")
+            test_summary.insert(1,"split","test"); summaries.append(test_summary)
+        pd.concat(summaries,ignore_index=True).to_csv(save_dir/"adaptive_threshold_subject_summary.csv",index=False,encoding="utf-8-sig")
+        save_json(save_dir/"adaptive_threshold_metrics.json",{**val_metrics,"threshold_epoch":threshold_ckpt["threshold_epoch"],
+                  "alpha":threshold.alpha,"beta":threshold.beta,"temperature":threshold.temperature,
+                  "threshold_train_subjects":threshold_ckpt["threshold_train_subjects"],
+                  "threshold_val_subjects":threshold_ckpt["threshold_val_subjects"]})
+    else:
+        fixed=final["records"].copy(); fixed["Emotion_label"]=(fixed.prob_pos >= .5).astype(int)
+        fixed.to_csv(save_dir/"validation_trials.csv",index=False,encoding="utf-8-sig")
+        if args.predict_test and test_ds is not None:
+            loader=DataLoader(test_ds,batch_size=args.batch_size,shuffle=False,num_workers=args.num_workers,collate_fn=trial_sequence_collate)
+            test_records=predict_trials(restored,loader,device,target_base,False,args.max_batches)
+            test_records["Emotion_label"]=(test_records.prob_pos >= .5).astype(int)
+            test_records.to_csv(save_dir/"test_trials.csv",index=False,encoding="utf-8-sig")
+    return {"fold":fold,"repeat":repeat,"best_path":str(best_path),"threshold_path":str(threshold_path) if threshold_path else None,
+            "metrics":{k:v for k,v in final.items() if k!="records"}}
 
 
-def ensemble(paths, args):
-    """多折模型集成：加载所有 checkpoint，对测试集分别推理后取平均概率。
-
-    每个 checkpoint 独立计算 subject-relative baseline 后推理，
-    最终将多个模型的 prob_pos 和 score_pos 取均值，并用 Top-K 生成提交文件。
-    """
+def ensemble(results, args):
+    """Average each fold's calibrated probabilities, then classify at 0.5."""
     device=torch.device(args.device if torch.cuda.is_available() else "cpu"); frames=[]
-    for i,path in enumerate(paths):
+    for i,result in enumerate(results):
+        path=result["best_path"]
         ckpt=torch.load(path,map_location=device,weights_only=False); model=rebuild_stage2(ckpt,device); mapping=ckpt["domain_mapping"]
         test_w=UnlabeledTargetDataset(args.test_csv,mapping,not args.no_normalize); test_ds=TrialSequenceDataset(test_w,ckpt["trial_num_windows"],f"ensemble-{i}")
         loader=DataLoader(test_ds,batch_size=args.batch_size,collate_fn=trial_sequence_collate,num_workers=args.num_workers)
@@ -682,10 +722,24 @@ def ensemble(paths, args):
         bm=bs=None
         if ckpt["model_config"].get("use_subject_relative_bio"):
             bm,bs=compute_bio_baseline(model,test_w,device,dm,ds,args.batch_size,args.num_workers,args.relative_eps)
-        frame=predict_trials(model,loader,device,(dm,ds,bm,bs),False).rename(columns={"prob_pos":f"prob_{i}","score_pos":f"score_{i}"}); frames.append(frame[["user_id","trial_id",f"prob_{i}",f"score_{i}"]])
+        frame=predict_trials(model,loader,device,(dm,ds,bm,bs),False)
+        if not args.no_adaptive_threshold:
+            threshold_path=result.get("threshold_path")
+            if not threshold_path: raise RuntimeError(f"missing adaptive threshold checkpoint for {path}")
+            threshold,_=load_threshold(threshold_path,device); frame,_=apply_threshold(frame,threshold,device,False)
+            frame=frame.rename(columns={"adaptive_probability":f"adaptive_{i}"})
+        frame=frame.rename(columns={"prob_pos":f"prob_{i}","score_pos":f"score_{i}"})
+        columns=["user_id","trial_id",f"prob_{i}",f"score_{i}"]
+        if not args.no_adaptive_threshold: columns.append(f"adaptive_{i}")
+        frames.append(frame[columns])
     merged=frames[0]
     for frame in frames[1:]: merged=merged.merge(frame,on=["user_id","trial_id"],how="inner")
-    merged["prob_pos"]=merged.filter(regex="^prob_").mean(1); merged["score_pos"]=merged.filter(regex="^score_").mean(1); merged["Emotion_label"]=apply_topk(merged,args.k_pos)
+    merged["ensemble_prob_positive_raw"]=merged.filter(regex="^prob_").mean(1)
+    if args.no_adaptive_threshold:
+        merged["ensemble_adaptive_probability"]=merged["ensemble_prob_positive_raw"]
+    else:
+        merged["ensemble_adaptive_probability"]=merged.filter(regex="^adaptive_").mean(1)
+    merged["Emotion_label"]=(merged["ensemble_adaptive_probability"] >= .5).astype(int); merged["num_models"]=len(frames)
     out=Path(args.save_root)/"test_ensemble"; out.mkdir(parents=True,exist_ok=True); merged.to_csv(out/"test_ensemble_probs.csv",index=False,encoding="utf-8-sig"); merged[["user_id","trial_id","Emotion_label"]].to_csv(out/"submission_test_ensemble.csv",index=False,encoding="utf-8-sig")
 
 
@@ -717,20 +771,30 @@ def parse_args():
     # ---- Stage 1 投票 ----
     p.add_argument("--vote_smooth",type=float,default=5.); p.add_argument("--vote_mode",choices=["hard","soft","soft_conf"],default="soft"); p.add_argument("--tau_vote",type=float,default=1.); p.add_argument("--confidence_power",type=float,default=1.)
     # ---- Stage 2 损失权重 ----
-    p.add_argument("--lambda_expert",type=float,default=.5); p.add_argument("--lambda_mix",type=float,default=1.); p.add_argument("--lambda_diag",type=float,default=.01); p.add_argument("--stage2_lambda_mmd",type=float,default=.0003); p.add_argument("--lambda_subject",type=float,default=.0003); p.add_argument("--grl_subject",type=float,default=.001); p.add_argument("--lambda_ent",type=float,default=0.); p.add_argument("--lambda_rank",type=float,default=.1); p.add_argument("--rank_margin",type=float,default=.2); p.add_argument("--rank_warmup_epochs",type=int,default=3); p.add_argument("--rank_max_pairs_per_subject",type=int,default=128); p.add_argument("--shared_mix_alpha",type=float,default=.7)
+    p.add_argument("--lambda_expert",type=float,default=.5); p.add_argument("--lambda_mix",type=float,default=1.); p.add_argument("--lambda_diag",type=float,default=.01); p.add_argument("--stage2_lambda_mmd",type=float,default=.0003); p.add_argument("--lambda_subject",type=float,default=.0003); p.add_argument("--grl_subject",type=float,default=.001); p.add_argument("--lambda_ent",type=float,default=0.); p.add_argument("--lambda_rank",type=float,default=0.0); p.add_argument("--rank_margin",type=float,default=.2); p.add_argument("--rank_warmup_epochs",type=int,default=3); p.add_argument("--rank_max_pairs_per_subject",type=int,default=128); p.add_argument("--shared_mix_alpha",type=float,default=.7)
     # ---- 训练策略控制 ----
-    p.add_argument("--no_stage1_init",action="store_true"); p.add_argument("--no_stage2_early_stop",action="store_true"); p.add_argument("--stage2_early_stop_patience",type=int,default=5); p.add_argument("--stage2_early_stop_warmup",type=int,default=3); p.add_argument("--stage2_early_stop_min_delta",type=float,default=1e-6); p.add_argument("--k_pos",type=int,default=4); p.add_argument("--predict_test",action="store_true"); p.add_argument("--no_test_ensemble",action="store_true")
+    p.add_argument("--no_stage1_init",action="store_true"); p.add_argument("--no_stage2_early_stop",action="store_true"); p.add_argument("--stage2_early_stop_patience",type=int,default=5); p.add_argument("--stage2_early_stop_warmup",type=int,default=3); p.add_argument("--stage2_early_stop_min_delta",type=float,default=1e-6); p.add_argument("--k_pos",type=int,default=4,help="legacy Top-K comparison only; never used by the default prediction path"); p.add_argument("--predict_test",action="store_true"); p.add_argument("--no_test_ensemble",action="store_true")
+    p.add_argument("--predict_best_name",choices=["trial_f1","loss"],default="trial_f1")
+    p.add_argument("--test_vote_method",choices=["adaptive_threshold","fixed"],default="adaptive_threshold")
+    p.add_argument("--no_adaptive_threshold",action="store_true")
+    p.add_argument("--threshold_epochs",type=int,default=300); p.add_argument("--threshold_lr",type=float,default=.01)
+    p.add_argument("--threshold_weight_decay",type=float,default=0.0); p.add_argument("--threshold_patience",type=int,default=30)
+    p.add_argument("--threshold_min_delta",type=float,default=1e-6); p.add_argument("--threshold_min_std",type=float,default=.1)
+    p.add_argument("--threshold_init_temperature",type=float,default=1.0); p.add_argument("--threshold_val_ratio",type=float,default=.2)
+    p.add_argument("--threshold_seed",type=int,default=42); p.add_argument("--lambda_threshold_f1",type=float,default=.5)
+    p.add_argument("--lambda_threshold_reg",type=float,default=.001)
     return p.parse_args()
 
 
 def main():
     """主入口：解析参数 → 遍历 folds/repeats → 逐折训练 → 保存汇总 → 可选集成。"""
-    args=parse_args(); seeds=list(getattr(config,"V2_seed",[42])); repeats=range(len(seeds)) if args.all_repeats else [args.repeat]; folds=range(args.n_splits) if args.all_folds else [args.fold]; results=[]
+    args=parse_args(); args.no_adaptive_threshold = args.no_adaptive_threshold or args.test_vote_method == "fixed"
+    seeds=list(getattr(config,"V2_seed",[42])); repeats=range(len(seeds)) if args.all_repeats else [args.repeat]; folds=range(args.n_splits) if args.all_folds else [args.fold]; results=[]
     for repeat in repeats:
         seed=seeds[repeat] if repeat<len(seeds) else seeds[0]+31*repeat
         for fold in folds: results.append(run_fold(args,fold,repeat,int(seed)))
     root=Path(args.save_root); root.mkdir(parents=True,exist_ok=True); save_json(root/"all_fold_summary.json",results)
-    if not args.no_test_ensemble and args.test_csv and Path(args.test_csv).exists(): ensemble([r["best_path"] for r in results],args)
+    if not args.no_test_ensemble and args.test_csv and Path(args.test_csv).exists(): ensemble(results,args)
 
 
 if __name__=="__main__": main()

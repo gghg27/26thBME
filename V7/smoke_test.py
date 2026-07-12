@@ -1,7 +1,9 @@
 """Small synthetic shape/mask/gradient/checkpoint test for Experiment A."""
 
 import sys
+import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -14,6 +16,7 @@ from torch.utils.data import Dataset
 from V7.experiment_a_model import Stage2ExpertEmotionAdaptationModel
 from V7.temporal_aggregator import TemporalTrialAggregator
 from V7.trial_sequence import TrialSequenceDataset, trial_sequence_collate
+from V7.adaptive_threshold import apply_threshold, load_threshold, train_threshold
 
 
 class _FakeWindows(Dataset):
@@ -98,6 +101,36 @@ def main() -> None:
     clone = Stage2ExpertEmotionAdaptationModel(**model_args)
     loaded = clone.load_state_dict(model.state_dict(), strict=False)
     assert not loaded.missing_keys and not loaded.unexpected_keys
+    # Frozen Stage 2 + complete-subject threshold calibration/checkpoint smoke.
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    frozen = {name: value.detach().clone() for name, value in model.state_dict().items()}
+    records = pd.DataFrame({
+        "user_id": sum(([f"source-{u}"] * 4 for u in range(4)), []),
+        "trial_id": list(range(4)) * 4,
+        "score_pos": [-1.3, -.4, .3, 1.2, -1.1, -.2, .5, 1.4,
+                      -1.4, -.5, .2, 1.1, -1.2, -.3, .4, 1.3],
+        "prob_pos": torch.sigmoid(torch.tensor([-1.3, -.4, .3, 1.2, -1.1, -.2, .5, 1.4,
+                                                -1.4, -.5, .2, 1.1, -1.2, -.3, .4, 1.3])).numpy(),
+        "label_emo": [0, 0, 1, 1] * 4,
+    })
+    args = SimpleNamespace(threshold_seed=42, threshold_val_ratio=.25, threshold_min_std=.1,
+                           threshold_init_temperature=1., threshold_lr=.05, threshold_weight_decay=0.,
+                           threshold_epochs=30, lambda_threshold_f1=.5, lambda_threshold_reg=.001,
+                           threshold_min_delta=1e-6, threshold_patience=8)
+    with tempfile.TemporaryDirectory() as directory:
+        threshold, checkpoint, path = train_threshold(records, args, Path(directory), "stage2_best.pt", torch.device("cpu"))
+        calibrated, summary = apply_threshold(records, threshold, torch.device("cpu"), labeled=True)
+        reloaded, reloaded_checkpoint = load_threshold(path, torch.device("cpu"))
+        calibrated_reload, _ = apply_threshold(records, reloaded, torch.device("cpu"), labeled=True)
+        assert torch.allclose(torch.tensor(calibrated.adaptive_probability.to_numpy()),
+                              torch.tensor(calibrated_reload.adaptive_probability.to_numpy()))
+        assert len(summary) == 4 and checkpoint["threshold_train_subjects"] and checkpoint["threshold_val_subjects"]
+        assert reloaded_checkpoint["base_stage2_checkpoint"] == "stage2_best.pt"
+    assert all(torch.equal(frozen[name], value) for name, value in model.state_dict().items())
+    assert any(abs(float(x)) > 1e-7 for x in (threshold.alpha, threshold.beta)) or abs(float(threshold.temperature) - 1.) > 1e-7
+    print("adaptive_threshold_freeze_group_checkpoint_smoke=PASS")
     print("shape_mask_gradient_checkpoint_smoke=PASS", float(loss.detach()))
 
 
