@@ -1,0 +1,15 @@
+{
+  "checkpoint": "B:\\26thbme\\v2_best\\26thBME\\model_params\\V7_experiment_a\\experiment_a_repeat0_fold2\\stage2_best.pt",
+  "test_csv": "B:\\26thbme\\v2_best\\26thBME\\com_test_trial_index_2s.csv",
+  "device": "cuda",
+  "n_trials": 80,
+  "n_subjects": 10,
+  "trial_num_windows": 0,
+  "emotion_feature_dim": 185,
+  "diagnosis_feature_dim": 185,
+  "emotion_tsne_perplexity": 26.0,
+  "diagnosis_tsne_perplexity": 26.0,
+  "emotion_pca_dim": 50,
+  "diagnosis_pca_dim": 50,
+  "seed": 42
+}
