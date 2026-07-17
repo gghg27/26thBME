@@ -253,9 +253,13 @@ def build_data(args, split, mapping):
       target_vote           — 目标域投票 DataLoader（val + test，shuffle=False）
     """
     # 窗口级数据集：用于计算受试者基线统计量
-    cache_dir = None if args.no_plv_cache else args.plv_cache_dir
-    data_kwargs = dict(plv_cache_dir=cache_dir, sampling_rate=args.sampling_rate,
-                       num_nodes=args.num_nodes, num_bands=args.de_num_bands)
+    cache_dir = None if getattr(args, "no_plv_cache", False) else getattr(args, "plv_cache_dir", "V8/cache/plv")
+    data_kwargs = dict(
+        plv_cache_dir=cache_dir,
+        sampling_rate=getattr(args, "sampling_rate", 250.0),
+        num_nodes=getattr(args, "num_nodes", 30),
+        num_bands=getattr(args, "de_num_bands", 5),
+    )
     src_w = DomainAwareCompetitionDataset(args.index_csv, split["train_all"], mapping, "source",
                                            not args.no_normalize, not args.use_raw_diagnosis_label,
                                            **data_kwargs)
@@ -301,7 +305,20 @@ def compute_de_baseline(window_ds, eps=1e-6):
     """
     sums, squares, count = {}, {}, defaultdict(int)
     for i in tqdm(range(len(window_ds)), desc="DE baseline", leave=False):
-        item = window_ds[i]; key = baseline_key(item.get("target_key", item["subject_id"])); x = item["de_feat"].float()
+        row = window_ds.df.iloc[i]
+        array = np.load(resolve_data_path(row["de_path"], ROOT), mmap_mode="r")
+        index = int(row.get("de_win_id", 0))
+        if array.ndim >= 3:
+            if index < 0 or index >= array.shape[0]:
+                raise IndexError(f"de_win_id={index} invalid for {row['de_path']} shape={array.shape}")
+            array = array[index]
+        x = torch.as_tensor(np.asarray(array, dtype=np.float32)).float()
+        if tuple(x.shape) != (window_ds.num_nodes, window_ds.num_bands) or not torch.isfinite(x).all():
+            raise ValueError(f"invalid DE baseline sample {x.shape} path={row['de_path']}, trial={row['trial_id']}")
+        if hasattr(window_ds, "split_prefix"):
+            key = f"{window_ds.split_prefix}:{int(row['subject_id'])}"
+        else:
+            key = f"test:{row[window_ds.id_col]}"
         sums[key] = sums.get(key, torch.zeros_like(x)) + x
         squares[key] = squares.get(key, torch.zeros_like(x)) + x.square(); count[key] += 1
     mu = {k: v / count[k] for k, v in sums.items()}
@@ -362,6 +379,28 @@ def forward(model, batch, device, baselines, **kwargs):
                  window_mask=batch["window_mask"], **kwargs, **rel)
 
 
+def debug_shapes_once(args, stage: str, batch: dict, out: dict) -> None:
+    """Print and validate the first Stage 1/2 batch when --debug_shapes is enabled."""
+    flag = f"_debug_shapes_{stage}"
+    if not args.debug_shapes or getattr(args, flag, False):
+        return
+    setattr(args, flag, True)
+    values = {
+        "de_feat": batch["de_feat"], "plv_feat": batch["plv_feat"],
+        "window_mask": batch["window_mask"], "band_embeddings": out["window_band_embeddings"],
+        "z_emotion_seq": out["z_emotion_seq"], "z_diag_seq": out["z_diag_seq"],
+        "z_end_emotion": out["z_end_emotion"], "z_end_diag": out["z_end_diag"],
+    }
+    if "mix_prob" in out:
+        values["mix_prob"] = out["mix_prob"]
+    for name, value in values.items():
+        if not torch.isfinite(value).all():
+            raise FloatingPointError(f"{stage} {name} contains NaN/Inf")
+    print(f"[debug_shapes:{stage}] valid_window_count={int(batch['window_mask'].sum())}")
+    for name, value in values.items():
+        print(f"[debug_shapes:{stage}] {name} shape={tuple(value.shape)}")
+
+
 # ============================================================================
 # Stage 1 训练 —— 域自适应源选择 (SSAS)
 #
@@ -383,12 +422,13 @@ def train_stage1(model, source_loader, target_loader, optimizer, device, args, s
         source, target = move(source, device), move(next(target_iter), device); optimizer.zero_grad(set_to_none=True)
         so = forward(model, source, device, source_base, lambda_emo=args.grl_emo, lambda_diag=args.grl_diag)
         to = forward(model, target, device, target_base)
+        debug_shapes_once(args, "stage1", source, so)
         logits = torch.cat((so["domain_logits"], to["domain_logits"])); labels = torch.cat((source["domain_id"], target["domain_id"])).long()
         parts = {"domain": F.cross_entropy(logits, labels), "mmd": weighted_mmd_rbf(so["z_mmd"], to["z_mmd"]),
                  "emotion": F.cross_entropy(so["emotion_logits_grl"], source["emotion_label"].long()),
                  "diagnosis": F.cross_entropy(so["diagnosis_logits_grl"], source["diagnosis_label"].long())}
         loss = args.lambda_domain*parts["domain"] + args.stage1_lambda_mmd*parts["mmd"] + args.lambda_emo_grl*parts["emotion"] + args.lambda_diag_grl*parts["diagnosis"]
-        loss.backward(); optimizer.step(); b = len(source["x"]); n += b; totals["loss"] += loss.item()*b
+        loss.backward(); optimizer.step(); b = len(source["de_feat"]); n += b; totals["loss"] += loss.item()*b
         for k, v in parts.items(): totals[k] += v.item()*b
     return {k: v/max(n, 1) for k, v in totals.items()}
 
@@ -406,7 +446,7 @@ def validate_stage1(model, source_loader, target_loader, device, args, source_ba
                "emotion":F.cross_entropy(so["emotion_logits_grl"],source["emotion_label"].long()),
                "diagnosis":F.cross_entropy(so["diagnosis_logits_grl"],source["diagnosis_label"].long())}
         loss=args.lambda_domain*parts["domain"]+args.stage1_lambda_mmd*parts["mmd"]+args.lambda_emo_grl*parts["emotion"]+args.lambda_diag_grl*parts["diagnosis"]
-        b=len(source["x"]); n+=b; totals["loss"]+=loss.item()*b
+        b=len(source["de_feat"]); n+=b; totals["loss"]+=loss.item()*b
         for k,v in parts.items(): totals[k]+=v.item()*b
     return {k:v/max(n,1) for k,v in totals.items()}
 
@@ -435,7 +475,7 @@ def vote_source_weights(model, loader, mapping, device, baselines, args, save_di
             contribution = prob * confidence.pow(args.confidence_power).unsqueeze(1)
         else: contribution = prob
         votes += contribution.sum(0).cpu().double()
-        for i in range(len(batch["x"])):
+        for i in range(len(batch["de_feat"])):
             rows.append({"user_id": str(batch["user_id"][i]), "trial_id": int(batch["trial_id"][i]),
                          "predicted_source": domain_to_key[str(source_domains[int(prob[i].argmax())])],
                          "confidence": float(prob[i].max())})
@@ -496,6 +536,7 @@ def train_stage2(model, source_loader, target_loader, optimizer, device, args, w
         source, target = move(source, device), move(next(target_iter), device); optimizer.zero_grad(set_to_none=True)
         so = forward(model, source, device, source_base, lambda_subject=args.grl_subject)
         to = forward(model, target, device, target_base, lambda_subject=args.grl_subject)
+        debug_shapes_once(args, "stage2", source, so)
         y, yd = source["emotion_label"].long(), source["diagnosis_label"].long(); sw = sample_weights(source["subject_id"], weights, device)
         domain_logits = torch.cat((so["subject_domain_logits"], to["subject_domain_logits"])); domain_y = torch.cat((source["domain_id"], target["domain_id"])).long()
         parts = {"expert": hard_expert_emotion_loss(so["hc_logits"], so["dep_logits"], y, yd, sw),
@@ -562,9 +603,12 @@ def validate(model, loader, device, baselines, max_batches=0):
 
 def checkpoint_payload(model,args,mapping,weights,fold,repeat,seed,metrics):
     """构建完整的 checkpoint 字典，包含模型参数、配置、域映射和验证指标。"""
-    return {"format":"V7_experiment_a","model_state":model.state_dict(),"model_config":model_kwargs(args),
+    return {"format":"V8_experiment_a","model_state":model.state_dict(),"model_config":model_kwargs(args),
             "temporal_config":model.temporal_config,"trial_num_windows":args.trial_num_windows,
-            "backbone_config":{k:model_kwargs(args)[k] for k in ("sfreq","topk","dropout","biomarker_dim","de_num_bands")},
+            "backbone_config":{k:model_kwargs(args)[k] for k in (
+                "num_nodes","graph_hidden_dim","band_embed_dim","window_embed_dim",
+                "cheb_order","num_graph_layers","share_band_encoder","graph_dropout",
+                "use_subject_relative_de","relative_eps","de_num_bands")},
             "num_domains":mapping["num_domains"],"domain_mapping":mapping,"source_subject_weights":weights,
             "shared_mix_alpha":args.shared_mix_alpha,"fold":fold,"repeat":repeat,"seed":seed,
             "metrics":jsonable({k:v for k,v in metrics.items() if k!="records"}),"args":vars(args)}
@@ -596,7 +640,7 @@ def run_fold(args, fold, repeat, seed):
     split=get_unified_subject_split(args.index_csv,fold=fold,n_splits=args.n_splits,seed=seed); mapping=domain_mapping(split["train_all"],split["val_all"],args.test_csv); save_json(save_dir/"domain_mapping.json",mapping)
     # ---- 构建数据和 baseline ----
     src_w,val_w,src,val,test_ds,src_loader,val_loader,target_loader,target_vote=build_data(args,split,mapping)
-    source_base=target_base=val_base=(None,None,None,None)
+    source_base=target_base=val_base=(None,None)
     # 计算 DE 特征的 subject-relative 基线统计量
     if not args.no_subject_relative_de:
         sm,ss=compute_de_baseline(src_w,args.relative_eps); vm,vs=compute_de_baseline(val_w,args.relative_eps)
@@ -604,16 +648,8 @@ def run_fold(args, fold, repeat, seed):
         tm,ts=dict(vm),dict(vs)
         if test_ds is not None:
             test_window=test_ds.window_dataset; xm,xs=compute_de_baseline(test_window,args.relative_eps); tm.update(xm); ts.update(xs)
-        source_base=(sm,ss,None,None); val_base=(vm,vs,None,None); target_base=(tm,ts,None,None)
+        source_base=(sm,ss); val_base=(vm,vs); target_base=(tm,ts)
     kwargs=model_kwargs(args); stage1=Stage1SSASSourceSelectionModel(mapping["num_domains"],**kwargs).to(device)
-    # 计算 biomarker 的 subject-relative 基线统计量（需要先初始化 Stage1 模型）
-    if not args.no_subject_relative_bio and not args.no_biomarkers:
-        sbm,sbs=compute_bio_baseline(stage1,src_w,device,source_base[0],source_base[1],args.batch_size,args.num_workers,args.relative_eps)
-        vbm,vbs=compute_bio_baseline(stage1,val_w,device,val_base[0],val_base[1],args.batch_size,args.num_workers,args.relative_eps)
-        tbm,tbs=dict(vbm),dict(vbs)
-        if test_ds is not None:
-            xbm,xbs=compute_bio_baseline(stage1,test_ds.window_dataset,device,target_base[0],target_base[1],args.batch_size,args.num_workers,args.relative_eps); tbm.update(xbm); tbs.update(xbs)
-        source_base=(source_base[0],source_base[1],sbm,sbs); val_base=(val_base[0],val_base[1],vbm,vbs); target_base=(target_base[0],target_base[1],tbm,tbs)
 
     # ---- Stage 1：域自适应源选择 ----
     opt=torch.optim.AdamW(stage1.parameters(),lr=args.lr_stage1,weight_decay=args.weight_decay); best=float("inf")
@@ -707,15 +743,17 @@ def ensemble(results, args):
     for i,result in enumerate(results):
         path=result["best_path"]
         ckpt=torch.load(path,map_location=device,weights_only=False); model=rebuild_stage2(ckpt,device); mapping=ckpt["domain_mapping"]
-        test_w=UnlabeledTargetDataset(args.test_csv,mapping,not args.no_normalize); test_ds=TrialSequenceDataset(test_w,ckpt["trial_num_windows"],f"ensemble-{i}")
+        cache_dir=None if getattr(args, "no_plv_cache", False) else getattr(args, "plv_cache_dir", "V8/cache/plv")
+        test_w=UnlabeledTargetDataset(args.test_csv,mapping,not args.no_normalize,
+                                      plv_cache_dir=cache_dir,sampling_rate=getattr(args,"sampling_rate",250.0),
+                                      num_nodes=ckpt["model_config"]["num_nodes"],
+                                      num_bands=ckpt["model_config"]["de_num_bands"])
+        test_ds=TrialSequenceDataset(test_w,ckpt["trial_num_windows"],f"ensemble-{i}")
         loader=DataLoader(test_ds,batch_size=args.batch_size,collate_fn=trial_sequence_collate,num_workers=args.num_workers)
         dm=ds=None
         if ckpt["model_config"].get("use_subject_relative_de"):
             dm,ds=compute_de_baseline(test_w,args.relative_eps)
-        bm=bs=None
-        if ckpt["model_config"].get("use_subject_relative_bio"):
-            bm,bs=compute_bio_baseline(model,test_w,device,dm,ds,args.batch_size,args.num_workers,args.relative_eps)
-        frame=predict_trials(model,loader,device,(dm,ds,bm,bs),False)
+        frame=predict_trials(model,loader,device,(dm,ds),False)
         if not args.no_adaptive_threshold:
             threshold_path=result.get("threshold_path")
             if not threshold_path: raise RuntimeError(f"missing adaptive threshold checkpoint for {path}")
@@ -740,25 +778,30 @@ def parse_args():
     """解析命令行参数，按功能分为以下几组：
 
     训练控制: fold/all_folds/repeat/all_repeats, epochs, batch_size, lr, early_stop
-    模型架构: sfreq/topk/dropout/biomarker_dim/de_num_bands, temporal_*
-    Baseline控制: no_biomarkers/no_normalize/no_subject_relative_de/no_subject_relative_bio
+    模型架构: graph_hidden_dim/band_embed_dim/window_embed_dim/cheb_order, temporal_*
+    Baseline控制: no_normalize/no_subject_relative_de
     Stage1 损失权重: lambda_domain/stage1_lambda_mmd/lambda_emo_grl/grl_emo/lambda_diag_grl/grl_diag
     Stage1 投票: vote_smooth/vote_mode/tau_vote/confidence_power
     Stage2 损失权重: lambda_expert/lambda_mix/lambda_diag/stage2_lambda_mmd/lambda_subject/grl_subject/lambda_ent/lambda_rank
     """
     p=argparse.ArgumentParser()
     # ---- 数据路径 ----
-    p.add_argument("--index_csv",default="com_index_sub_2s.csv"); p.add_argument("--test_csv",default="com_test_trial_index_2s.csv"); p.add_argument("--save_root",default="model_params/V7_experiment_a")
+    p.add_argument("--index_csv",default="com_index_sub_2s.csv"); p.add_argument("--test_csv",default="com_test_trial_index_2s.csv"); p.add_argument("--save_root",default="model_params/V8_experiment_a")
+    p.add_argument("--plv_cache_dir",default="V8/cache/plv"); p.add_argument("--no_plv_cache",action="store_true")
     # ---- 实验组织 ----
     p.add_argument("--fold",type=int,default=0); p.add_argument("--all_folds",action="store_true"); p.add_argument("--n_splits",type=int,default=10); p.add_argument("--repeat",type=int,default=0); p.add_argument("--all_repeats",action="store_true")
     # ---- 训练超参数 ----
-    p.add_argument("--stage1_epochs",type=int,default=5); p.add_argument("--stage2_epochs",type=int,default=25); p.add_argument("--batch_size",type=int,default=4); p.add_argument("--num_workers",type=int,default=0); p.add_argument("--device",default="cuda:0"); p.add_argument("--deterministic",action="store_true"); p.add_argument("--max_batches",type=int,default=0,help="debug only; 0 uses every batch")
+    p.add_argument("--stage1_epochs",type=int,default=5); p.add_argument("--stage2_epochs",type=int,default=25); p.add_argument("--batch_size",type=int,default=4); p.add_argument("--num_workers",type=int,default=0); p.add_argument("--device",default="cuda:0"); p.add_argument("--deterministic",action="store_true"); p.add_argument("--max_batches",type=int,default=0,help="debug only; 0 uses every batch"); p.add_argument("--debug_shapes",action="store_true")
     # ---- 时域聚合参数 ----
     p.add_argument("--trial_num_windows",type=int,default=0); p.add_argument("--temporal_hidden_dim",type=int,default=128); p.add_argument("--temporal_kernel_size",type=int,default=3); p.add_argument("--temporal_dilations",type=int,nargs="+",default=[1,2]); p.add_argument("--temporal_dropout",type=float,default=.3); p.add_argument("--lambda_window_aux",type=float,default=0.)
     # ---- 优化器 & 模型架构 ----
-    p.add_argument("--lr_stage1",type=float,default=1e-4); p.add_argument("--lr_stage2",type=float,default=1e-4); p.add_argument("--weight_decay",type=float,default=1e-3); p.add_argument("--sfreq",type=float,default=250.); p.add_argument("--topk",type=int,default=8); p.add_argument("--dropout",type=float,default=.45); p.add_argument("--biomarker_dim",type=int,default=57); p.add_argument("--de_num_bands",type=int,default=5)
+    p.add_argument("--lr_stage1",type=float,default=1e-4); p.add_argument("--lr_stage2",type=float,default=1e-4); p.add_argument("--weight_decay",type=float,default=1e-3); p.add_argument("--dropout",type=float,default=.45)
+    p.add_argument("--sampling_rate",type=float,default=250.); p.add_argument("--num_nodes",type=int,default=30); p.add_argument("--de_num_bands",type=int,default=5)
+    p.add_argument("--graph_hidden_dim",type=int,default=64); p.add_argument("--band_embed_dim",type=int,default=64); p.add_argument("--window_embed_dim",type=int,default=128)
+    p.add_argument("--cheb_order",type=int,default=3); p.add_argument("--num_graph_layers",type=int,default=2); p.add_argument("--graph_dropout",type=float,default=.3)
+    band_group=p.add_mutually_exclusive_group(); band_group.add_argument("--share_band_encoder",dest="share_band_encoder",action="store_true"); band_group.add_argument("--no_share_band_encoder",dest="share_band_encoder",action="store_false"); p.set_defaults(share_band_encoder=True)
     # ---- Baseline 控制 ----
-    p.add_argument("--no_biomarkers",action="store_true"); p.add_argument("--no_normalize",action="store_true"); p.add_argument("--no_subject_relative_de",action="store_true"); p.add_argument("--no_subject_relative_bio",action="store_true"); p.add_argument("--bio_abs_scale",type=float,default=.3); p.add_argument("--relative_eps",type=float,default=1e-6); p.add_argument("--use_raw_diagnosis_label",action="store_true")
+    p.add_argument("--no_normalize",action="store_true"); p.add_argument("--no_subject_relative_de",action="store_true"); p.add_argument("--relative_eps",type=float,default=1e-6); p.add_argument("--use_raw_diagnosis_label",action="store_true")
     # ---- Stage 1 损失权重 ----
     p.add_argument("--lambda_domain",type=float,default=1.); p.add_argument("--stage1_lambda_mmd",type=float,default=.03); p.add_argument("--lambda_emo_grl",type=float,default=.001); p.add_argument("--grl_emo",type=float,default=.01); p.add_argument("--lambda_diag_grl",type=float,default=.001); p.add_argument("--grl_diag",type=float,default=.01)
     # ---- Stage 1 投票 ----
