@@ -13,7 +13,10 @@ Train Experiment A: ordered full-trial temporal aggregation plus two-stage SSAS.
 Quick check（小批量快速验证）:
   python V7/train_experiment_a.py --fold 0 --stage1_epochs 2 --stage2_epochs 2 --batch_size 4
 Full run（完整训练）:
-  python V7/train_experiment_a.py --all_folds --all_repeats --trial_num_windows 0
+  python V7/train_experiment_a.py --all_folds --all_repeats --trial_num_windows 0 --predict_test
+
+默认训练源为 com_index_sub_2s.csv，无标签目标域为决赛数据
+com_juesai_window_index_2s.csv，新模型单独保存到 model_params/V7_juesai。
 """
 
 from __future__ import annotations
@@ -34,6 +37,10 @@ from typing import Any, Iterable, Optional
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+DEFAULT_TRAIN_INDEX = "com_index_sub_2s.csv"
+DEFAULT_TARGET_INDEX = "com_juesai_window_index_2s.csv"
+DEFAULT_SAVE_ROOT = "model_params/V7_juesai"
 
 import numpy as np
 import pandas as pd
@@ -755,7 +762,7 @@ def parse_args():
     """
     p=argparse.ArgumentParser()
     # ---- 数据路径 ----
-    p.add_argument("--index_csv",default="com_index_sub_2s.csv"); p.add_argument("--test_csv",default="com_test_trial_index_2s.csv"); p.add_argument("--save_root",default="model_params/V7_experiment_a")
+    p.add_argument("--index_csv",default=DEFAULT_TRAIN_INDEX); p.add_argument("--test_csv",default=DEFAULT_TARGET_INDEX); p.add_argument("--save_root",default=DEFAULT_SAVE_ROOT)
     # ---- 实验组织 ----
     p.add_argument("--fold",type=int,default=0); p.add_argument("--all_folds",action="store_true"); p.add_argument("--n_splits",type=int,default=10); p.add_argument("--repeat",type=int,default=0); p.add_argument("--all_repeats",action="store_true")
     # ---- 训练超参数 ----
@@ -789,6 +796,15 @@ def parse_args():
 def main():
     """主入口：解析参数 → 遍历 folds/repeats → 逐折训练 → 保存汇总 → 可选集成。"""
     args=parse_args(); args.no_adaptive_threshold = args.no_adaptive_threshold or args.test_vote_method == "fixed"
+    train_index = Path(args.index_csv)
+    target_index = Path(args.test_csv) if args.test_csv else None
+    if not train_index.exists():
+        raise FileNotFoundError(f"training index does not exist: {train_index}")
+    if target_index is None or not target_index.exists():
+        raise FileNotFoundError(f"juesai target index does not exist: {target_index}")
+    print(f"[data] source_train={train_index}")
+    print(f"[data] unlabeled_target={target_index}")
+    print(f"[output] save_root={Path(args.save_root)}")
     seeds=list(getattr(config,"V2_seed",[42])); repeats=range(len(seeds)) if args.all_repeats else [args.repeat]; folds=range(args.n_splits) if args.all_folds else [args.fold]; results=[]
     for repeat in repeats:
         seed=seeds[repeat] if repeat<len(seeds) else seeds[0]+31*repeat

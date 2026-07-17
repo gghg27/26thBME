@@ -8,7 +8,7 @@ diagnosis encoder features before the classifier heads.
 
 Example (run from the repository root):
     conda run -n pytorch python plot/visualize_v7_test_embedding_tsne.py ^
-        --checkpoint model_params/V7_experiment_a/experiment_a_repeat0_fold0/stage2_best.pt ^
+        --checkpoint model_params/V7_non_res/experiment_a_repeat0_fold0/stage2_best.pt ^
         --split validation --index_csv com_index_sub_2s.csv ^
         --device cuda
 """

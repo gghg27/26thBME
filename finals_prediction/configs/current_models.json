@@ -1,0 +1,45 @@
+{
+  "test_index": "com_juesai_window_index_2s.csv",
+  "output_dir": "finals_prediction/outputs/current_vote",
+  "runtime": {
+    "device": "auto",
+    "batch_size": 4,
+    "num_workers": 0
+  },
+  "vote": {
+    "method": "soft",
+    "threshold": 0.5
+  },
+  "models": [
+    {
+      "name": "v7_non_res",
+      "version": "v7",
+      "enabled": true,
+      "checkpoint_glob": "model_params/v7_non_res/experiment_a_repeat0_fold*/stage2_best.pt",
+      "threshold_filename": "adaptive_threshold_best.pt",
+      "probability": "adaptive",
+      "normalize": true,
+      "weight": 1.0
+    },
+    {
+      "name": "v8_experiment_a",
+      "version": "v8",
+      "enabled": true,
+      "checkpoint_glob": "model_params/v8/V8_experiment_a/experiment_a_repeat0_fold*/stage2_best.pt",
+      "threshold_filename": "adaptive_threshold_best.pt",
+      "probability": "adaptive",
+      "normalize": true,
+      "plv_cache_dir": "finals_prediction/cache/v8_plv",
+      "weight": 1.0
+    },
+    {
+      "name": "v9_bfgcn",
+      "version": "v9",
+      "enabled": true,
+      "checkpoint_glob": "V9/checkpoints/fold_*/best_model.pt",
+      "probability": "raw",
+      "plv_cache_dir": "finals_prediction/cache/v9_plv",
+      "weight": 1.0
+    }
+  ]
+}

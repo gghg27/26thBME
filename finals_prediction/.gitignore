@@ -1,0 +1,4 @@
+cache/
+outputs/
+model_zoo/*
+!model_zoo/README.md

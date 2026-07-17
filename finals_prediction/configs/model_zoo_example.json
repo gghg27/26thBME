@@ -1,0 +1,31 @@
+{
+  "test_index": "com_juesai_window_index_2s.csv",
+  "output_dir": "finals_prediction/outputs/model_zoo_vote",
+  "runtime": {
+    "device": "auto",
+    "batch_size": 4,
+    "num_workers": 0
+  },
+  "vote": {
+    "method": "soft",
+    "threshold": 0.5
+  },
+  "models": [
+    {
+      "name": "my_v7",
+      "version": "v7",
+      "checkpoint_glob": "finals_prediction/model_zoo/my_v7/fold*/stage2_best.pt",
+      "threshold_filename": "adaptive_threshold_best.pt",
+      "probability": "adaptive",
+      "folds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+      "weight": 1.0
+    },
+    {
+      "name": "my_v9",
+      "version": "v9",
+      "checkpoint_glob": "finals_prediction/model_zoo/my_v9/fold_*/best_model.pt",
+      "probability": "raw",
+      "weight": 1.0
+    }
+  ]
+}
