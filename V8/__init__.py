@@ -1,1 +1,2 @@
-"""V8 Experiment A: trial DE spatial attention plus order-2 Chebyshev SSAS."""
+"""V7 Experiment A: ordered full-trial temporal aggregation for SSAS."""
+

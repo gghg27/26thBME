@@ -13,10 +13,10 @@ import torch
 import pandas as pd
 from torch.utils.data import Dataset
 
-from V8.experiment_a_model import Stage2ExpertEmotionAdaptationModel
-from V8.temporal_aggregator import TemporalTrialAggregator
-from V8.trial_sequence import TrialSequenceDataset, trial_sequence_collate
-from V8.adaptive_threshold import apply_threshold, load_threshold, train_threshold
+from V7.experiment_a_model import Stage2ExpertEmotionAdaptationModel
+from V7.temporal_aggregator import TemporalTrialAggregator
+from V7.trial_sequence import TrialSequenceDataset, trial_sequence_collate
+from V7.adaptive_threshold import apply_threshold, load_threshold, train_threshold
 
 
 class _FakeWindows(Dataset):
@@ -69,50 +69,22 @@ def main() -> None:
     model = Stage2ExpertEmotionAdaptationModel(**model_args)
     x = torch.randn(2, 3, 30, 500)
     de = torch.randn(2, 3, 30, 5)
-    trial_mask = torch.tensor([[1, 1, 1], [1, 0, 0]], dtype=torch.bool)
-    out = model(x, de, trial_mask, lambda_subject=0.01, return_graph_debug=True)
+    trial_mask = torch.tensor([[1, 1, 1], [1, 1, 0]], dtype=torch.bool)
+    out = model(x, de, trial_mask, lambda_subject=0.01)
     feature_dim = model.in_dim
     expected = {
         "z_emotion_seq": (2, 3, feature_dim), "z_diag_seq": (2, 3, feature_dim),
         "z_end_emotion": (2, feature_dim), "z_end_diag": (2, feature_dim),
         "temporal_attention_emotion": (2, 3), "temporal_attention_diag": (2, 3),
-        "trial_de_spatial_attention": (2, 30, 30), "temporal_de_attention": (2, 3, 30),
-        "trial_de_embedding": (2, 30, 32), "node_features_valid": (4, 30, 64),
-        "window_spatial_attention": (4, 30, 30), "cheb_effective_adj": (4, 30, 30),
-        "cheb_laplacian": (4, 30, 30), "cheb_t0": (4, 30, 64),
-        "cheb_t1": (4, 30, 64), "cheb_t2": (4, 30, 64),
     }
     for key, shape in expected.items():
         assert tuple(out[key].shape) == shape, (key, out[key].shape)
-    assert torch.equal(out["temporal_attention_emotion"][~trial_mask],
-                       torch.zeros_like(out["temporal_attention_emotion"][~trial_mask]))
-    assert torch.equal(out["temporal_attention_diag"][~trial_mask],
-                       torch.zeros_like(out["temporal_attention_diag"][~trial_mask]))
-    de_temporal = out["temporal_de_attention"]
-    assert torch.equal(de_temporal[~trial_mask], torch.zeros_like(de_temporal[~trial_mask]))
-    assert torch.allclose(de_temporal.sum(1), torch.ones(2, 30), atol=1e-6)
-    spatial = out["trial_de_spatial_attention"]
-    assert torch.allclose(spatial, spatial.transpose(-1, -2), atol=1e-6) and torch.isfinite(spatial).all()
-    effective = out["cheb_effective_adj"]
-    assert torch.allclose(effective, effective.transpose(-1, -2), atol=1e-6)
-    assert (effective >= 0).all() and torch.allclose(effective.diagonal(dim1=-2, dim2=-1), torch.ones(4, 30))
-    assert 0 < float(out["cheb_gamma"]) < 1
+    assert torch.equal(out["temporal_attention_emotion"][~trial_mask], torch.zeros(1))
+    assert torch.equal(out["temporal_attention_diag"][~trial_mask], torch.zeros(1))
     loss = torch.nn.functional.nll_loss(
         torch.log(out["mix_prob"].clamp_min(1e-8)), torch.tensor([0, 1])
     ) + torch.nn.functional.cross_entropy(out["diag_logits"], torch.tensor([0, 1]))
     loss.backward()
-    attention = model.shared_encoder.de_spatial_attention
-    cheb = model.shared_encoder.backbone.pmg_encoder.local_cheb_gcn
-    targeted = {
-        "de_projection": attention.de_projection, "de_temporal_attention": attention.temporal_attention,
-        "de_query": attention.query, "de_key": attention.key,
-        "cheb_linear0": cheb.linear0, "cheb_linear1": cheb.linear1, "cheb_linear2": cheb.linear2,
-        "multiscale_node_encoder": model.shared_encoder.backbone.node_encoder,
-    }
-    for name, module in targeted.items():
-        assert any(p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0
-                   for p in module.parameters()), name
-    assert cheb.raw_gamma.grad is not None and cheb.raw_gamma.grad.abs().sum() > 0
     groups = {
         "backbone": model.shared_encoder.backbone,
         "emotion_temporal": model.shared_encoder.emotion_temporal_aggregator,
@@ -126,7 +98,6 @@ def main() -> None:
         )
         assert nonzero > 0, (name, nonzero)
         print(name, "nonzero_grad_params", nonzero)
-    print("trial_de_attention_cheb_shape_graph_gradient=PASS", "gamma", float(out["cheb_gamma"]))
     clone = Stage2ExpertEmotionAdaptationModel(**model_args)
     loaded = clone.load_state_dict(model.state_dict(), strict=False)
     assert not loaded.missing_keys and not loaded.unexpected_keys

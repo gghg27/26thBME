@@ -103,6 +103,14 @@ class TrialSequenceDataset(Dataset):
         pos = self._selected_positions(len(group["window_indices"]))
         indices = [group["window_indices"][int(i)] for i in pos]
         items = [self.window_dataset[i] for i in indices]
+        for item_index, item in enumerate(items):
+            de_shape = tuple(item.get("de_feat", torch.empty(0)).shape)
+            plv_shape = tuple(item.get("plv_feat", torch.empty(0)).shape)
+            if de_shape != (30, 5) or plv_shape != (5, 30, 30):
+                raise ValueError(
+                    f"{self.name} subject={group['subject_key']} trial={group['trial_id']} "
+                    f"window={indices[item_index]} has de={de_shape}, plv={plv_shape}"
+                )
         out: dict[str, Any] = {}
         for key in items[0]:
             values = [item[key] for item in items]
@@ -153,6 +161,13 @@ def trial_sequence_collate(samples: list[dict[str, Any]]) -> dict[str, Any]:
         else:
             out[key] = values
     out["window_mask"] = torch.arange(max_t).unsqueeze(0) < torch.tensor(lengths).unsqueeze(1)
+    if "de_feat" not in out or "plv_feat" not in out:
+        raise KeyError("trial batch requires both de_feat and plv_feat")
+    if out["de_feat"].shape[:2] != out["window_mask"].shape or out["plv_feat"].shape[:2] != out["window_mask"].shape:
+        raise ValueError(
+            f"padded trial mismatch: de={tuple(out['de_feat'].shape)}, "
+            f"plv={tuple(out['plv_feat'].shape)}, mask={tuple(out['window_mask'].shape)}"
+        )
     return out
 
 

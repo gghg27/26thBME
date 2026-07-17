@@ -57,6 +57,7 @@ from V8.experiment_a_model import (
 )
 from V8.trial_sequence import TrialSequenceDataset, trial_sequence_collate
 from V8.adaptive_threshold import adaptive_validation_metrics, apply_threshold, load_threshold, train_threshold
+from V8.plv_features import load_or_compute_plv
 
 
 # ============================================================================
@@ -98,12 +99,6 @@ def move(batch: dict, device: torch.device) -> dict:
     return {k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v for k, v in batch.items()}
 
 
-def window_collate(samples: list[dict]) -> dict:
-    """窗口级 batch 的 collate 函数：stack tensor，list 保持不变。"""
-    return {key: torch.stack([x[key] for x in samples]) if torch.is_tensor(samples[0][key])
-            else [x[key] for x in samples] for key in samples[0]}
-
-
 # ============================================================================
 # 数据集类
 # ============================================================================
@@ -118,13 +113,29 @@ class DomainAwareCompetitionDataset(Competition4ClassDataset):
     """
 
     def __init__(self, index_csv, subject_ids, domain_mapping, split_prefix, normalize=True,
-                 use_label4_for_diagnosis=True):
+                 use_label4_for_diagnosis=True, plv_cache_dir=None, sampling_rate=250.0,
+                 num_nodes=30, num_bands=5):
         super().__init__(index_csv=index_csv, subject_ids=subject_ids, normalize=normalize)
         self.domain_mapping, self.split_prefix = domain_mapping, split_prefix
         self.use_label4_for_diagnosis = use_label4_for_diagnosis
+        self.plv_cache_dir = Path(plv_cache_dir) if plv_cache_dir else None
+        self.sampling_rate, self.num_nodes, self.num_bands = float(sampling_rate), int(num_nodes), int(num_bands)
 
     def __getitem__(self, idx):
+        row = self.df.iloc[int(idx)]
         item = super().__getitem__(idx); subject = str(int(item["subject_id"]))
+        eeg_window = item.pop("x").numpy()
+        plv = load_or_compute_plv(row, eeg_window, root=ROOT, cache_dir=self.plv_cache_dir,
+                                  sampling_rate=self.sampling_rate, num_bands=self.num_bands,
+                                  num_nodes=self.num_nodes)
+        if tuple(item["de_feat"].shape) != (self.num_nodes, self.num_bands):
+            raise ValueError(
+                f"DE shape mismatch path={row.get('de_path')}, trial={row.get('trial_id')}: "
+                f"got {tuple(item['de_feat'].shape)}, expected {(self.num_nodes, self.num_bands)}"
+            )
+        if not torch.isfinite(item["de_feat"]).all():
+            raise ValueError(f"DE contains NaN/Inf path={row.get('de_path')}, trial={row.get('trial_id')}")
+        item["plv_feat"] = torch.from_numpy(plv.copy())
         key = f"{self.split_prefix}:{subject}"
         item["domain_id"] = torch.tensor(self.domain_mapping["key_to_domain"][key])
         if self.use_label4_for_diagnosis:
@@ -140,11 +151,14 @@ class UnlabeledTargetDataset(Dataset):
     因为测试集无真实标签，label4 / emotion_label / diagnosis_label 均填充为 0。
     """
 
-    def __init__(self, index_csv, domain_mapping, normalize=True):
+    def __init__(self, index_csv, domain_mapping, normalize=True, plv_cache_dir=None,
+                 sampling_rate=250.0, num_nodes=30, num_bands=5):
         raw = pd.read_csv(index_csv)
         self.df = expand_window_index(raw, root=ROOT).reset_index(drop=True)
         self.id_col = "user_id" if "user_id" in self.df else "subject_id"
         self.domain_mapping, self.normalize = domain_mapping, normalize
+        self.plv_cache_dir = Path(plv_cache_dir) if plv_cache_dir else None
+        self.sampling_rate, self.num_nodes, self.num_bands = float(sampling_rate), int(num_nodes), int(num_bands)
         users = sorted(self.df[self.id_col].astype(str).unique(), key=natural_key)
         self.user_to_int = {u: i for i, u in enumerate(users)}
 
@@ -160,10 +174,20 @@ class UnlabeledTargetDataset(Dataset):
         if self.normalize: x = (x - x.mean(-1, keepdims=True)) / (x.std(-1, keepdims=True) + 1e-6)
         # 加载 DE 特征（可能是多窗口的，按 de_win_id 选取）
         de = np.load(resolve_data_path(row["de_path"], ROOT))
-        if de.ndim >= 3 and "de_win_id" in row: de = de[int(row["de_win_id"])]
+        if de.ndim >= 3 and "de_win_id" in row:
+            de_index = int(row["de_win_id"])
+            if de_index < 0 or de_index >= de.shape[0]:
+                raise IndexError(f"de_win_id={de_index} invalid for {row['de_path']} shape={de.shape}, trial={row['trial_id']}")
+            de = de[de_index]
+        if tuple(de.shape) != (self.num_nodes, self.num_bands) or not np.isfinite(de).all():
+            raise ValueError(f"invalid DE shape/values {de.shape} path={row['de_path']}, trial={row['trial_id']}")
+        plv = load_or_compute_plv(row, x, root=ROOT, cache_dir=self.plv_cache_dir,
+                                  sampling_rate=self.sampling_rate, num_bands=self.num_bands,
+                                  num_nodes=self.num_nodes)
         uid = str(row[self.id_col]); key = f"test:{uid}"
         sid = int(row["subject_number"]) if "subject_number" in row and pd.notna(row["subject_number"]) else self.user_to_int[uid]
-        return {"x": torch.from_numpy(x), "de_feat": torch.tensor(de, dtype=torch.float32),
+        return {"de_feat": torch.tensor(de, dtype=torch.float32),
+                "plv_feat": torch.from_numpy(plv.copy()),
                 "label4": torch.tensor(0), "emotion_label": torch.tensor(0),
                 "diagnosis_label": torch.tensor(0), "subject_id": torch.tensor(sid),
                 "domain_id": torch.tensor(self.domain_mapping["key_to_domain"][key]),
@@ -229,10 +253,15 @@ def build_data(args, split, mapping):
       target_vote           — 目标域投票 DataLoader（val + test，shuffle=False）
     """
     # 窗口级数据集：用于计算受试者基线统计量
+    cache_dir = None if args.no_plv_cache else args.plv_cache_dir
+    data_kwargs = dict(plv_cache_dir=cache_dir, sampling_rate=args.sampling_rate,
+                       num_nodes=args.num_nodes, num_bands=args.de_num_bands)
     src_w = DomainAwareCompetitionDataset(args.index_csv, split["train_all"], mapping, "source",
-                                           not args.no_normalize, not args.use_raw_diagnosis_label)
+                                           not args.no_normalize, not args.use_raw_diagnosis_label,
+                                           **data_kwargs)
     val_w = DomainAwareCompetitionDataset(args.index_csv, split["val_all"], mapping, "val",
-                                           not args.no_normalize, not args.use_raw_diagnosis_label)
+                                           not args.no_normalize, not args.use_raw_diagnosis_label,
+                                           **data_kwargs)
     # trial 级数据集：窗口打包成 trial 序列
     src, src_loader = trial_loader(src_w, args.trial_num_windows, args.batch_size, args.num_workers, "source", True, True)
     val, val_loader = trial_loader(val_w, args.trial_num_windows, args.batch_size, args.num_workers, "val")
@@ -240,7 +269,7 @@ def build_data(args, split, mapping):
     target_parts: list[Dataset] = [val]
     test_trial = None
     if args.test_csv and Path(args.test_csv).exists() and mapping["test_users"]:
-        test_w = UnlabeledTargetDataset(args.test_csv, mapping, not args.no_normalize)
+        test_w = UnlabeledTargetDataset(args.test_csv, mapping, not args.no_normalize, **data_kwargs)
         test_trial = TrialSequenceDataset(test_w, args.trial_num_windows, "test")
         target_parts.append(test_trial)
     target = ConcatDataset(target_parts) if len(target_parts) > 1 else val
@@ -280,67 +309,24 @@ def compute_de_baseline(window_ds, eps=1e-6):
     return mu, std
 
 
-@torch.no_grad()
-def compute_bio_baseline(model, window_ds, device, de_mu, de_std, batch_size, workers, eps=1e-6):
-    """计算受试者级别的生物标志物 (biomarker) 均值与标准差。
-
-    需要先完成 DE baseline 计算（de_mu, de_std），然后通过模型 backbone
-    前向传播得到 bio_raw 特征，再按 subject 分组建模统计量。
-    与 V2 版本中的 subject-relative 方法保持一致。
-    """
-    backbone = model.shared_encoder.backbone
-    if not getattr(backbone, "use_biomarkers", True):
-        return {}, {}
-    # V8 spatial attention requires complete trials even while estimating bio baselines.
-    trial_ds = TrialSequenceDataset(window_ds, trial_num_windows=0, name="bio-baseline")
-    loader = DataLoader(trial_ds, batch_size=batch_size, shuffle=False, num_workers=workers,
-                        collate_fn=trial_sequence_collate)
-    sums, squares, counts = {}, {}, defaultdict(int)
-    was_training = model.training; model.eval()
-    for batch in tqdm(loader, desc="Bio baseline", leave=False):
-        batch = move(batch, device); keys = batch_keys(batch)
-        def gather(store):
-            """从 baseline dict 中按 batch key 顺序收集对应统计量。"""
-            if not store or any(k not in store for k in keys): return None
-            return torch.stack([store[k] for k in keys]).to(device=device, dtype=batch["de_feat"].dtype)
-        out = model.shared_encoder(batch["x"], batch["de_feat"], batch["window_mask"],
-                                   subject_de_mu=gather(de_mu), subject_de_std=gather(de_std),
-                                   subject_bio_mu=None, subject_bio_std=None)
-        raw = out.get("window_bio_raw")
-        if raw is None:
-            if was_training: model.train()
-            return {}, {}
-        raw_keys = [keys[int(i)] for i in out["valid_trial_index"].detach().cpu().tolist()]
-        for i, key in enumerate(raw_keys):
-            feat = raw[i].detach().cpu().float()
-            sums[key] = sums.get(key, torch.zeros_like(feat)) + feat
-            squares[key] = squares.get(key, torch.zeros_like(feat)) + feat.square(); counts[key] += 1
-    if was_training: model.train()
-    mu = {k: v / counts[k] for k, v in sums.items()}
-    std = {k: (squares[k] / counts[k] - mu[k].square()).clamp_min(0).add(eps).sqrt() for k in mu}
-    return mu, std
-
-
 def batch_keys(batch):
     """从 batch 中提取每个样本的字符串 key（优先使用 target_key，否则用 subject_id）。"""
     values = batch.get("target_key", batch["subject_id"])
     return [baseline_key(x) for x in (values.detach().cpu().tolist() if torch.is_tensor(values) else values)]
 
 
-def baseline_kwargs(batch, device, de_mu=None, de_std=None, bio_mu=None, bio_std=None):
+def baseline_kwargs(batch, device, de_mu=None, de_std=None):
     """根据 batch 中的样本 keys 从 baseline 字典中收集对应的统计量，
     构造成模型 forward 所需的 subject_relative 参数。
 
     Args:
-        de_mu, de_std:   DE 特征的受试者均值/标准差
-        bio_mu, bio_std: 生物标志物的受试者均值/标准差
+        de_mu, de_std: DE 特征的受试者均值/标准差
     """
     keys = batch_keys(batch)
     def gather(store):
         if not store or any(k not in store for k in keys): return None
         return torch.stack([store[k] for k in keys]).to(device=device, dtype=batch["de_feat"].dtype)
-    return {"subject_de_mu": gather(de_mu), "subject_de_std": gather(de_std),
-            "subject_bio_mu": gather(bio_mu), "subject_bio_std": gather(bio_std)}
+    return {"subject_de_mu": gather(de_mu), "subject_de_std": gather(de_std)}
 
 
 # ============================================================================
@@ -350,17 +336,15 @@ def baseline_kwargs(batch, device, de_mu=None, de_std=None, bio_mu=None, bio_std
 
 def model_kwargs(args):
     """从命令行参数中提取模型构造函数所需的关键字参数。"""
-    return dict(sfreq=args.sfreq, topk=args.topk, dropout=args.dropout,
-                use_biomarkers=not args.no_biomarkers, biomarker_dim=args.biomarker_dim,
+    return dict(dropout=args.dropout, num_nodes=args.num_nodes,
+                graph_hidden_dim=args.graph_hidden_dim, band_embed_dim=args.band_embed_dim,
+                window_embed_dim=args.window_embed_dim, cheb_order=args.cheb_order,
+                num_graph_layers=args.num_graph_layers, share_band_encoder=args.share_band_encoder,
+                graph_dropout=args.graph_dropout,
                 use_subject_relative_de=not args.no_subject_relative_de,
-                use_subject_relative_bio=(not args.no_subject_relative_bio and not args.no_biomarkers),
-                bio_abs_scale=args.bio_abs_scale, relative_eps=args.relative_eps, de_num_bands=args.de_num_bands,
+                relative_eps=args.relative_eps, de_num_bands=args.de_num_bands,
                 temporal_hidden_dim=args.temporal_hidden_dim, temporal_kernel_size=args.temporal_kernel_size,
-                temporal_dilations=tuple(args.temporal_dilations), temporal_dropout=args.temporal_dropout,
-                de_attention_hidden_dim=args.de_attention_hidden_dim,
-                de_attention_dim=args.de_attention_dim,
-                de_attention_dropout=args.de_attention_dropout,
-                cheb_gamma_init=args.cheb_gamma_init)
+                temporal_dilations=tuple(args.temporal_dilations), temporal_dropout=args.temporal_dropout)
 
 
 def forward(model, batch, device, baselines, **kwargs):
@@ -370,11 +354,12 @@ def forward(model, batch, device, baselines, **kwargs):
         model:      模型实例
         batch:      数据 batch
         device:     目标设备
-        baselines:  四元组 (de_mu, de_std, bio_mu, bio_std)
+        baselines:  二元组 (de_mu, de_std)
         **kwargs:   额外的 forward 参数（如 lambda_emo, lambda_diag 等 GRL 系数）
     """
     rel = baseline_kwargs(batch, device, *baselines)
-    return model(batch["x"], batch["de_feat"], batch["window_mask"], **kwargs, **rel)
+    return model(de_feat=batch["de_feat"], plv_feat=batch["plv_feat"],
+                 window_mask=batch["window_mask"], **kwargs, **rel)
 
 
 # ============================================================================
@@ -577,14 +562,11 @@ def validate(model, loader, device, baselines, max_batches=0):
 
 def checkpoint_payload(model,args,mapping,weights,fold,repeat,seed,metrics):
     """构建完整的 checkpoint 字典，包含模型参数、配置、域映射和验证指标。"""
-    return {"format":"V8_experiment_a_cheb","model_state":model.state_dict(),"model_config":model_kwargs(args),
+    return {"format":"V7_experiment_a","model_state":model.state_dict(),"model_config":model_kwargs(args),
             "temporal_config":model.temporal_config,"trial_num_windows":args.trial_num_windows,
             "backbone_config":{k:model_kwargs(args)[k] for k in ("sfreq","topk","dropout","biomarker_dim","de_num_bands")},
             "num_domains":mapping["num_domains"],"domain_mapping":mapping,"source_subject_weights":weights,
             "shared_mix_alpha":args.shared_mix_alpha,"fold":fold,"repeat":repeat,"seed":seed,
-            "graph_config":{"cheb_order":2,"cheb_num_terms":3,"cheb_gamma_init":args.cheb_gamma_init,
-                            "de_attention_hidden_dim":args.de_attention_hidden_dim,
-                            "de_attention_dim":args.de_attention_dim,"use_de_graph_diagonal":False},
             "metrics":jsonable({k:v for k,v in metrics.items() if k!="records"}),"args":vars(args)}
 
 
@@ -766,14 +748,13 @@ def parse_args():
     """
     p=argparse.ArgumentParser()
     # ---- 数据路径 ----
-    p.add_argument("--index_csv",default="com_index_sub_2s.csv"); p.add_argument("--test_csv",default="com_test_trial_index_2s.csv"); p.add_argument("--save_root",default="model_params/V8_experiment_a")
+    p.add_argument("--index_csv",default="com_index_sub_2s.csv"); p.add_argument("--test_csv",default="com_test_trial_index_2s.csv"); p.add_argument("--save_root",default="model_params/V7_experiment_a")
     # ---- 实验组织 ----
     p.add_argument("--fold",type=int,default=0); p.add_argument("--all_folds",action="store_true"); p.add_argument("--n_splits",type=int,default=10); p.add_argument("--repeat",type=int,default=0); p.add_argument("--all_repeats",action="store_true")
     # ---- 训练超参数 ----
     p.add_argument("--stage1_epochs",type=int,default=5); p.add_argument("--stage2_epochs",type=int,default=25); p.add_argument("--batch_size",type=int,default=4); p.add_argument("--num_workers",type=int,default=0); p.add_argument("--device",default="cuda:0"); p.add_argument("--deterministic",action="store_true"); p.add_argument("--max_batches",type=int,default=0,help="debug only; 0 uses every batch")
     # ---- 时域聚合参数 ----
     p.add_argument("--trial_num_windows",type=int,default=0); p.add_argument("--temporal_hidden_dim",type=int,default=128); p.add_argument("--temporal_kernel_size",type=int,default=3); p.add_argument("--temporal_dilations",type=int,nargs="+",default=[1,2]); p.add_argument("--temporal_dropout",type=float,default=.3); p.add_argument("--lambda_window_aux",type=float,default=0.)
-    p.add_argument("--de_attention_hidden_dim",type=int,default=32); p.add_argument("--de_attention_dim",type=int,default=32); p.add_argument("--de_attention_dropout",type=float,default=.2); p.add_argument("--cheb_gamma_init",type=float,default=.15)
     # ---- 优化器 & 模型架构 ----
     p.add_argument("--lr_stage1",type=float,default=1e-4); p.add_argument("--lr_stage2",type=float,default=1e-4); p.add_argument("--weight_decay",type=float,default=1e-3); p.add_argument("--sfreq",type=float,default=250.); p.add_argument("--topk",type=int,default=8); p.add_argument("--dropout",type=float,default=.45); p.add_argument("--biomarker_dim",type=int,default=57); p.add_argument("--de_num_bands",type=int,default=5)
     # ---- Baseline 控制 ----

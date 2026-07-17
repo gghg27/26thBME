@@ -1,4 +1,4 @@
-"""Subject-wise adaptive decision threshold for V8 Experiment A.
+"""Subject-wise adaptive decision threshold for V7 Experiment A.
 
 This module deliberately has no dependency on the Stage 2 model.  It consumes
 complete trial-score collections, so target-subject statistics are unsupervised

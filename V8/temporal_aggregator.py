@@ -23,7 +23,7 @@ class _ResidualTemporalBlock(nn.Module):
         residual = x
         y = self.conv(x.transpose(1, 2)).transpose(1, 2)
         y = self.dropout(self.activation(y))
-        y = self.norm(residual + y)
+        y = self.norm( y)
         return y * mask.unsqueeze(-1).to(y.dtype)
 
 
