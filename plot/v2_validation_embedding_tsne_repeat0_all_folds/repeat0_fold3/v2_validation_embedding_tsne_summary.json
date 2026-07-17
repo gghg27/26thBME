@@ -1,0 +1,27 @@
+{
+  "checkpoint": "B:\\26thbme\\v2_best\\26thBME\\model_params\\V2_expert_ssas\\expert_ssas_repeat0_fold3\\stage2_best.pt",
+  "fold": 3,
+  "repeat": 0,
+  "best_name": "combined",
+  "index_csv": "B:\\26thbme\\v2_best\\26thBME\\com_index_sub_2s.csv",
+  "device": "cuda",
+  "validation_subjects": [
+    "2",
+    "17",
+    "25",
+    "42",
+    "45",
+    "55"
+  ],
+  "n_windows": 2352,
+  "n_trials": 48,
+  "n_subjects": 6,
+  "aggregation": "mean_encoded_windows_per_trial",
+  "emotion_feature_dim": 185,
+  "diagnosis_feature_dim": 185,
+  "emotion_tsne_perplexity": 15.0,
+  "diagnosis_tsne_perplexity": 15.0,
+  "emotion_pca_dim": 47,
+  "diagnosis_pca_dim": 47,
+  "seed": 42
+}
