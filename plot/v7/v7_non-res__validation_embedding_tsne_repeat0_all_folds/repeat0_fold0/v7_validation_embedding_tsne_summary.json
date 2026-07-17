@@ -1,0 +1,18 @@
+{
+  "checkpoint": "/root/autodl-tmp/26thBME/model_params/V7_non_res/experiment_a_repeat0_fold0/stage2_best.pt",
+  "split": "validation",
+  "fold": 0,
+  "repeat": 0,
+  "data_csv": "/root/autodl-tmp/26thBME/com_index_sub_2s.csv",
+  "device": "cuda",
+  "n_trials": 48,
+  "n_subjects": 6,
+  "trial_num_windows": 0,
+  "emotion_feature_dim": 185,
+  "diagnosis_feature_dim": 185,
+  "emotion_tsne_perplexity": 15.0,
+  "diagnosis_tsne_perplexity": 15.0,
+  "emotion_pca_dim": 47,
+  "diagnosis_pca_dim": 47,
+  "seed": 42
+}

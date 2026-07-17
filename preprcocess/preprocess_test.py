@@ -324,8 +324,11 @@ def preprocess_test_subject(
         exclude_idx = []
         clean_all = raw_main.get_data()
 
-    # subject-wise 标准化
-    clean_norm, subj_mean, subj_std = subject_wise_zscore(clean_all)
+    # Keep the test signal on the same scale as the current training data.
+    # Training preprocessing saves ``clean_all`` directly, so applying a
+    # subject-wise z-score only at test time causes a large DE domain shift.
+    _, subj_mean, subj_std = subject_wise_zscore(clean_all)
+    clean_output = clean_all.astype(np.float32, copy=False)
 
     info_dict = {
         "bad_channels": list(bads),
@@ -333,9 +336,10 @@ def preprocess_test_subject(
         "ica_exclude_idx": list(map(int, exclude_idx)),
         "subject_mean_shape": list(subj_mean.shape),
         "subject_std_shape": list(subj_std.shape),
+        "subject_wise_zscore_applied": False,
     }
 
-    return clean_norm, subj_mean, subj_std, info_dict
+    return clean_output, subj_mean, subj_std, info_dict
 
 
 # ============================================================
@@ -719,18 +723,18 @@ if __name__ == "__main__":
     #   P_test2.mat
     #   ...
     #   P_test10.mat
-    TEST_MAT_ROOT = "testdata"
+    TEST_MAT_ROOT = "juesai_data"
 
     # 如果你有 ch_name.mat，就填真实路径
     # 如果没有，程序会自动使用数据集说明中的 30 通道顺序
     CH_NAME_PATH = "ch_name.mat"
 
-    SAVE_CLEAN_ROOT = "data/com_test_clean_2s"
-    SAVE_TRIAL_ROOT = "data/com_test_split_trial_2s"
-    SAVE_DE_ROOT = "data/com_test_de_features_2s"
+    SAVE_CLEAN_ROOT = "data/com_juesai_clean_2s"
+    SAVE_TRIAL_ROOT = "data/com_juesai_split_trial_2s"
+    SAVE_DE_ROOT = "data/com_juesai_de_features_2s"
 
-    OUT_WINDOW_CSV = "data/com_test_window_index_2s.csv"
-    OUT_TRIAL_CSV = "data/com_test_trial_index_2s.csv"
+    OUT_WINDOW_CSV = "data/com_juesai_window_index_2s.csv"
+    OUT_TRIAL_CSV = "data/com_juesai_trial_index_2s.csv"
 
     build_test_index(
         test_mat_root=TEST_MAT_ROOT,

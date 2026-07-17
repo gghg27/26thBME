@@ -1,0 +1,11 @@
+﻿checkpoint,split,fold,repeat,data_csv,device,n_trials,n_subjects,trial_num_windows,emotion_feature_dim,diagnosis_feature_dim,emotion_tsne_perplexity,diagnosis_tsne_perplexity,emotion_pca_dim,diagnosis_pca_dim,seed
+/root/autodl-tmp/26thBME/model_params/V7_non_res/experiment_a_repeat0_fold0/stage2_best.pt,validation,0,0,/root/autodl-tmp/26thBME/com_index_sub_2s.csv,cuda,48,6,0,185,185,15.0,15.0,47,47,42
+/root/autodl-tmp/26thBME/model_params/V7_non_res/experiment_a_repeat0_fold1/stage2_best.pt,validation,1,0,/root/autodl-tmp/26thBME/com_index_sub_2s.csv,cuda,48,6,0,185,185,15.0,15.0,47,47,42
+/root/autodl-tmp/26thBME/model_params/V7_non_res/experiment_a_repeat0_fold2/stage2_best.pt,validation,2,0,/root/autodl-tmp/26thBME/com_index_sub_2s.csv,cuda,48,6,0,185,185,15.0,15.0,47,47,42
+/root/autodl-tmp/26thBME/model_params/V7_non_res/experiment_a_repeat0_fold3/stage2_best.pt,validation,3,0,/root/autodl-tmp/26thBME/com_index_sub_2s.csv,cuda,48,6,0,185,185,15.0,15.0,47,47,42
+/root/autodl-tmp/26thBME/model_params/V7_non_res/experiment_a_repeat0_fold4/stage2_best.pt,validation,4,0,/root/autodl-tmp/26thBME/com_index_sub_2s.csv,cuda,48,6,0,185,185,15.0,15.0,47,47,42
+/root/autodl-tmp/26thBME/model_params/V7_non_res/experiment_a_repeat0_fold5/stage2_best.pt,validation,5,0,/root/autodl-tmp/26thBME/com_index_sub_2s.csv,cuda,48,6,0,185,185,15.0,15.0,47,47,42
+/root/autodl-tmp/26thBME/model_params/V7_non_res/experiment_a_repeat0_fold6/stage2_best.pt,validation,6,0,/root/autodl-tmp/26thBME/com_index_sub_2s.csv,cuda,48,6,0,185,185,15.0,15.0,47,47,42
+/root/autodl-tmp/26thBME/model_params/V7_non_res/experiment_a_repeat0_fold7/stage2_best.pt,validation,7,0,/root/autodl-tmp/26thBME/com_index_sub_2s.csv,cuda,48,6,0,185,185,15.0,15.0,47,47,42
+/root/autodl-tmp/26thBME/model_params/V7_non_res/experiment_a_repeat0_fold8/stage2_best.pt,validation,8,0,/root/autodl-tmp/26thBME/com_index_sub_2s.csv,cuda,48,6,0,185,185,15.0,15.0,47,47,42
+/root/autodl-tmp/26thBME/model_params/V7_non_res/experiment_a_repeat0_fold9/stage2_best.pt,validation,9,0,/root/autodl-tmp/26thBME/com_index_sub_2s.csv,cuda,48,6,0,185,185,15.0,15.0,47,47,42

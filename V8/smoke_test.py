@@ -13,10 +13,11 @@ import torch
 import pandas as pd
 from torch.utils.data import Dataset
 
-from V7.experiment_a_model import Stage2ExpertEmotionAdaptationModel
-from V7.temporal_aggregator import TemporalTrialAggregator
-from V7.trial_sequence import TrialSequenceDataset, trial_sequence_collate
-from V7.adaptive_threshold import apply_threshold, load_threshold, train_threshold
+from V8.de_plv_graph_backbone import DEPLVGraphBackbone
+from V8.experiment_a_model import Stage2ExpertEmotionAdaptationModel
+from V8.temporal_aggregator import TemporalTrialAggregator
+from V8.trial_sequence import TrialSequenceDataset, trial_sequence_collate
+from V8.adaptive_threshold import apply_threshold, load_threshold, train_threshold
 
 
 class _FakeWindows(Dataset):
@@ -34,8 +35,8 @@ class _FakeWindows(Dataset):
     def __getitem__(self, index):
         row = self.df.iloc[index]
         return {
-            "x": torch.full((30, 20), float(row.start)),
             "de_feat": torch.zeros(30, 5), "label4": torch.tensor(int(row.label4)),
+            "plv_feat": torch.eye(30).repeat(5, 1, 1),
             "emotion_label": torch.tensor(int(row.emotion_label)),
             "diagnosis_label": torch.tensor(int(row.diagnosis_label)),
             "subject_id": torch.tensor(int(row.subject_id)), "domain_id": torch.tensor(int(row.domain_id)),
@@ -61,16 +62,27 @@ def main() -> None:
     assert torch.equal(weight[~mask], torch.zeros_like(weight[~mask]))
     assert torch.allclose(weight.sum(1), torch.ones(2), atol=1e-6) and torch.isfinite(end).all()
 
-    model_args = dict(
-        num_domains=3, sfreq=250, topk=4, dropout=0.1, use_biomarkers=False,
-        use_subject_relative_de=False, use_subject_relative_bio=False,
-        temporal_hidden_dim=32, temporal_dropout=0.1,
-    )
+    backbone = DEPLVGraphBackbone(graph_hidden_dim=16, band_embed_dim=16, window_embed_dim=32,
+                                  dropout=0.1, use_subject_relative_de=True)
+    de_window = torch.randn(7, 30, 5)
+    plv_window = torch.rand(7, 5, 30, 30)
+    plv_window = 0.5 * (plv_window + plv_window.transpose(-1, -2))
+    window_out = backbone(de_window, plv_window)
+    assert window_out["z_emotion"].shape == (7, 32)
+    assert window_out["z_diag"].shape == (7, 32)
+    assert window_out["band_embeddings"].shape == (7, 5, 16)
+    assert torch.allclose(window_out["frequency_attention_emotion"].sum(1), torch.ones(7), atol=1e-6)
+
+    model_args = dict(num_domains=3, dropout=0.1, graph_hidden_dim=16,
+                      band_embed_dim=16, window_embed_dim=32,
+                      use_subject_relative_de=False, temporal_hidden_dim=32,
+                      temporal_dropout=0.1)
     model = Stage2ExpertEmotionAdaptationModel(**model_args)
-    x = torch.randn(2, 3, 30, 500)
     de = torch.randn(2, 3, 30, 5)
+    plv = torch.rand(2, 3, 5, 30, 30)
+    plv = 0.5 * (plv + plv.transpose(-1, -2))
     trial_mask = torch.tensor([[1, 1, 1], [1, 1, 0]], dtype=torch.bool)
-    out = model(x, de, trial_mask, lambda_subject=0.01)
+    out = model(de, plv, trial_mask, lambda_subject=0.01)
     feature_dim = model.in_dim
     expected = {
         "z_emotion_seq": (2, 3, feature_dim), "z_diag_seq": (2, 3, feature_dim),
