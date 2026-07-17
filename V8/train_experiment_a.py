@@ -123,25 +123,38 @@ class DomainAwareCompetitionDataset(Competition4ClassDataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[int(idx)]
-        item = super().__getitem__(idx); subject = str(int(item["subject_id"]))
-        eeg_window = item.pop("x").numpy()
-        plv = load_or_compute_plv(row, eeg_window, root=ROOT, cache_dir=self.plv_cache_dir,
+        de_saved = np.load(resolve_data_path(row["de_path"], ROOT), mmap_mode="r")
+        de_index = int(row.get("de_win_id", 0))
+        if de_saved.ndim >= 3:
+            if de_index < 0 or de_index >= de_saved.shape[0]:
+                raise IndexError(f"de_win_id={de_index} invalid for {row['de_path']} shape={de_saved.shape}")
+            de_saved = de_saved[de_index]
+        de_feat = torch.from_numpy(np.array(de_saved, dtype=np.float32, copy=True))
+        subject = str(int(row["subject_id"]))
+        plv = load_or_compute_plv(row, root=ROOT, cache_dir=self.plv_cache_dir,
                                   sampling_rate=self.sampling_rate, num_bands=self.num_bands,
                                   num_nodes=self.num_nodes)
-        if tuple(item["de_feat"].shape) != (self.num_nodes, self.num_bands):
+        if tuple(de_feat.shape) != (self.num_nodes, self.num_bands):
             raise ValueError(
                 f"DE shape mismatch path={row.get('de_path')}, trial={row.get('trial_id')}: "
-                f"got {tuple(item['de_feat'].shape)}, expected {(self.num_nodes, self.num_bands)}"
+                f"got {tuple(de_feat.shape)}, expected {(self.num_nodes, self.num_bands)}"
             )
-        if not torch.isfinite(item["de_feat"]).all():
+        if not torch.isfinite(de_feat).all():
             raise ValueError(f"DE contains NaN/Inf path={row.get('de_path')}, trial={row.get('trial_id')}")
-        item["plv_feat"] = torch.from_numpy(plv.copy())
         key = f"{self.split_prefix}:{subject}"
-        item["domain_id"] = torch.tensor(self.domain_mapping["key_to_domain"][key])
-        if self.use_label4_for_diagnosis:
-            item["diagnosis_label"] = (item["label4"] >= 2).long()
-        item.update(user_id=subject, target_key=key)
-        return item
+        label4 = int(row["label4"])
+        diagnosis = int(label4 >= 2) if self.use_label4_for_diagnosis else int(row["diagnosis_label"])
+        emotion = int(row["emotion_label"]) if "emotion_label" in row.index else label4 % 2
+        return {
+            "de_feat": de_feat, "plv_feat": torch.from_numpy(plv.copy()),
+            "label4": torch.tensor(label4, dtype=torch.long),
+            "emotion_label": torch.tensor(emotion, dtype=torch.long),
+            "diagnosis_label": torch.tensor(diagnosis, dtype=torch.long),
+            "subject_id": torch.tensor(int(row["subject_id"]), dtype=torch.long),
+            "domain_id": torch.tensor(self.domain_mapping["key_to_domain"][key], dtype=torch.long),
+            "trial_id": torch.tensor(int(row["trial_id"]), dtype=torch.long),
+            "user_id": subject, "target_key": key,
+        }
 
 
 class UnlabeledTargetDataset(Dataset):
@@ -166,14 +179,8 @@ class UnlabeledTargetDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        # 加载并裁剪 trial 时间序列
-        trial = np.load(resolve_data_path(row["trial_path"], ROOT))
-        start = int(row.get("start", 0)); end = int(row.get("end", trial.shape[-1]))
-        x = trial[:, start:end].astype("float32", copy=False)
-        # 通道级 z-score 归一化
-        if self.normalize: x = (x - x.mean(-1, keepdims=True)) / (x.std(-1, keepdims=True) + 1e-6)
         # 加载 DE 特征（可能是多窗口的，按 de_win_id 选取）
-        de = np.load(resolve_data_path(row["de_path"], ROOT))
+        de = np.load(resolve_data_path(row["de_path"], ROOT), mmap_mode="r")
         if de.ndim >= 3 and "de_win_id" in row:
             de_index = int(row["de_win_id"])
             if de_index < 0 or de_index >= de.shape[0]:
@@ -181,7 +188,7 @@ class UnlabeledTargetDataset(Dataset):
             de = de[de_index]
         if tuple(de.shape) != (self.num_nodes, self.num_bands) or not np.isfinite(de).all():
             raise ValueError(f"invalid DE shape/values {de.shape} path={row['de_path']}, trial={row['trial_id']}")
-        plv = load_or_compute_plv(row, x, root=ROOT, cache_dir=self.plv_cache_dir,
+        plv = load_or_compute_plv(row, root=ROOT, cache_dir=self.plv_cache_dir,
                                   sampling_rate=self.sampling_rate, num_bands=self.num_bands,
                                   num_nodes=self.num_nodes)
         uid = str(row[self.id_col]); key = f"test:{uid}"
@@ -236,7 +243,8 @@ def trial_loader(window_ds, trial_num_windows, batch_size, workers, name, shuffl
     ds = TrialSequenceDataset(window_ds, trial_num_windows=trial_num_windows, name=name)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
                         drop_last=drop_last and len(ds) >= batch_size, num_workers=workers,
-                        pin_memory=True, collate_fn=trial_sequence_collate)
+                        pin_memory=True, persistent_workers=workers > 0,
+                        collate_fn=trial_sequence_collate)
     return ds, loader
 
 
@@ -279,9 +287,11 @@ def build_data(args, split, mapping):
     target = ConcatDataset(target_parts) if len(target_parts) > 1 else val
     target_train = DataLoader(target, batch_size=args.batch_size, shuffle=True,
                               drop_last=len(target) >= args.batch_size, num_workers=args.num_workers,
-                              pin_memory=True, collate_fn=trial_sequence_collate)
+                              pin_memory=True, persistent_workers=args.num_workers > 0,
+                              collate_fn=trial_sequence_collate)
     target_vote = DataLoader(target, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
-                             pin_memory=True, collate_fn=trial_sequence_collate)
+                             pin_memory=True, persistent_workers=args.num_workers > 0,
+                             collate_fn=trial_sequence_collate)
     return src_w, val_w, src, val, test_trial, src_loader, val_loader, target_train, target_vote
 
 
@@ -312,7 +322,9 @@ def compute_de_baseline(window_ds, eps=1e-6):
             if index < 0 or index >= array.shape[0]:
                 raise IndexError(f"de_win_id={index} invalid for {row['de_path']} shape={array.shape}")
             array = array[index]
-        x = torch.as_tensor(np.asarray(array, dtype=np.float32)).float()
+        # mmap_mode="r" exposes a non-writable NumPy view.  Make an owned,
+        # writable copy before sharing storage with PyTorch.
+        x = torch.from_numpy(np.array(array, dtype=np.float32, copy=True))
         if tuple(x.shape) != (window_ds.num_nodes, window_ds.num_bands) or not torch.isfinite(x).all():
             raise ValueError(f"invalid DE baseline sample {x.shape} path={row['de_path']}, trial={row['trial_id']}")
         if hasattr(window_ds, "split_prefix"):
@@ -696,7 +708,9 @@ def run_fold(args, fold, repeat, seed):
         frozen={name:value.detach().cpu().clone() for name,value in restored.state_dict().items()}
         # The calibration pass is deliberately unshuffled/non-dropping and includes every source trial.
         source_complete_loader=DataLoader(src,batch_size=args.batch_size,shuffle=False,drop_last=False,
-                                          num_workers=args.num_workers,pin_memory=True,collate_fn=trial_sequence_collate)
+                                          num_workers=args.num_workers,pin_memory=True,
+                                          persistent_workers=args.num_workers > 0,
+                                          collate_fn=trial_sequence_collate)
         source_records=predict_trials(restored,source_complete_loader,device,source_base,True,0)
         source_records.to_csv(save_dir/"adaptive_threshold_source_trials.csv",index=False,encoding="utf-8-sig")
         threshold,threshold_ckpt,threshold_path=train_threshold(source_records,args,save_dir,str(best_path),device)
@@ -715,7 +729,8 @@ def run_fold(args, fold, repeat, seed):
         summaries=[source_summary,val_summary]
         print("[adaptive threshold] grouped examples:\n",source_summary.head(2).to_string(index=False))
         if args.predict_test and test_ds is not None:
-            loader=DataLoader(test_ds,batch_size=args.batch_size,shuffle=False,num_workers=args.num_workers,collate_fn=trial_sequence_collate)
+            loader=DataLoader(test_ds,batch_size=args.batch_size,shuffle=False,num_workers=args.num_workers,
+                              persistent_workers=args.num_workers > 0,collate_fn=trial_sequence_collate)
             test_records=predict_trials(restored,loader,device,target_base,False,0)
             test_adaptive,test_summary=apply_threshold(test_records,threshold,device,labeled=False)
             test_adaptive.to_csv(save_dir/"test_trials.csv",index=False,encoding="utf-8-sig")
@@ -729,7 +744,8 @@ def run_fold(args, fold, repeat, seed):
         fixed=final["records"].copy(); fixed["Emotion_label"]=(fixed.prob_pos >= .5).astype(int)
         fixed.to_csv(save_dir/"validation_trials.csv",index=False,encoding="utf-8-sig")
         if args.predict_test and test_ds is not None:
-            loader=DataLoader(test_ds,batch_size=args.batch_size,shuffle=False,num_workers=args.num_workers,collate_fn=trial_sequence_collate)
+            loader=DataLoader(test_ds,batch_size=args.batch_size,shuffle=False,num_workers=args.num_workers,
+                              persistent_workers=args.num_workers > 0,collate_fn=trial_sequence_collate)
             test_records=predict_trials(restored,loader,device,target_base,False,args.max_batches)
             test_records["Emotion_label"]=(test_records.prob_pos >= .5).astype(int)
             test_records.to_csv(save_dir/"test_trials.csv",index=False,encoding="utf-8-sig")
@@ -749,7 +765,8 @@ def ensemble(results, args):
                                       num_nodes=ckpt["model_config"]["num_nodes"],
                                       num_bands=ckpt["model_config"]["de_num_bands"])
         test_ds=TrialSequenceDataset(test_w,ckpt["trial_num_windows"],f"ensemble-{i}")
-        loader=DataLoader(test_ds,batch_size=args.batch_size,collate_fn=trial_sequence_collate,num_workers=args.num_workers)
+        loader=DataLoader(test_ds,batch_size=args.batch_size,collate_fn=trial_sequence_collate,
+                          num_workers=args.num_workers,persistent_workers=args.num_workers > 0)
         dm=ds=None
         if ckpt["model_config"].get("use_subject_relative_de"):
             dm,ds=compute_de_baseline(test_w,args.relative_eps)

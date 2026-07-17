@@ -95,7 +95,7 @@ def _select_saved_plv(row: pd.Series, path: Path, root: Path, num_bands: int, nu
     raise ValueError(f"{context}: PLV must be [W,5,30,30] or [5,30,30], got {saved.shape}")
 
 
-def load_or_compute_plv(row: pd.Series, eeg_window: np.ndarray, *, root: Path,
+def load_or_compute_plv(row: pd.Series, eeg_window: np.ndarray | None = None, *, root: Path,
                         cache_dir: Path | None, sampling_rate: float = 250.0,
                         num_bands: int = 5, num_nodes: int = 30) -> np.ndarray:
     """Prefer indexed PLV, otherwise lazily compute/cache it from the same EEG window."""
@@ -106,12 +106,19 @@ def load_or_compute_plv(row: pd.Series, eeg_window: np.ndarray, *, root: Path,
 
     trial_path = resolve_data_path(row["trial_path"], root)
     start = int(row.get("start", 0))
-    end = int(row.get("end", start + eeg_window.shape[-1]))
+    raw_end = row.get("end", None)
+    end = int(raw_end) if raw_end is not None and not pd.isna(raw_end) else -1
     token = f"{trial_path.resolve()}|{start}|{end}|{sampling_rate}|{DEFAULT_FREQUENCY_BANDS}"
     cache_path = None if cache_dir is None else cache_dir / f"{hashlib.sha1(token.encode('utf-8')).hexdigest()}.npy"
     if cache_path is not None and cache_path.exists():
         raw = np.load(cache_path, mmap_mode="r")
     else:
+        if eeg_window is None:
+            trial = np.load(trial_path, mmap_mode="r")
+            actual_end = int(trial.shape[-1]) if end < 0 else end
+            eeg_window = np.asarray(trial[:, start:actual_end], dtype=np.float32)
+        if end < 0:
+            end = start + int(eeg_window.shape[-1])
         raw = compute_band_plv(eeg_window, sampling_rate, DEFAULT_FREQUENCY_BANDS)
         if cache_path is not None:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
