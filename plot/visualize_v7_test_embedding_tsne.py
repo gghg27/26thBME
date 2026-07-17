@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="t-SNE of V7-encoded test or validation trials.")
     parser.add_argument(
         "--checkpoint",
-        default="model_params/V7_experiment_a/experiment_a_repeat0_fold2/stage2_best.pt",
+        default="model_params/V7_non_res/experiment_a_repeat0_fold2/stage2_best.pt",
         help="V7 stage2_best.pt to visualize. One checkpoint defines one embedding space.",
     )
     parser.add_argument("--split", choices=["test", "validation"], default="test")
@@ -67,7 +67,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Draw validation t-SNE separately for every fold of one repeat.",
     )
-    parser.add_argument("--checkpoint_root", default="model_params/V7_experiment_a")
+    parser.add_argument("--checkpoint_root", default="model_params/V7_non_res")
     parser.add_argument("--repeat", type=int, default=0)
     parser.add_argument("--n_folds", type=int, default=10)
     parser.add_argument("--index_csv", default="com_index_sub_2s.csv", help="Labeled data index for validation.")
@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output_dir",
         default="",
-        help="Default: plot/v7_<split>_embedding_tsne.",
+        help="Default: plot/v7_non_res_<split>_embedding_tsne.",
     )
     parser.add_argument("--device", default="cuda", help="cuda, cpu, or auto")
     parser.add_argument("--batch_size", type=int, default=8)
